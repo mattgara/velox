@@ -17,7 +17,7 @@ int sumPositive(const std::vector<int>& values) {
 }
 
 std::string stateLabel(bool ready) {
-  return ready ? "ready" : "pending";
+  return ready ? "ready" : "not-ready";
 }
 
 } // namespace gpc_fixture
