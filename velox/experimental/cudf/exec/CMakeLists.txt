@@ -31,6 +31,7 @@ add_library(
 target_link_libraries(
   velox_cudf_exec
   PUBLIC cudf::cudf
+  PUBLIC velox_cudf_parquet_connector
   PRIVATE
     arrow
     velox_arrow_bridge
@@ -38,7 +39,6 @@ target_link_libraries(
     velox_common_base
     velox_cudf_vector
     velox_exec
-    velox_cudf_parquet_connector
 )
 
 target_compile_options(velox_cudf_exec PRIVATE -Wno-missing-field-initializers)
