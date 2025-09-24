@@ -328,11 +328,11 @@ TEST_F(TableScanTest, filterPushdown) {
   createDuckDbTable(vectors);
 
   // c1 >= 0 or null and c3 is true
-  // common::SubfieldFilters subfieldFilters =
-  //     SubfieldFiltersBuilder()
-  //         .add("c1", greaterThanOrEqual(0, true))
-  //         .add("c3", std::make_unique<common::BoolValue>(true, false))
-  //         .build();
+   common::SubfieldFilters subfieldFilters =
+       SubfieldFiltersBuilder()
+           .add("c1", greaterThanOrEqual(0, true))
+           .add("c3", std::make_unique<common::BoolValue>(true, false))
+           .build();
   // convert subfieldFilters to a typed expression
   // c1 >= 0 or null and c3 is true
   auto c1Expr = std::make_shared<core::CallTypedExpr>(
