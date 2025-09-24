@@ -23,12 +23,31 @@
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/exec/Cursor.h"
+#include "velox/core/QueryConfig.h"
+
 
 #include <experimental/cudf/connectors/hive/CudfHiveConnector.h>
+
+// Add NVTX support for profiling iterations
+#ifdef NVTX_ENABLED
+#include <nvtx3/nvtx3.hpp>
+#endif
 
 DECLARE_int64(max_coalesced_bytes);
 DECLARE_string(max_coalesced_distance_bytes);
 DECLARE_int32(parquet_prefetch_rowgroups);
+
+// Declarations needed for the run method override
+DECLARE_int32(num_drivers);
+DECLARE_int32(num_splits_per_file);
+DECLARE_int32(split_preload_per_driver);
+DECLARE_int64(preferred_output_batch_bytes);
+DECLARE_int32(preferred_output_batch_rows);
+DECLARE_int32(max_output_batch_rows);
+DECLARE_uint64(max_partial_aggregation_memory);
+DECLARE_int32(num_repeats);
 
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
@@ -137,6 +156,73 @@ class CudfTpchBenchmark : public TpchBenchmark {
     }
 
     return TpchBenchmark::listSplits(path, numSplitsPerFile, plan);
+  }
+
+  // Override run method to add NVTX ranges for iteration tracking
+  // This implementation mirrors that of QueryBenchmarkBase::run, with annotations for iteration tracking
+  std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>> run(
+      const exec::test::TpchPlan& tpchPlan,
+      const std::unordered_map<std::string, std::string>& queryConfigs = {}) override {
+    
+    int32_t repeat = 0;
+    try {
+      for (;;) {
+#ifdef NVTX_ENABLED
+        // Create NVTX range for each iteration
+        std::string rangeName = "TPC-H Iteration " + std::to_string(repeat + 1) + "/" + std::to_string(FLAGS_num_repeats);
+        std::cout << "DEBUG: Adding NVTX range: " << rangeName << std::endl;
+        nvtx3::scoped_range nvtx_range{rangeName.c_str()};
+#else
+        std::cout << "DEBUG: NVTX_ENABLED is NOT defined, iteration " << (repeat + 1) << "/" << FLAGS_num_repeats << std::endl;
+#endif
+
+        // Execute one iteration (copied from QueryBenchmarkBase::run but without the loop)
+        CursorParameters params;
+        params.maxDrivers = FLAGS_num_drivers;
+        params.planNode = tpchPlan.plan;
+        params.queryConfigs = queryConfigs;
+        params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
+            std::to_string(FLAGS_split_preload_per_driver);
+        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchBytes] =
+            std::to_string(FLAGS_preferred_output_batch_bytes);
+        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
+            std::to_string(FLAGS_preferred_output_batch_rows);
+        params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
+            std::to_string(FLAGS_max_output_batch_rows);
+        params.queryConfigs[core::QueryConfig::kMaxPartialAggregationMemory] =
+            std::to_string(FLAGS_max_partial_aggregation_memory);
+        const int numSplitsPerFile = FLAGS_num_splits_per_file;
+
+        auto addSplits = [&](TaskCursor* taskCursor) {
+          auto& task = taskCursor->task();
+          if (!taskCursor->noMoreSplits()) {
+            for (const auto& entry : tpchPlan.dataFiles) {
+              for (const auto& path : entry.second) {
+                auto splits = listSplits(path, numSplitsPerFile, tpchPlan);
+                for (auto split : splits) {
+                  task->addSplit(entry.first, exec::Split(std::move(split)));
+                }
+              }
+              task->noMoreSplits(entry.first);
+            }
+          }
+          taskCursor->setNoMoreSplits();
+        };
+        auto result = readCursor(params, addSplits);
+        ensureTaskCompletion(result.first->task().get());
+
+#ifdef NVTX_ENABLED
+        std::cout << "DEBUG: NVTX range for iteration " << (repeat + 1) << " terminated" << std::endl;
+#endif
+
+        if (++repeat >= FLAGS_num_repeats) {
+          return result;
+        }
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Query terminated with: " << e.what();
+      return {nullptr, std::vector<RowVectorPtr>()};
+    }
   }
 
   void shutdown() override {

@@ -56,7 +56,7 @@ class QueryBenchmarkBase {
   virtual ~QueryBenchmarkBase() = default;
   virtual void initialize();
   virtual void shutdown();
-  std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>> run(
+  virtual std::pair<std::unique_ptr<exec::TaskCursor>, std::vector<RowVectorPtr>> run(
       const exec::test::TpchPlan& tpchPlan,
       const std::unordered_map<std::string, std::string>& queryConfigs = {});
 
