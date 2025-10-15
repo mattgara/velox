@@ -205,42 +205,15 @@ int main(int argc, char** argv) {
         // Initialize Velox (same as existing reproducer)
         folly::Init init{&argc, &argv, false};
         
-        // SOLUTION: Bypass percentage calculation and use fixed size
+        // SOLUTION: Do exactly what the benchmark does - call registerCudf()
+        // The benchmark works fine with large datasets, so let's use its exact setup
         
-        const char* memResource = std::getenv("VELOX_CUDF_MEMORY_RESOURCE");
-        const std::string mrMode = memResource ? memResource : "cuda";
+        std::cout << "Initializing cuDF exactly like the benchmark does..." << std::endl;
         
-        std::cout << "Creating " << mrMode << " memory resource" << std::endl;
+        // Call registerCudf() exactly like the benchmark - this sets up memory resources correctly
+        cudf_velox::registerCudf();
         
-        // For pool and async, use a large fixed size instead of percentage
-        std::shared_ptr<rmm::mr::device_memory_resource> mr;
-        if (mrMode == "cuda") {
-            mr = std::make_shared<rmm::mr::cuda_memory_resource>();
-            std::cout << "Using cuda memory resource (no pool limits)" << std::endl;
-        } else {
-            // For pool/async, use a large fixed size (10GB) instead of percentage
-            size_t fixedPoolSize = 10ULL * 1024 * 1024 * 1024; // 10GB
-            std::cout << "Using fixed pool size: 10GB instead of percentage (to bypass RMM percentage calculation bug)" << std::endl;
-            
-            if (mrMode == "pool") {
-                auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
-                mr = rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(cuda_mr, fixedPoolSize);
-            } else if (mrMode == "async") {
-                mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(fixedPoolSize);
-            } else {
-                // Fallback to cuda for unknown types
-                std::cout << "Unknown memory resource '" << mrMode << "', using cuda" << std::endl;
-                mr = std::make_shared<rmm::mr::cuda_memory_resource>();
-            }
-        }
-        
-        cudf::set_current_device_resource(mr.get());
-        
-        // Initialize CUDA context (same as registerCudf does)
-        cudaFree(nullptr);
-        
-        // We DON'T call registerCudf() because it would overwrite our memory resource
-        // The reproducer only needs the memory resource, not the full Velox cuDF integration
+        std::cout << "cuDF initialized successfully with benchmark configuration" << std::endl;
         
         std::cout << "Starting " << numThreads << " concurrent threads..." << std::endl;
         
