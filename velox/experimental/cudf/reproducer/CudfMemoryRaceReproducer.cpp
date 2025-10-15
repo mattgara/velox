@@ -14,16 +14,13 @@
  * limitations under the License.
  */
 
-#include "velox/experimental/cudf/connectors/parquet/ParquetConfig.h"
-#include "velox/experimental/cudf/connectors/parquet/ParquetDataSource.h"
-#include "velox/experimental/cudf/connectors/parquet/ParquetConnectorSplit.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
-#include "velox/connectors/hive/HiveConnector.h"
-#include "velox/connectors/hive/TableHandle.h"
-#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
-#include "velox/type/Type.h"
-#include "velox/vector/BaseVector.h"
+#include <cudf/io/parquet.hpp>
+#include <cudf/io/types.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
 
 #include <folly/init/Init.h>
 #include <iostream>
@@ -36,12 +33,9 @@
 #include <algorithm>
 
 using namespace facebook::velox;
-using namespace facebook::velox::cudf_velox::connector::parquet;
-using namespace facebook::velox::connector;
-using namespace facebook::velox::exec::test;
 
-// Multi-threaded reproducer that mimics the EXACT Velox ParquetDataSource behavior
-// This should trigger the exact same memory race condition as the benchmark
+// Multi-threaded reproducer that uses the same cuDF API as the existing reproducer
+// but with multiple threads to trigger memory allocator race conditions
 
 std::atomic<int> successCount{0};
 std::atomic<int> errorCount{0};
@@ -55,83 +49,49 @@ void workerThread(int threadId, const std::vector<std::string>& filePaths, int i
             for (size_t fileIdx = 0; fileIdx < filePaths.size(); ++fileIdx) {
                 const auto& filePath = filePaths[fileIdx];
                 
-                // Create the EXACT same schema as lineitem table (from TPC-H)
-                auto outputType = ROW({
-                    {"l_orderkey", BIGINT()},
-                    {"l_partkey", BIGINT()},
-                    {"l_suppkey", BIGINT()},
-                    {"l_linenumber", INTEGER()},
-                    {"l_quantity", DOUBLE()},
-                    {"l_extendedprice", DOUBLE()},
-                    {"l_discount", DOUBLE()},
-                    {"l_tax", DOUBLE()},
-                    {"l_returnflag", VARCHAR()},
-                    {"l_linestatus", VARCHAR()},
-                    {"l_shipdate", DATE()},
-                    {"l_commitdate", DATE()},
-                    {"l_receiptdate", DATE()},
-                    {"l_shipinstruct", VARCHAR()},
-                    {"l_shipmode", VARCHAR()},
-                    {"l_comment", VARCHAR()}
-                });
+                // Use the EXACT same cuDF API as the existing reproducer
+                auto readerOptions =
+                    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filePath})
+                        .skip_rows(0)
+                        .use_pandas_metadata(true)
+                        .use_arrow_schema(true)
+                        .allow_mismatched_pq_schemas(false)
+                        .build();
                 
-                // Create ParquetConfig with EXACT same settings as benchmark
-                auto emptyConfig = std::make_shared<config::ConfigBase>(std::unordered_map<std::string, std::string>{});
-                auto parquetConfig = std::make_shared<ParquetConfig>(emptyConfig);
+                // Get stream exactly like the existing reproducer
+                auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
                 
-                // Create table handle (same as benchmark)
-                auto tableHandle = std::make_shared<connector::hive::HiveTableHandle>(
-                    "hive_connector",
-                    "lineitem",
-                    true, // partitioned
-                    SubfieldFilters{},
-                    nullptr, // remainingFilter
-                    nullptr, // dataColumns
-                    std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>{});
+                // Create chunked reader with smaller chunks to avoid memory exhaustion
+                // Focus on triggering race conditions in memory allocator, not hitting memory limits
+                size_t chunkLimit = 64 * 1024 * 1024; // 64MB chunks (smaller than 100MB pool limit)
+                auto reader = cudf::io::chunked_parquet_reader(
+                    chunkLimit, // Limit chunk size to avoid memory exhaustion
+                    0, // passLimit = 0 (no limit)
+                    readerOptions,
+                    stream,
+                    cudf::get_current_device_resource_ref() // This uses the configured memory resource
+                );
                 
-                // Create column handles (same as benchmark)
-                ColumnHandleMap columnHandles;
-                for (int j = 0; j < outputType->size(); ++j) {
-                    auto name = outputType->nameOf(j);
-                    auto type = outputType->childAt(j);
-                    columnHandles[name] = std::make_shared<connector::hive::HiveColumnHandle>(
-                        name, connector::hive::HiveColumnHandle::ColumnType::kRegular, type, type);
+                int chunkCount = 0;
+                size_t totalRows = 0;
+                
+                // Read chunks - this is where the race condition should occur
+                while (reader.has_next()) {
+                    auto [table, metadata] = reader.read_chunk(); // EXACT call from existing reproducer
+                    
+                    chunkCount++;
+                    totalRows += table->num_rows();
+                    
+                    // Force table to go out of scope to free memory
+                    table.reset();
+                    
+                    // Small delay to increase chance of race condition during allocation/deallocation
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
                 }
                 
-                // Create ParquetDataSource - EXACT same as benchmark
-                auto dataSource = std::make_unique<ParquetDataSource>(
-                    outputType,
-                    tableHandle,
-                    columnHandles,
-                    nullptr, // executor
-                    nullptr, // connectorQueryCtx
-                    parquetConfig);
-                
-                // Create split for the parquet file - EXACT same as benchmark
-                auto split = std::make_shared<ParquetConnectorSplit>(
-                    "test_connector_id_" + std::to_string(threadId),
-                    filePath, // filePath
-                    0); // splitWeight
-                
-                // Add split to data source
-                dataSource->addSplit(split);
-                
-                // This is the EXACT call that triggers the problematic code path
-                // Multiple threads doing this concurrently should reproduce the race condition
-                ContinueFuture future;
-                auto result = dataSource->next(100000, future); // Read up to 100K rows per iteration
-                
-                if (result.has_value()) {
-                    std::cout << "Thread " << threadId << " iteration " << i << " file " << fileIdx 
-                             << " - Success: " << result.value()->size() << " rows" << std::endl;
-                    successCount++;
-                } else {
-                    std::cout << "Thread " << threadId << " iteration " << i << " file " << fileIdx 
-                             << " - No data" << std::endl;
-                }
-                
-                // Small delay to allow other threads to interleave
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                std::cout << "Thread " << threadId << " iteration " << i << " file " << fileIdx 
+                         << " - Success: " << chunkCount << " chunks, " << totalRows << " rows" << std::endl;
+                successCount++;
             }
         }
         
@@ -151,7 +111,7 @@ int main(int argc, char** argv) {
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5" << std::endl;
         std::cerr << "" << std::endl;
         std::cerr << "This reproducer tests for memory allocator race conditions in cuDF." << std::endl;
-        std::cerr << "Uses the EXACT same Velox ParquetDataSource code path as the benchmark." << std::endl;
+        std::cerr << "Uses the same cuDF API as the existing reproducer but with multiple threads." << std::endl;
         std::cerr << "Use max_files to limit the number of files processed (useful to avoid memory exhaustion)." << std::endl;
         std::cerr << "Set VELOX_CUDF_MEMORY_RESOURCE environment variable to test different allocators:" << std::endl;
         std::cerr << "  cuda (should work), pool (should fail), async (may fail)" << std::endl;
@@ -209,7 +169,7 @@ int main(int argc, char** argv) {
         std::cout << "Using single parquet file: " << inputPath << std::endl;
     }
 
-    std::cout << "=== Multi-threaded Velox ParquetDataSource Race Reproducer ===" << std::endl;
+    std::cout << "=== Multi-threaded cuDF Memory Race Reproducer ===" << std::endl;
     std::cout << "Parquet files: " << parquetFiles.size() << std::endl;
     for (size_t i = 0; i < parquetFiles.size(); ++i) {
         std::cout << "  [" << i << "] " << parquetFiles[i] << std::endl;
@@ -224,10 +184,10 @@ int main(int argc, char** argv) {
     std::cout << "" << std::endl;
     
     try {
-        // Initialize Velox (same as benchmark)
+        // Initialize Velox (same as existing reproducer)
         folly::Init init{&argc, &argv, false};
         
-        // Register cuDF operators (same as benchmark)
+        // Register cuDF operators (same as existing reproducer)
         cudf_velox::registerCudf();
         
         std::cout << "Starting " << numThreads << " concurrent threads..." << std::endl;
@@ -275,7 +235,7 @@ int main(int argc, char** argv) {
             std::cout << "All operations completed successfully - no race condition detected with current memory resource" << std::endl;
         }
         
-        // Clean up (same as benchmark)
+        // Clean up (same as existing reproducer)
         cudf_velox::unregisterCudf();
         
         return errorCount.load() > 0 ? 1 : 0;

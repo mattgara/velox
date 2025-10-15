@@ -29,8 +29,6 @@ add_executable(velox_cudf_memory_race_reproducer CudfMemoryRaceReproducer.cpp)
 target_link_libraries(
   velox_cudf_memory_race_reproducer
   velox_cudf_exec
-  velox_cudf_connectors_parquet
-  velox_exec_test_lib
   cudf::cudf
   Folly::folly
 )
