@@ -107,15 +107,15 @@ int main(int argc, char** argv) {
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4    # Limit to 4 files" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4 64    # 64MB chunks" << std::endl;
-        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4 64 80    # 64MB chunks, 80% GPU memory" << std::endl;
-        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5 1 1024 90    # 1GB chunks, 90% GPU memory" << std::endl;
+        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4 64 30    # 64MB chunks, 30GB pool" << std::endl;
+        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5 1 1024 50    # 1GB chunks, 50GB pool" << std::endl;
         std::cerr << "" << std::endl;
         std::cerr << "This reproducer tests for memory allocator race conditions in cuDF." << std::endl;
         std::cerr << "Uses the same cuDF API as the existing reproducer but with multiple threads." << std::endl;
         std::cerr << "Parameters:" << std::endl;
         std::cerr << "  max_files: Limit number of files processed (useful to avoid memory exhaustion)" << std::endl;
         std::cerr << "  chunk_limit_mb: Chunk size in MB (default: 1024MB like benchmark, try 64MB to avoid pool limits)" << std::endl;
-        std::cerr << "  memory_percent: Percentage of GPU memory for RMM pool (default: 80%, try 90% for more memory)" << std::endl;
+        std::cerr << "  memory_pool_gb: Maximum pool size in GB (default: 80GB, try 30GB for async/pool)" << std::endl;
         std::cerr << "Set VELOX_CUDF_MEMORY_RESOURCE environment variable to test different allocators:" << std::endl;
         std::cerr << "  cuda (should work), pool (should fail), async (may fail)" << std::endl;
         return 1;
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
     int iterationsPerThread = std::stoi(argv[3]);
     int maxFiles = (argc >= 5) ? std::stoi(argv[4]) : -1; // -1 means no limit
     int chunkLimitMB = (argc >= 6) ? std::stoi(argv[5]) : 1024; // Default 1024MB like benchmark
-    int memoryPercent = (argc == 7) ? std::stoi(argv[6]) : 80; // Default 80% of GPU memory
+    int memoryPoolGB = (argc == 7) ? std::stoi(argv[6]) : 30; // Default 30GB pool
     
     size_t chunkLimit = static_cast<size_t>(chunkLimitMB) * 1024 * 1024; // Convert MB to bytes
 
@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
     std::cout << "Threads: " << numThreads << std::endl;
     std::cout << "Iterations per thread: " << iterationsPerThread << std::endl;
     std::cout << "Chunk limit: " << chunkLimitMB << "MB (" << chunkLimit << " bytes)" << std::endl;
-    std::cout << "Memory percent: " << memoryPercent << "% of GPU memory" << std::endl;
+    std::cout << "Memory pool size: " << memoryPoolGB << " GB" << std::endl;
     std::cout << "Total operations: " << (numThreads * iterationsPerThread * parquetFiles.size()) << std::endl;
     
     // Show current memory resource
@@ -196,10 +196,47 @@ int main(int argc, char** argv) {
         // Initialize Velox (same as existing reproducer)
         folly::Init init{&argc, &argv, false};
         
-        // Register cuDF operators with custom memory configuration
-        auto cudfOptions = cudf_velox::CudfOptions(false);
-        cudfOptions.memoryPercent = memoryPercent; // Use configurable percentage of GPU memory
-        cudf_velox::registerCudf(cudfOptions);
+        // SOLUTION: Create memory resource with explicit maximum pool size (like Python's rmm.reinitialize)
+        
+        const char* memResource = std::getenv("VELOX_CUDF_MEMORY_RESOURCE");
+        const std::string mrMode = memResource ? memResource : "cuda";
+        
+        // Calculate pool size in bytes
+        size_t maxPoolSizeBytes = static_cast<size_t>(memoryPoolGB) * 1024 * 1024 * 1024; // Convert GB to bytes
+        
+        std::cout << "Creating " << mrMode << " memory resource with max pool size: " 
+                  << (maxPoolSizeBytes / (1024*1024*1024)) << " GB (" << maxPoolSizeBytes << " bytes)" << std::endl;
+        
+        // Create memory resource with explicit maximum pool size
+        std::shared_ptr<rmm::mr::device_memory_resource> mr;
+        if (mrMode == "cuda") {
+            mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+        } else if (mrMode == "pool") {
+            // Create pool with explicit maximum size
+            auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+            mr = rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
+                cuda_mr, 
+                0,  // initial_pool_size = 0 (let it grow as needed)
+                maxPoolSizeBytes  // maximum_pool_size = our specified size
+            );
+        } else if (mrMode == "async") {
+            // Create async memory resource with explicit maximum size
+            mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(
+                maxPoolSizeBytes  // pool_size = our specified size
+            );
+        } else {
+            // Fallback to cuda for unknown types
+            std::cout << "Unknown memory resource '" << mrMode << "', using cuda" << std::endl;
+            mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+        }
+        
+        cudf::set_current_device_resource(mr.get());
+        
+        // Initialize CUDA context (same as registerCudf does)
+        cudaFree(nullptr);
+        
+        // We DON'T call registerCudf() because it would overwrite our memory resource
+        // The reproducer only needs the memory resource, not the full Velox cuDF integration
         
         std::cout << "Starting " << numThreads << " concurrent threads..." << std::endl;
         
