@@ -12,15 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(exec)
-add_subdirectory(connectors)
-add_subdirectory(vector)
+add_executable(velox_cudf_parquet_reproducer CudfParquetReproducer.cpp)
 
-if(VELOX_BUILD_TESTING)
-  add_subdirectory(tests)
-endif()
+target_link_libraries(
+  velox_cudf_parquet_reproducer
+  velox_cudf_exec
+  cudf::cudf
+  Folly::folly
+)
 
-if(VELOX_ENABLE_BENCHMARKS)
-  add_subdirectory(benchmarks)
-  add_subdirectory(reproducer)
-endif()
+target_link_libraries(velox_cudf_parquet_reproducer CUDA::nvtx3)
+
+# Multi-threaded memory race reproducer
+add_executable(velox_cudf_memory_race_reproducer CudfMemoryRaceReproducer.cpp)
+
+target_link_libraries(
+  velox_cudf_memory_race_reproducer
+  velox_cudf_exec
+  cudf::cudf
+  Folly::folly
+)
+
+target_link_libraries(velox_cudf_memory_race_reproducer CUDA::nvtx3)
