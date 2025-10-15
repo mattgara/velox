@@ -36,6 +36,7 @@
 #include <common/base/Exceptions.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string_view>
 
@@ -94,18 +95,16 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         "\nExpecting: cuda, pool, async, arena, managed, or managed_pool");
   }
 
-  // Check if RMM memory event logging is enabled
-  const char* enableLogging = std::getenv("VELOX_RMM_MEMORY_LOGGING");
-  if (enableLogging && (std::string(enableLogging) == "true" || std::string(enableLogging) == "1")) {
-    // Get log file path from environment or use default
-    const char* logFile = std::getenv("VELOX_RMM_LOG_FILE");
-    std::string logPath = logFile ? std::string(logFile) : "rmm_memory_events.csv";
+  // Check if RMM memory event logging is enabled via RMM_LOG_FILE environment variable
+  // As per RMM docs: if filename not specified, RMM_LOG_FILE is checked, if not set exception is thrown
+  const char* rmm_log_file = std::getenv("RMM_LOG_FILE");
+  if (rmm_log_file) {
+    std::string logPath(rmm_log_file);
     
-    // Wrap the memory resource with logging adaptor
-    auto logging_mr = std::make_shared<rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource>>(
-        mr, logPath);
-    
-    return logging_mr;
+    // Create logging adaptor as per RMM documentation
+    // Use the generic device_memory_resource wrapper for all types
+    return std::make_shared<rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource>>(
+        mr.get(), logPath);
   }
   
   return mr;
