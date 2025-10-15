@@ -28,6 +28,9 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <algorithm>
 
 using namespace facebook::velox;
 
@@ -38,49 +41,54 @@ using namespace facebook::velox;
 std::atomic<int> successCount{0};
 std::atomic<int> errorCount{0};
 
-void workerThread(int threadId, const std::string& filePath, int iterations) {
+void workerThread(int threadId, const std::vector<std::string>& filePaths, int iterations) {
     try {
-        std::cout << "Thread " << threadId << " starting..." << std::endl;
+        std::cout << "Thread " << threadId << " starting with " << filePaths.size() << " files..." << std::endl;
         
         for (int i = 0; i < iterations; ++i) {
-            // Use the EXACT same cuDF API as the existing reproducer
-            auto readerOptions =
-                cudf::io::parquet_reader_options::builder(cudf::io::source_info{filePath})
-                    .skip_rows(0)
-                    .use_pandas_metadata(true)
-                    .use_arrow_schema(true)
-                    .allow_mismatched_pq_schemas(false)
-                    .build();
-            
-            // Get stream exactly like the existing reproducer
-            auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-            
-            // Create chunked reader - this is where memory allocation happens
-            auto reader = cudf::io::chunked_parquet_reader(
-                0, // chunkLimit = 0 (no limit)
-                0, // passLimit = 0 (no limit)
-                readerOptions,
-                stream,
-                cudf::get_current_device_resource_ref() // This uses the configured memory resource
-            );
-            
-            int chunkCount = 0;
-            size_t totalRows = 0;
-            
-            // Read chunks - this is where the race condition should occur
-            while (reader.has_next()) {
-                auto [table, metadata] = reader.read_chunk(); // EXACT call from existing reproducer
+            // Each thread processes different files (simulating different drivers/splits)
+            for (size_t fileIdx = 0; fileIdx < filePaths.size(); ++fileIdx) {
+                const auto& filePath = filePaths[fileIdx];
                 
-                chunkCount++;
-                totalRows += table->num_rows();
+                // Use the EXACT same cuDF API as the existing reproducer
+                auto readerOptions =
+                    cudf::io::parquet_reader_options::builder(cudf::io::source_info{filePath})
+                        .skip_rows(0)
+                        .use_pandas_metadata(true)
+                        .use_arrow_schema(true)
+                        .allow_mismatched_pq_schemas(false)
+                        .build();
                 
-                // Small delay to increase chance of race condition
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                // Get stream exactly like the existing reproducer
+                auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+                
+                // Create chunked reader - this is where memory allocation happens
+                auto reader = cudf::io::chunked_parquet_reader(
+                    0, // chunkLimit = 0 (no limit)
+                    0, // passLimit = 0 (no limit)
+                    readerOptions,
+                    stream,
+                    cudf::get_current_device_resource_ref() // This uses the configured memory resource
+                );
+                
+                int chunkCount = 0;
+                size_t totalRows = 0;
+                
+                // Read chunks - this is where the race condition should occur
+                while (reader.has_next()) {
+                    auto [table, metadata] = reader.read_chunk(); // EXACT call from existing reproducer
+                    
+                    chunkCount++;
+                    totalRows += table->num_rows();
+                    
+                    // Small delay to increase chance of race condition
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
+                }
+                
+                std::cout << "Thread " << threadId << " iteration " << i << " file " << fileIdx 
+                         << " - Success: " << chunkCount << " chunks, " << totalRows << " rows" << std::endl;
+                successCount++;
             }
-            
-            std::cout << "Thread " << threadId << " iteration " << i << " - Success: " 
-                     << chunkCount << " chunks, " << totalRows << " rows" << std::endl;
-            successCount++;
         }
         
         std::cout << "Thread " << threadId << " completed successfully" << std::endl;
@@ -93,24 +101,69 @@ void workerThread(int threadId, const std::string& filePath, int iterations) {
 
 int main(int argc, char** argv) {
     if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <parquet_file> <num_threads> <iterations_per_thread>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <parquet_directory_or_file> <num_threads> <iterations_per_thread>" << std::endl;
+        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5" << std::endl;
         std::cerr << "" << std::endl;
         std::cerr << "This reproducer tests for memory allocator race conditions in cuDF." << std::endl;
+        std::cerr << "If a directory is provided, all .parquet files will be discovered and distributed across threads." << std::endl;
         std::cerr << "Set VELOX_CUDF_MEMORY_RESOURCE environment variable to test different allocators:" << std::endl;
         std::cerr << "  cuda (should work), pool (should fail), async (may fail)" << std::endl;
         return 1;
     }
 
-    std::string parquetFile = argv[1];
+    std::string inputPath = argv[1];
     int numThreads = std::stoi(argv[2]);
     int iterationsPerThread = std::stoi(argv[3]);
 
+    // Discover parquet files (like the benchmark does)
+    std::vector<std::string> parquetFiles;
+    
+    // Check if input is a directory or file
+    struct stat pathStat;
+    if (stat(inputPath.c_str(), &pathStat) != 0) {
+        std::cerr << "ERROR: Path does not exist: " << inputPath << std::endl;
+        return 1;
+    }
+    
+    if (S_ISDIR(pathStat.st_mode)) {
+        // Directory - find all parquet files
+        std::cout << "Discovering parquet files in directory: " << inputPath << std::endl;
+        
+        // Simple directory scan for .parquet files
+        DIR* dir = opendir(inputPath.c_str());
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                std::string filename = entry->d_name;
+                if (filename.size() > 8 && filename.substr(filename.size() - 8) == ".parquet") {
+                    parquetFiles.push_back(inputPath + "/" + filename);
+                }
+            }
+            closedir(dir);
+        }
+        
+        if (parquetFiles.empty()) {
+            std::cerr << "ERROR: No .parquet files found in directory: " << inputPath << std::endl;
+            return 1;
+        }
+        
+        std::sort(parquetFiles.begin(), parquetFiles.end());
+        std::cout << "Found " << parquetFiles.size() << " parquet files" << std::endl;
+    } else {
+        // Single file
+        parquetFiles.push_back(inputPath);
+        std::cout << "Using single parquet file: " << inputPath << std::endl;
+    }
+
     std::cout << "=== Multi-threaded cuDF Memory Race Reproducer ===" << std::endl;
-    std::cout << "Parquet file: " << parquetFile << std::endl;
+    std::cout << "Parquet files: " << parquetFiles.size() << std::endl;
+    for (size_t i = 0; i < parquetFiles.size(); ++i) {
+        std::cout << "  [" << i << "] " << parquetFiles[i] << std::endl;
+    }
     std::cout << "Threads: " << numThreads << std::endl;
     std::cout << "Iterations per thread: " << iterationsPerThread << std::endl;
-    std::cout << "Total operations: " << (numThreads * iterationsPerThread) << std::endl;
+    std::cout << "Total operations: " << (numThreads * iterationsPerThread * parquetFiles.size()) << std::endl;
     
     // Show current memory resource
     const char* memResource = std::getenv("VELOX_CUDF_MEMORY_RESOURCE");
@@ -126,12 +179,24 @@ int main(int argc, char** argv) {
         
         std::cout << "Starting " << numThreads << " concurrent threads..." << std::endl;
         
+        // Distribute files across threads (like benchmark distributes splits across drivers)
+        std::vector<std::vector<std::string>> threadFiles(numThreads);
+        for (size_t i = 0; i < parquetFiles.size(); ++i) {
+            threadFiles[i % numThreads].push_back(parquetFiles[i]);
+        }
+        
+        // Show file distribution
+        for (int i = 0; i < numThreads; ++i) {
+            std::cout << "Thread " << i << " will process " << threadFiles[i].size() << " files" << std::endl;
+        }
+        std::cout << "" << std::endl;
+        
         auto startTime = std::chrono::high_resolution_clock::now();
         
         // Launch worker threads (simulating multiple drivers)
         std::vector<std::thread> threads;
         for (int i = 0; i < numThreads; ++i) {
-            threads.emplace_back(workerThread, i, parquetFile, iterationsPerThread);
+            threads.emplace_back(workerThread, i, threadFiles[i], iterationsPerThread);
         }
         
         // Wait for all threads to complete
