@@ -22,6 +22,15 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
+// RMM includes (same as Utilities.cpp)
+#include <rmm/mr/device/arena_memory_resource.hpp>
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/managed_memory_resource.hpp>
+#include <rmm/mr/device/owning_wrapper.hpp>
+#include <rmm/mr/device/pool_memory_resource.hpp>
+
 #include <folly/init/Init.h>
 #include <iostream>
 #include <thread>
@@ -103,7 +112,7 @@ void workerThread(int threadId, const std::vector<std::string>& filePaths, int i
 
 int main(int argc, char** argv) {
     if (argc < 4 || argc > 7) {
-        std::cerr << "Usage: " << argv[0] << " <parquet_directory_or_file> <num_threads> <iterations_per_thread> [max_files] [chunk_limit_mb] [memory_percent]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <parquet_directory_or_file> <num_threads> <iterations_per_thread> [max_files] [chunk_limit_mb] [memory_pool_gb]" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4    # Limit to 4 files" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4 64    # 64MB chunks" << std::endl;
@@ -115,7 +124,7 @@ int main(int argc, char** argv) {
         std::cerr << "Parameters:" << std::endl;
         std::cerr << "  max_files: Limit number of files processed (useful to avoid memory exhaustion)" << std::endl;
         std::cerr << "  chunk_limit_mb: Chunk size in MB (default: 1024MB like benchmark, try 64MB to avoid pool limits)" << std::endl;
-        std::cerr << "  memory_pool_gb: Maximum pool size in GB (default: 80GB, try 30GB for async/pool)" << std::endl;
+        std::cerr << "  memory_pool_gb: Maximum pool size in GB (default: 30GB, try 50GB for large datasets)" << std::endl;
         std::cerr << "Set VELOX_CUDF_MEMORY_RESOURCE environment variable to test different allocators:" << std::endl;
         std::cerr << "  cuda (should work), pool (should fail), async (may fail)" << std::endl;
         return 1;
@@ -207,23 +216,19 @@ int main(int argc, char** argv) {
         std::cout << "Creating " << mrMode << " memory resource with max pool size: " 
                   << (maxPoolSizeBytes / (1024*1024*1024)) << " GB (" << maxPoolSizeBytes << " bytes)" << std::endl;
         
-        // Create memory resource with explicit maximum pool size
+        // Create memory resource using EXACT same API as Velox Utilities.cpp
         std::shared_ptr<rmm::mr::device_memory_resource> mr;
         if (mrMode == "cuda") {
             mr = std::make_shared<rmm::mr::cuda_memory_resource>();
         } else if (mrMode == "pool") {
-            // Create pool with explicit maximum size
+            // Use exact same API as makePoolMr() but with explicit size instead of percentage
             auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
             mr = rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
-                cuda_mr, 
-                0,  // initial_pool_size = 0 (let it grow as needed)
-                maxPoolSizeBytes  // maximum_pool_size = our specified size
-            );
+                cuda_mr, maxPoolSizeBytes);
         } else if (mrMode == "async") {
-            // Create async memory resource with explicit maximum size
+            // Use exact same API as makeAsyncMr() but with explicit size instead of percentage
             mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(
-                maxPoolSizeBytes  // pool_size = our specified size
-            );
+                maxPoolSizeBytes);
         } else {
             // Fallback to cuda for unknown types
             std::cout << "Unknown memory resource '" << mrMode << "', using cuda" << std::endl;
