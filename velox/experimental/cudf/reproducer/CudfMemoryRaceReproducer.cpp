@@ -40,7 +40,7 @@ using namespace facebook::velox;
 std::atomic<int> successCount{0};
 std::atomic<int> errorCount{0};
 
-void workerThread(int threadId, const std::vector<std::string>& filePaths, int iterations) {
+void workerThread(int threadId, const std::vector<std::string>& filePaths, int iterations, size_t chunkLimit) {
     try {
         std::cout << "Thread " << threadId << " starting with " << filePaths.size() << " files..." << std::endl;
         
@@ -61,9 +61,7 @@ void workerThread(int threadId, const std::vector<std::string>& filePaths, int i
                 // Get stream exactly like the existing reproducer
                 auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
                 
-                // Create chunked reader with smaller chunks to avoid memory exhaustion
-                // Focus on triggering race conditions in memory allocator, not hitting memory limits
-                size_t chunkLimit = 64 * 1024 * 1024; // 64MB chunks (smaller than 100MB pool limit)
+                // Use configurable chunk limit
                 auto reader = cudf::io::chunked_parquet_reader(
                     chunkLimit, // Limit chunk size to avoid memory exhaustion
                     0, // passLimit = 0 (no limit)
@@ -104,15 +102,18 @@ void workerThread(int threadId, const std::vector<std::string>& filePaths, int i
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4 || argc > 5) {
-        std::cerr << "Usage: " << argv[0] << " <parquet_directory_or_file> <num_threads> <iterations_per_thread> [max_files]" << std::endl;
+    if (argc < 4 || argc > 6) {
+        std::cerr << "Usage: " << argv[0] << " <parquet_directory_or_file> <num_threads> <iterations_per_thread> [max_files] [chunk_limit_mb]" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5" << std::endl;
         std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4    # Limit to 4 files" << std::endl;
-        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5" << std::endl;
+        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem 8 5 4 64    # 64MB chunks" << std::endl;
+        std::cerr << "Example: " << argv[0] << " /data/tpch/lineitem/lineitem.parquet 8 5 1 1024    # 1GB chunks" << std::endl;
         std::cerr << "" << std::endl;
         std::cerr << "This reproducer tests for memory allocator race conditions in cuDF." << std::endl;
         std::cerr << "Uses the same cuDF API as the existing reproducer but with multiple threads." << std::endl;
-        std::cerr << "Use max_files to limit the number of files processed (useful to avoid memory exhaustion)." << std::endl;
+        std::cerr << "Parameters:" << std::endl;
+        std::cerr << "  max_files: Limit number of files processed (useful to avoid memory exhaustion)" << std::endl;
+        std::cerr << "  chunk_limit_mb: Chunk size in MB (default: 1024MB like benchmark, try 64MB to avoid pool limits)" << std::endl;
         std::cerr << "Set VELOX_CUDF_MEMORY_RESOURCE environment variable to test different allocators:" << std::endl;
         std::cerr << "  cuda (should work), pool (should fail), async (may fail)" << std::endl;
         return 1;
@@ -121,7 +122,10 @@ int main(int argc, char** argv) {
     std::string inputPath = argv[1];
     int numThreads = std::stoi(argv[2]);
     int iterationsPerThread = std::stoi(argv[3]);
-    int maxFiles = (argc == 5) ? std::stoi(argv[4]) : -1; // -1 means no limit
+    int maxFiles = (argc >= 5) ? std::stoi(argv[4]) : -1; // -1 means no limit
+    int chunkLimitMB = (argc == 6) ? std::stoi(argv[5]) : 1024; // Default 1024MB like benchmark
+    
+    size_t chunkLimit = static_cast<size_t>(chunkLimitMB) * 1024 * 1024; // Convert MB to bytes
 
     // Discover parquet files (like the benchmark does)
     std::vector<std::string> parquetFiles;
@@ -176,6 +180,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "Threads: " << numThreads << std::endl;
     std::cout << "Iterations per thread: " << iterationsPerThread << std::endl;
+    std::cout << "Chunk limit: " << chunkLimitMB << "MB (" << chunkLimit << " bytes)" << std::endl;
     std::cout << "Total operations: " << (numThreads * iterationsPerThread * parquetFiles.size()) << std::endl;
     
     // Show current memory resource
@@ -209,7 +214,7 @@ int main(int argc, char** argv) {
         // Launch worker threads (simulating multiple drivers)
         std::vector<std::thread> threads;
         for (int i = 0; i < numThreads; ++i) {
-            threads.emplace_back(workerThread, i, threadFiles[i], iterationsPerThread);
+            threads.emplace_back(workerThread, i, threadFiles[i], iterationsPerThread, chunkLimit);
         }
         
         // Wait for all threads to complete
