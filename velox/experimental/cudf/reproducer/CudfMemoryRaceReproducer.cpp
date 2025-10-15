@@ -205,15 +205,35 @@ int main(int argc, char** argv) {
         // Initialize Velox (same as existing reproducer)
         folly::Init init{&argc, &argv, false};
         
-        // SOLUTION: Use Velox's existing createMemoryResource function with configurable percentage
+        // SOLUTION: Bypass percentage calculation and use fixed size
         
         const char* memResource = std::getenv("VELOX_CUDF_MEMORY_RESOURCE");
         const std::string mrMode = memResource ? memResource : "cuda";
         
-        std::cout << "Creating " << mrMode << " memory resource with " << memoryPercent << "% of GPU memory" << std::endl;
+        std::cout << "Creating " << mrMode << " memory resource" << std::endl;
         
-        // Use Velox's existing createMemoryResource function (guaranteed to compile)
-        auto mr = cudf_velox::createMemoryResource(mrMode, memoryPercent);
+        // For pool and async, use a large fixed size instead of percentage
+        std::shared_ptr<rmm::mr::device_memory_resource> mr;
+        if (mrMode == "cuda") {
+            mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+            std::cout << "Using cuda memory resource (no pool limits)" << std::endl;
+        } else {
+            // For pool/async, use a large fixed size (10GB) instead of percentage
+            size_t fixedPoolSize = 10ULL * 1024 * 1024 * 1024; // 10GB
+            std::cout << "Using fixed pool size: 10GB instead of percentage (to bypass RMM percentage calculation bug)" << std::endl;
+            
+            if (mrMode == "pool") {
+                auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+                mr = rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(cuda_mr, fixedPoolSize);
+            } else if (mrMode == "async") {
+                mr = std::make_shared<rmm::mr::cuda_async_memory_resource>(fixedPoolSize);
+            } else {
+                // Fallback to cuda for unknown types
+                std::cout << "Unknown memory resource '" << mrMode << "', using cuda" << std::endl;
+                mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+            }
+        }
+        
         cudf::set_current_device_resource(mr.get());
         
         // Initialize CUDA context (same as registerCudf does)
