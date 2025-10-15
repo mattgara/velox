@@ -28,6 +28,7 @@
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/logging_resource_adaptor.hpp>
 #include <rmm/mr/device/managed_memory_resource.hpp>
 #include <rmm/mr/device/owning_wrapper.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
@@ -73,21 +74,41 @@ namespace {
 std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
     std::string_view mode,
     int percent) {
+  std::shared_ptr<rmm::mr::device_memory_resource> mr;
+  
   if (mode == "cuda")
-    return makeCudaMr();
-  if (mode == "pool")
-    return makePoolMr(percent);
-  if (mode == "async")
-    return makeAsyncMr(percent);
-  if (mode == "arena")
-    return makeArenaMr(percent);
-  if (mode == "managed")
-    return makeManagedMr();
-  if (mode == "managed_pool")
-    return makeManagedPoolMr(percent);
-  VELOX_FAIL(
-      "Unknown memory resource mode: " + std::string(mode) +
-      "\nExpecting: cuda, pool, async, arena, managed, or managed_pool");
+    mr = makeCudaMr();
+  else if (mode == "pool")
+    mr = makePoolMr(percent);
+  else if (mode == "async")
+    mr = makeAsyncMr(percent);
+  else if (mode == "arena")
+    mr = makeArenaMr(percent);
+  else if (mode == "managed")
+    mr = makeManagedMr();
+  else if (mode == "managed_pool")
+    mr = makeManagedPoolMr(percent);
+  else {
+    VELOX_FAIL(
+        "Unknown memory resource mode: " + std::string(mode) +
+        "\nExpecting: cuda, pool, async, arena, managed, or managed_pool");
+  }
+
+  // Check if RMM memory event logging is enabled
+  const char* enableLogging = std::getenv("VELOX_RMM_MEMORY_LOGGING");
+  if (enableLogging && (std::string(enableLogging) == "true" || std::string(enableLogging) == "1")) {
+    // Get log file path from environment or use default
+    const char* logFile = std::getenv("VELOX_RMM_LOG_FILE");
+    std::string logPath = logFile ? std::string(logFile) : "rmm_memory_events.csv";
+    
+    // Wrap the memory resource with logging adaptor
+    auto logging_mr = std::make_shared<rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource>>(
+        mr, logPath);
+    
+    return logging_mr;
+  }
+  
+  return mr;
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
