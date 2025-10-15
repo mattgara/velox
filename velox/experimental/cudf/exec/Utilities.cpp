@@ -96,15 +96,35 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   }
 
   // Check if RMM memory event logging is enabled via RMM_LOG_FILE environment variable
-  // As per RMM docs: if filename not specified, RMM_LOG_FILE is checked, if not set exception is thrown
   const char* rmm_log_file = std::getenv("RMM_LOG_FILE");
   if (rmm_log_file) {
     std::string logPath(rmm_log_file);
     
-    // Create logging adaptor as per RMM documentation
-    // Use the generic device_memory_resource wrapper for all types
-    return std::make_shared<rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource>>(
-        mr.get(), logPath);
+    // Wrapper class that holds both resources but acts like the logging resource
+    class LoggingWrapper : public rmm::mr::device_memory_resource {
+    private:
+      std::shared_ptr<rmm::mr::device_memory_resource> upstream_mr_;
+      rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource> logging_mr_;
+      
+    public:
+      LoggingWrapper(std::shared_ptr<rmm::mr::device_memory_resource> upstream, const std::string& logFile)
+        : upstream_mr_(std::move(upstream)), logging_mr_(upstream_mr_.get(), logFile) {}
+      
+      // Delegate all device_memory_resource methods to logging_mr_
+      void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override {
+        return logging_mr_.allocate(bytes, stream);
+      }
+      
+      void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override {
+        logging_mr_.deallocate(ptr, bytes, stream);
+      }
+      
+      bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
+        return logging_mr_.is_equal(other);
+      }
+    };
+    
+    return std::make_shared<LoggingWrapper>(mr, logPath);
   }
   
   return mr;
