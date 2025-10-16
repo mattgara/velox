@@ -40,6 +40,8 @@
 #include <memory>
 #include <string_view>
 
+#include <cuda_runtime.h>
+
 namespace facebook::velox::cudf_velox {
 
 namespace {
@@ -116,6 +118,8 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       }
       
       void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override {
+        // DEBUG: Synchronize device before deallocate to catch use-after-free timing issues
+        cudaDeviceSynchronize();
         logging_mr_.deallocate(ptr, bytes, stream);
       }
       
