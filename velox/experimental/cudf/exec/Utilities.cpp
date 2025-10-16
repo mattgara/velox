@@ -39,10 +39,19 @@
 #include <cstring>
 #include <memory>
 #include <string_view>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
+#include <mutex>
 
 #include <cuda_runtime.h>
+#include <execinfo.h>  // For backtrace
 
 namespace facebook::velox::cudf_velox {
+
+// Global mutex for thread-safe stack trace logging
+static std::mutex g_stack_trace_mutex;
 
 namespace {
 [[nodiscard]] auto makeCudaMr() {
@@ -120,7 +129,62 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override {
         // DEBUG: Synchronize device before deallocate to catch use-after-free timing issues
         cudaDeviceSynchronize();
+        
+        // Capture stack trace for deallocate calls
+        captureStackTrace(ptr, bytes, stream);
+        
         logging_mr_.deallocate(ptr, bytes, stream);
+      }
+      
+    private:
+      void captureStackTrace(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+        const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
+        if (!stack_trace_file) return;
+        
+        // Get current timestamp
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        
+        // Capture stack trace (use large buffer for deep call stacks)
+        void* trace[512];
+        int trace_size = backtrace(trace, 512);
+        char** symbols = backtrace_symbols(trace, trace_size);
+        
+        // Build stack trace string (escape commas and newlines for CSV)
+        std::stringstream stack_trace_ss;
+        for (int i = 0; i < trace_size; ++i) {
+          std::string symbol = symbols[i] ? symbols[i] : "unknown";
+          // Replace commas and newlines to keep CSV format clean
+          for (char& c : symbol) {
+            if (c == ',' || c == '\n' || c == '\r') c = '|';
+          }
+          if (i > 0) stack_trace_ss << ";";
+          stack_trace_ss << symbol;
+        }
+        
+        // Write to CSV file (thread-safe append)
+        std::lock_guard<std::mutex> lock(g_stack_trace_mutex);
+        
+        std::ofstream csv_file(stack_trace_file, std::ios::app);
+        if (csv_file.is_open()) {
+          // Check if file is empty to write header
+          csv_file.seekp(0, std::ios::end);
+          if (csv_file.tellp() == 0) {
+            csv_file << "Timestamp,Pointer,Size,Stream,StackTrace\n";
+          }
+          
+          // Write the stack trace entry
+          csv_file << std::put_time(std::localtime(&time_t), "%H:%M:%S") 
+                   << "." << std::setfill('0') << std::setw(3) << ms.count()
+                   << ",0x" << std::hex << reinterpret_cast<uintptr_t>(ptr)
+                   << "," << std::dec << bytes
+                   << "," << stream.value()
+                   << ",\"" << stack_trace_ss.str() << "\"\n";
+          csv_file.close();
+        }
+        
+        free(symbols);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
