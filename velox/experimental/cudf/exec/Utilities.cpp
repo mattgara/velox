@@ -46,10 +46,14 @@
 #include <chrono>
 #include <mutex>
 #include <algorithm>  // For std::sort
+#include <vector>     // For std::vector
 
 #include <cuda_runtime.h>
-#include <execinfo.h>  // For backtrace
 #include <csignal>     // For signal handling
+#include <boost/stacktrace.hpp>  // For fast stack traces
+
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/logging_resource_adaptor.hpp>
 
 namespace facebook::velox::cudf_velox {
 
@@ -204,44 +208,30 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
           t_buffer_registered = true;
         }
         
-        // Get current timestamp
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        // Get current timestamp (lightweight)
+        auto now = std::chrono::high_resolution_clock::now();
+        auto ns = now.time_since_epoch().count();
         
-        // Capture stack trace (use large buffer for deep call stacks)
-        void* trace[512];
-        int trace_size = backtrace(trace, 512);
-        char** symbols = backtrace_symbols(trace, trace_size);
+        // Capture stack trace using Boost (much faster than glibc backtrace)
+        // Limit to reasonable depth for performance
+        auto st = boost::stacktrace::stacktrace(0, 16);  // Skip 0 frames, capture up to 16
         
-        // Build stack trace string (escape commas and newlines for CSV)
-        std::stringstream stack_trace_ss;
-        for (int i = 0; i < trace_size; ++i) {
-          std::string symbol = symbols[i] ? symbols[i] : "unknown";
-          // Replace commas and newlines to keep CSV format clean
-          for (char& c : symbol) {
-            if (c == ',' || c == '\n' || c == '\r') c = '|';
-          }
-          if (i > 0) stack_trace_ss << ";";
-          stack_trace_ss << symbol;
+        // Convert to string and clean for CSV
+        std::string stack_trace_str = boost::stacktrace::to_string(st);
+        // Replace commas and newlines to keep CSV format clean
+        for (char& c : stack_trace_str) {
+          if (c == ',' || c == '\n' || c == '\r') c = '|';
         }
-        
-        // Build timestamp string
-        std::stringstream timestamp_ss;
-        timestamp_ss << std::put_time(std::localtime(&time_t), "%H:%M:%S") 
-                     << "." << std::setfill('0') << std::setw(3) << ms.count();
         
         // Store in thread-local buffer (no mutex needed - thread-local)
         StackTraceEntry entry;
-        entry.timestamp = timestamp_ss.str();
+        entry.timestamp = std::to_string(ns);  // Nanosecond timestamp as string
         entry.pointer = reinterpret_cast<uintptr_t>(ptr);
         entry.size = bytes;
-        entry.stream = reinterpret_cast<uintptr_t>(stream.value());  // Convert stream pointer to uint64_t
-        entry.stack_trace = stack_trace_ss.str();
+        entry.stream = reinterpret_cast<uintptr_t>(stream.value());
+        entry.stack_trace = std::move(stack_trace_str);
         
         t_stack_trace_buffer.push_back(std::move(entry));
-        
-        free(symbols);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
