@@ -39,6 +39,11 @@ namespace facebook::velox::cudf_velox {
 createMemoryResource(std::string_view mode, int percent);
 
 /**
+ * @brief Flushes all thread-local stack trace buffers to file.
+ */
+void flushStackTraceBuffers();
+
+/**
  * @brief Returns the global CUDA stream pool used by cudf.
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();

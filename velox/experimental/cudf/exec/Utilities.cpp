@@ -39,19 +39,72 @@
 #include <cstring>
 #include <memory>
 #include <string_view>
+#include <cstdint>     // For uint64_t, uintptr_t
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
 #include <mutex>
+#include <algorithm>  // For std::sort
 
 #include <cuda_runtime.h>
 #include <execinfo.h>  // For backtrace
+#include <csignal>     // For signal handling
 
 namespace facebook::velox::cudf_velox {
 
-// Global mutex for thread-safe stack trace logging
-static std::mutex g_stack_trace_mutex;
+// Thread-local storage for stack trace entries
+struct StackTraceEntry {
+  std::string timestamp;
+  uintptr_t pointer;
+  size_t size;
+  uint64_t stream;
+  std::string stack_trace;
+};
+
+// Global collection of all thread-local buffers
+static std::vector<std::vector<StackTraceEntry>*> g_thread_buffers;
+static std::mutex g_buffer_registry_mutex;
+
+// Thread-local buffer for this thread's stack traces
+thread_local std::vector<StackTraceEntry> t_stack_trace_buffer;
+thread_local bool t_buffer_registered = false;
+
+// Signal handler registration state
+static bool g_signal_handlers_installed = false;
+static std::mutex g_signal_handler_mutex;
+
+// Forward declaration
+void flushStackTraceBuffers();
+
+// Signal handler for crash-safe stack trace flushing
+void crashSignalHandler(int signal) {
+  // Try to flush stack traces before crashing
+  try {
+    flushStackTraceBuffers();
+  } catch (...) {
+    // Ignore any errors during crash handling
+  }
+  
+  // Re-raise the signal to get normal crash behavior
+  std::signal(signal, SIG_DFL);
+  std::raise(signal);
+}
+
+// Install signal handlers for crash-safe flushing
+void installCrashHandlers() {
+  std::lock_guard<std::mutex> lock(g_signal_handler_mutex);
+  if (g_signal_handlers_installed) return;
+  
+  // Install handlers for common crash signals
+  std::signal(SIGSEGV, crashSignalHandler);  // Segmentation fault
+  std::signal(SIGABRT, crashSignalHandler);  // Abort
+  std::signal(SIGFPE, crashSignalHandler);   // Floating point exception
+  std::signal(SIGILL, crashSignalHandler);   // Illegal instruction
+  std::signal(SIGBUS, crashSignalHandler);   // Bus error
+  
+  g_signal_handlers_installed = true;
+}
 
 namespace {
 [[nodiscard]] auto makeCudaMr() {
@@ -141,6 +194,16 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
         
+        // Install crash handlers on first use
+        installCrashHandlers();
+        
+        // Register this thread's buffer if not already done
+        if (!t_buffer_registered) {
+          std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
+          g_thread_buffers.push_back(&t_stack_trace_buffer);
+          t_buffer_registered = true;
+        }
+        
         // Get current timestamp
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -163,26 +226,20 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
           stack_trace_ss << symbol;
         }
         
-        // Write to CSV file (thread-safe append)
-        std::lock_guard<std::mutex> lock(g_stack_trace_mutex);
+        // Build timestamp string
+        std::stringstream timestamp_ss;
+        timestamp_ss << std::put_time(std::localtime(&time_t), "%H:%M:%S") 
+                     << "." << std::setfill('0') << std::setw(3) << ms.count();
         
-        std::ofstream csv_file(stack_trace_file, std::ios::app);
-        if (csv_file.is_open()) {
-          // Check if file is empty to write header
-          csv_file.seekp(0, std::ios::end);
-          if (csv_file.tellp() == 0) {
-            csv_file << "Timestamp,Pointer,Size,Stream,StackTrace\n";
-          }
-          
-          // Write the stack trace entry
-          csv_file << std::put_time(std::localtime(&time_t), "%H:%M:%S") 
-                   << "." << std::setfill('0') << std::setw(3) << ms.count()
-                   << ",0x" << std::hex << reinterpret_cast<uintptr_t>(ptr)
-                   << "," << std::dec << bytes
-                   << "," << stream.value()
-                   << ",\"" << stack_trace_ss.str() << "\"\n";
-          csv_file.close();
-        }
+        // Store in thread-local buffer (no mutex needed - thread-local)
+        StackTraceEntry entry;
+        entry.timestamp = timestamp_ss.str();
+        entry.pointer = reinterpret_cast<uintptr_t>(ptr);
+        entry.size = bytes;
+        entry.stream = stream.value();
+        entry.stack_trace = stack_trace_ss.str();
+        
+        t_stack_trace_buffer.push_back(std::move(entry));
         
         free(symbols);
       }
@@ -196,6 +253,50 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   }
   
   return mr;
+}
+
+// Function to flush all thread-local stack trace buffers to file
+void flushStackTraceBuffers() {
+  const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
+  if (!stack_trace_file) return;
+  
+  std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
+  
+  std::ofstream csv_file(stack_trace_file);
+  if (!csv_file.is_open()) return;
+  
+  // Write header
+  csv_file << "Timestamp,Pointer,Size,Stream,StackTrace\n";
+  
+  // Collect all entries from all thread buffers
+  std::vector<StackTraceEntry> all_entries;
+  for (auto* buffer : g_thread_buffers) {
+    if (buffer) {
+      all_entries.insert(all_entries.end(), buffer->begin(), buffer->end());
+    }
+  }
+  
+  // Sort by timestamp for chronological order
+  std::sort(all_entries.begin(), all_entries.end(), 
+    [](const StackTraceEntry& a, const StackTraceEntry& b) {
+      return a.timestamp < b.timestamp;
+    });
+  
+  // Write all entries
+  for (const auto& entry : all_entries) {
+    csv_file << entry.timestamp
+             << ",0x" << std::hex << entry.pointer
+             << "," << std::dec << entry.size
+             << "," << entry.stream
+             << ",\"" << entry.stack_trace << "\"\n";
+  }
+  
+  csv_file.close();
+  
+  // Clear all buffers
+  for (auto* buffer : g_thread_buffers) {
+    if (buffer) buffer->clear();
+  }
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
