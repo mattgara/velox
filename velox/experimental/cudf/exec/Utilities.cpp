@@ -122,6 +122,12 @@ CallSiteInfo getCallSiteInfo(void* return_addr) {
 
 // Check if a call site should be synchronized
 bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
+  // Check if sync is completely disabled
+  const char* disable_sync = std::getenv("RMM_SYNC_DISABLE");
+  if (disable_sync && std::string(disable_sync) == "1") {
+    return false;
+  }
+  
   const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
   
   // If no sync file is specified, sync ALL call sites (for initial data collection)
