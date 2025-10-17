@@ -313,7 +313,15 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
           if (debug_env && std::string(debug_env) == "1") {
             static int sync_count = 0;
             sync_count++;
-            if (sync_count <= 5) {  // Only log first 5 syncs to avoid spam
+            
+            // Get debug limit from environment (default 16)
+            static int debug_limit = -1;
+            if (debug_limit == -1) {
+              const char* limit_env = std::getenv("RMM_SYNC_DEBUG_LIMIT");
+              debug_limit = limit_env ? std::atoi(limit_env) : 16;
+            }
+            
+            if (sync_count <= debug_limit) {
               std::cerr << "DEBUG: SYNC #" << sync_count << " at " 
                         << call_site.module_name << "+0x" << std::hex << call_site.call_offset 
                         << " (ptr=0x" << std::hex << ptr << ", size=" << std::dec << bytes << ")" << std::endl;
