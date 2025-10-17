@@ -95,17 +95,33 @@ struct CallSiteInfo {
   std::string module_name;
   uintptr_t module_base;
   uintptr_t call_offset;
+  std::vector<uintptr_t> stack_offsets;  // Multi-level stack trace
 };
 
-// Extract call site information from return address (reusable function)
-CallSiteInfo getCallSiteInfo(void* return_addr) {
+// Extract call site information with multi-level stack trace
+CallSiteInfo getCallSiteInfo() {
   CallSiteInfo info;
   info.module_name = "unknown";
   info.module_base = 0;
-  info.call_offset = reinterpret_cast<uintptr_t>(return_addr);
+  info.call_offset = 0;
+  
+  // Capture up to 8 levels of return addresses
+  void* return_addrs[8];
+  return_addrs[0] = __builtin_return_address(0);
+  return_addrs[1] = __builtin_return_address(1);
+  return_addrs[2] = __builtin_return_address(2);
+  return_addrs[3] = __builtin_return_address(3);
+  return_addrs[4] = __builtin_return_address(4);
+  return_addrs[5] = __builtin_return_address(5);
+  return_addrs[6] = __builtin_return_address(6);
+  return_addrs[7] = __builtin_return_address(7);
+  
+  // Use the first (immediate caller) for primary module info
+  void* primary_addr = return_addrs[0];
+  info.call_offset = reinterpret_cast<uintptr_t>(primary_addr);
   
   Dl_info dl_info;
-  if (dladdr(return_addr, &dl_info) != 0) {
+  if (dladdr(primary_addr, &dl_info) != 0) {
     if (dl_info.dli_fname) {
       // Extract just the filename, not full path
       const char* filename = strrchr(dl_info.dli_fname, '/');
@@ -113,7 +129,23 @@ CallSiteInfo getCallSiteInfo(void* return_addr) {
     }
     if (dl_info.dli_fbase) {
       info.module_base = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
-      info.call_offset = reinterpret_cast<uintptr_t>(return_addr) - info.module_base;
+      info.call_offset = reinterpret_cast<uintptr_t>(primary_addr) - info.module_base;
+    }
+  }
+  
+  // Calculate offsets for all stack levels
+  for (int i = 0; i < 8; i++) {
+    if (return_addrs[i] != nullptr) {
+      Dl_info level_info;
+      if (dladdr(return_addrs[i], &level_info) != 0 && level_info.dli_fbase) {
+        uintptr_t level_base = reinterpret_cast<uintptr_t>(level_info.dli_fbase);
+        uintptr_t level_offset = reinterpret_cast<uintptr_t>(return_addrs[i]) - level_base;
+        info.stack_offsets.push_back(level_offset);
+      } else {
+        info.stack_offsets.push_back(reinterpret_cast<uintptr_t>(return_addrs[i]));
+      }
+    } else {
+      break;  // Stop at first null address
     }
   }
   
@@ -161,7 +193,7 @@ bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
                        const std::string& module_name, uintptr_t module_base, 
-                       uintptr_t call_offset) {
+                       uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   
   // Open in append mode
@@ -172,6 +204,13 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
   auto now = std::chrono::high_resolution_clock::now();
   auto ns = now.time_since_epoch().count();
   
+  // Build stack trace string
+  std::ostringstream stack_trace;
+  for (size_t i = 0; i < stack_offsets.size(); i++) {
+    if (i > 0) stack_trace << "->";
+    stack_trace << "0x" << std::hex << stack_offsets[i];
+  }
+  
   // Write entry
   file << ns
        << ",0x" << std::hex << pointer
@@ -181,7 +220,8 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
        << "," << std::dec << device_id
        << ",\"" << module_name << "\""
        << ",0x" << std::hex << module_base
-       << ",0x" << std::hex << call_offset << "\n";
+       << ",0x" << std::hex << call_offset
+       << ",\"" << stack_trace.str() << "\"\n";
 }
 
 namespace {
@@ -259,8 +299,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       
       void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override {
         // Get call site info first (before any synchronization)
-        void* return_addr = __builtin_return_address(0);
-        CallSiteInfo call_site = getCallSiteInfo(return_addr);
+        CallSiteInfo call_site = getCallSiteInfo();
         
         // Conditional synchronization for bisection search
         if (shouldSyncCallSite(call_site.module_name, call_site.call_offset)) {
@@ -290,8 +329,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         if (!stack_trace_file) return;
         
         // Get caller address and extract call site info
-        void* return_addr = __builtin_return_address(0);
-        CallSiteInfo call_site = getCallSiteInfo(return_addr);
+        CallSiteInfo call_site = getCallSiteInfo();
         
         // Get current device and thread info
         int device_id = -1;
@@ -307,7 +345,8 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
                           device_id,
                           call_site.module_name,
                           call_site.module_base,
-                          call_site.call_offset);
+                          call_site.call_offset,
+                          call_site.stack_offsets);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
@@ -333,7 +372,7 @@ void flushCallSiteBuffers() {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
   if (csv_file.is_open()) {
-    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset\n";
+    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace\n";
   }
 }
 
