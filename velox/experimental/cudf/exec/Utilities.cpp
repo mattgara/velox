@@ -41,10 +41,14 @@
 #include <memory>
 #include <cstdint>     // For uint64_t, uintptr_t
 #include <fstream>
+#include <sstream>    // For std::ostringstream
+#include <iostream>   // For std::cerr
+#include <string>     // For std::string, std::getline
 #include <chrono>
 #include <mutex>
 #include <algorithm>  // For std::sort
 #include <vector>     // For std::vector
+#include <unordered_set>  // For std::unordered_set
 
 #include <cuda_runtime.h>
 #include <csignal>     // For signal handling
@@ -55,6 +59,86 @@ namespace facebook::velox::cudf_velox {
 
 // Simple direct-to-file logging to avoid deadlocks
 static std::mutex g_csv_file_mutex;
+
+// Bisection search support: set of call sites that should be synchronized
+static std::unordered_set<std::string> g_sync_call_sites;
+static std::mutex g_sync_call_sites_mutex;
+
+// Load call sites to synchronize from file (for bisection search)
+void loadSyncCallSites() {
+  const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
+  if (!sync_file) return;
+  
+  std::lock_guard<std::mutex> lock(g_sync_call_sites_mutex);
+  g_sync_call_sites.clear();
+  
+  std::ifstream file(sync_file);
+  if (!file.is_open()) {
+    std::cerr << "Warning: Could not open RMM_SYNC_CALL_SITES_FILE: " << sync_file << std::endl;
+    return;
+  }
+  
+  std::string line;
+  while (std::getline(file, line)) {
+    // Skip empty lines and comments
+    if (line.empty() || line[0] == '#') continue;
+    
+    // Expected format: "module_name+0xoffset" (e.g., "velox_cudf_tpch_benchmark+0x127060")
+    g_sync_call_sites.insert(line);
+  }
+  
+  std::cerr << "Loaded " << g_sync_call_sites.size() << " call sites for synchronization from " << sync_file << std::endl;
+}
+
+// Structure to hold call site information
+struct CallSiteInfo {
+  std::string module_name;
+  uintptr_t module_base;
+  uintptr_t call_offset;
+};
+
+// Extract call site information from return address (reusable function)
+CallSiteInfo getCallSiteInfo(void* return_addr) {
+  CallSiteInfo info;
+  info.module_name = "unknown";
+  info.module_base = 0;
+  info.call_offset = reinterpret_cast<uintptr_t>(return_addr);
+  
+  Dl_info dl_info;
+  if (dladdr(return_addr, &dl_info) != 0) {
+    if (dl_info.dli_fname) {
+      // Extract just the filename, not full path
+      const char* filename = strrchr(dl_info.dli_fname, '/');
+      info.module_name = filename ? (filename + 1) : dl_info.dli_fname;
+    }
+    if (dl_info.dli_fbase) {
+      info.module_base = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
+      info.call_offset = reinterpret_cast<uintptr_t>(return_addr) - info.module_base;
+    }
+  }
+  
+  return info;
+}
+
+// Check if a call site should be synchronized
+bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
+  const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
+  
+  // If no sync file is specified, sync ALL call sites (for initial data collection)
+  if (!sync_file) {
+    return true;
+  }
+  
+  std::lock_guard<std::mutex> lock(g_sync_call_sites_mutex);
+  if (g_sync_call_sites.empty()) return false;
+  
+  // Format: "module_name+0xoffset"
+  std::ostringstream oss;
+  oss << module_name << "+0x" << std::hex << call_offset;
+  std::string call_site_id = oss.str();
+  
+  return g_sync_call_sites.find(call_site_id) != g_sync_call_sites.end();
+}
 
 // Simple helper to write one entry directly to CSV file
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
@@ -157,10 +241,16 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       }
       
       void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override {
-        // DEBUG: Synchronize device before deallocate to catch use-after-free timing issues
-        cudaDeviceSynchronize();
+        // Get call site info first (before any synchronization)
+        void* return_addr = __builtin_return_address(0);
+        CallSiteInfo call_site = getCallSiteInfo(return_addr);
         
-        // Capture stack trace for deallocate calls
+        // Conditional synchronization for bisection search
+        if (shouldSyncCallSite(call_site.module_name, call_site.call_offset)) {
+          cudaDeviceSynchronize();
+        }
+        
+        // Capture call site for logging (if enabled)
         captureCallSite(ptr, bytes, stream);
         
         logging_mr_.deallocate(ptr, bytes, stream);
@@ -171,26 +261,9 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
         
-        // Get caller address (extremely fast)
+        // Get caller address and extract call site info
         void* return_addr = __builtin_return_address(0);
-        
-        // Use dladdr to get module info (fast lookup)
-        Dl_info dl_info;
-        std::string module_name = "unknown";
-        uintptr_t module_base = 0;
-        uintptr_t call_offset = reinterpret_cast<uintptr_t>(return_addr);
-        
-        if (dladdr(return_addr, &dl_info) != 0) {
-          if (dl_info.dli_fname) {
-            // Extract just the filename, not full path
-            const char* filename = strrchr(dl_info.dli_fname, '/');
-            module_name = filename ? (filename + 1) : dl_info.dli_fname;
-          }
-          if (dl_info.dli_fbase) {
-            module_base = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
-            call_offset = reinterpret_cast<uintptr_t>(return_addr) - module_base;
-          }
-        }
+        CallSiteInfo call_site = getCallSiteInfo(return_addr);
         
         // Get current device and thread info
         int device_id = -1;
@@ -204,15 +277,18 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
                           reinterpret_cast<uintptr_t>(stream.value()),
                           thread_id,
                           device_id,
-                          module_name,
-                          module_base,
-                          call_offset);
+                          call_site.module_name,
+                          call_site.module_base,
+                          call_site.call_offset);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
         return logging_mr_.is_equal(other);
       }
     };
+    
+    // Load call sites for bisection search (if specified)
+    loadSyncCallSites();
     
     return std::make_shared<LoggingWrapper>(mr, logPath);
   }
