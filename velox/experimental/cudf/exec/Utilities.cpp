@@ -105,7 +105,10 @@ CallSiteInfo getCallSiteInfo() {
   info.module_base = 0;
   info.call_offset = 0;
   
-  // Capture up to 8 levels of return addresses
+  // Capture up to 8 levels of return addresses (fast approach)
+  // Silence the frame-address warning for this specific section
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-address"
   void* return_addrs[8];
   return_addrs[0] = __builtin_return_address(0);
   return_addrs[1] = __builtin_return_address(1);
@@ -115,6 +118,7 @@ CallSiteInfo getCallSiteInfo() {
   return_addrs[5] = __builtin_return_address(5);
   return_addrs[6] = __builtin_return_address(6);
   return_addrs[7] = __builtin_return_address(7);
+#pragma GCC diagnostic pop
   
   // Use the first (immediate caller) for primary module info
   void* primary_addr = return_addrs[0];
