@@ -41,7 +41,7 @@ createMemoryResource(std::string_view mode, int percent);
 /**
  * @brief Flushes all thread-local stack trace buffers to file.
  */
-void flushStackTraceBuffers();
+void flushCallSiteBuffers();
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

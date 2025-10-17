@@ -417,7 +417,7 @@ void registerCudf(const CudfOptions& options) {
 
 void unregisterCudf() {
   // Flush stack trace buffers before cleanup
-  cudf_velox::flushStackTraceBuffers();
+  cudf_velox::flushCallSiteBuffers();
   
   exec::DriverFactory::adapters.erase(
       std::remove_if(

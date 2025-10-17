@@ -32,17 +32,15 @@
 #include <rmm/mr/device/managed_memory_resource.hpp>
 #include <rmm/mr/device/owning_wrapper.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <common/base/Exceptions.h>
 
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <string_view>
 #include <cstdint>     // For uint64_t, uintptr_t
 #include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <chrono>
 #include <mutex>
 #include <algorithm>  // For std::sort
@@ -50,28 +48,30 @@
 
 #include <cuda_runtime.h>
 #include <csignal>     // For signal handling
-#include <boost/stacktrace.hpp>  // For fast stack traces
-
-#include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/logging_resource_adaptor.hpp>
+#include <dlfcn.h>     // For dladdr()
+#include <pthread.h>   // For pthread_self()
 
 namespace facebook::velox::cudf_velox {
 
-// Thread-local storage for stack trace entries
-struct StackTraceEntry {
+// Thread-local storage for call site entries
+struct CallSiteEntry {
   std::string timestamp;
   uintptr_t pointer;
   size_t size;
   uint64_t stream;
-  std::string stack_trace;
+  uint64_t thread_id;
+  int device_id;
+  std::string module_name;  // dli_fname
+  uintptr_t module_base;    // dli_fbase  
+  uintptr_t call_offset;    // return_addr - module_base
 };
 
 // Global collection of all thread-local buffers
-static std::vector<std::vector<StackTraceEntry>*> g_thread_buffers;
+static std::vector<std::vector<CallSiteEntry>*> g_thread_buffers;
 static std::mutex g_buffer_registry_mutex;
 
-// Thread-local buffer for this thread's stack traces
-thread_local std::vector<StackTraceEntry> t_stack_trace_buffer;
+// Thread-local buffer for this thread's call sites
+thread_local std::vector<CallSiteEntry> t_call_site_buffer;
 thread_local bool t_buffer_registered = false;
 
 // Signal handler registration state
@@ -79,13 +79,13 @@ static bool g_signal_handlers_installed = false;
 static std::mutex g_signal_handler_mutex;
 
 // Forward declaration
-void flushStackTraceBuffers();
+void flushCallSiteBuffers();
 
-// Signal handler for crash-safe stack trace flushing
+// Signal handler for crash-safe call site flushing
 void crashSignalHandler(int signal) {
-  // Try to flush stack traces before crashing
+  // Try to flush call sites before crashing
   try {
-    flushStackTraceBuffers();
+    flushCallSiteBuffers();
   } catch (...) {
     // Ignore any errors during crash handling
   }
@@ -188,13 +188,13 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         cudaDeviceSynchronize();
         
         // Capture stack trace for deallocate calls
-        captureStackTrace(ptr, bytes, stream);
+        captureCallSite(ptr, bytes, stream);
         
         logging_mr_.deallocate(ptr, bytes, stream);
       }
       
     private:
-      void captureStackTrace(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+      void captureCallSite(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
         
@@ -204,7 +204,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         // Register this thread's buffer if not already done
         if (!t_buffer_registered) {
           std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
-          g_thread_buffers.push_back(&t_stack_trace_buffer);
+          g_thread_buffers.push_back(&t_call_site_buffer);
           t_buffer_registered = true;
         }
         
@@ -212,26 +212,45 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         auto now = std::chrono::high_resolution_clock::now();
         auto ns = now.time_since_epoch().count();
         
-        // Capture stack trace using Boost (much faster than glibc backtrace)
-        // Limit to reasonable depth for performance
-        auto st = boost::stacktrace::stacktrace(0, 16);  // Skip 0 frames, capture up to 16
+        // Get caller address (extremely fast)
+        void* return_addr = __builtin_return_address(0);
         
-        // Convert to string and clean for CSV
-        std::string stack_trace_str = boost::stacktrace::to_string(st);
-        // Replace commas and newlines to keep CSV format clean
-        for (char& c : stack_trace_str) {
-          if (c == ',' || c == '\n' || c == '\r') c = '|';
+        // Use dladdr to get module info (fast lookup)
+        Dl_info dl_info;
+        std::string module_name = "unknown";
+        uintptr_t module_base = 0;
+        uintptr_t call_offset = reinterpret_cast<uintptr_t>(return_addr);
+        
+        if (dladdr(return_addr, &dl_info) != 0) {
+          if (dl_info.dli_fname) {
+            // Extract just the filename, not full path
+            const char* filename = strrchr(dl_info.dli_fname, '/');
+            module_name = filename ? (filename + 1) : dl_info.dli_fname;
+          }
+          if (dl_info.dli_fbase) {
+            module_base = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
+            call_offset = reinterpret_cast<uintptr_t>(return_addr) - module_base;
+          }
         }
         
+        // Get current device and thread info
+        int device_id = -1;
+        cudaGetDevice(&device_id);  // Fast call
+        uint64_t thread_id = reinterpret_cast<uint64_t>(pthread_self());
+        
         // Store in thread-local buffer (no mutex needed - thread-local)
-        StackTraceEntry entry;
-        entry.timestamp = std::to_string(ns);  // Nanosecond timestamp as string
+        CallSiteEntry entry;
+        entry.timestamp = std::to_string(ns);
         entry.pointer = reinterpret_cast<uintptr_t>(ptr);
         entry.size = bytes;
         entry.stream = reinterpret_cast<uintptr_t>(stream.value());
-        entry.stack_trace = std::move(stack_trace_str);
+        entry.thread_id = thread_id;
+        entry.device_id = device_id;
+        entry.module_name = std::move(module_name);
+        entry.module_base = module_base;
+        entry.call_offset = call_offset;
         
-        t_stack_trace_buffer.push_back(std::move(entry));
+        t_call_site_buffer.push_back(std::move(entry));
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
@@ -245,8 +264,8 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   return mr;
 }
 
-// Function to flush all thread-local stack trace buffers to file
-void flushStackTraceBuffers() {
+// Function to flush all thread-local call site buffers to file
+void flushCallSiteBuffers() {
   const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
   if (!stack_trace_file) return;
   
@@ -255,11 +274,11 @@ void flushStackTraceBuffers() {
   std::ofstream csv_file(stack_trace_file);
   if (!csv_file.is_open()) return;
   
-  // Write header
-  csv_file << "Timestamp,Pointer,Size,Stream,StackTrace\n";
+  // Write header with new columns
+  csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset\n";
   
   // Collect all entries from all thread buffers
-  std::vector<StackTraceEntry> all_entries;
+  std::vector<CallSiteEntry> all_entries;
   for (auto* buffer : g_thread_buffers) {
     if (buffer) {
       all_entries.insert(all_entries.end(), buffer->begin(), buffer->end());
@@ -268,7 +287,7 @@ void flushStackTraceBuffers() {
   
   // Sort by timestamp for chronological order
   std::sort(all_entries.begin(), all_entries.end(), 
-    [](const StackTraceEntry& a, const StackTraceEntry& b) {
+    [](const CallSiteEntry& a, const CallSiteEntry& b) {
       return a.timestamp < b.timestamp;
     });
   
@@ -277,8 +296,12 @@ void flushStackTraceBuffers() {
     csv_file << entry.timestamp
              << ",0x" << std::hex << entry.pointer
              << "," << std::dec << entry.size
-             << "," << entry.stream
-             << ",\"" << entry.stack_trace << "\"\n";
+             << ",0x" << std::hex << entry.stream
+             << ",0x" << std::hex << entry.thread_id
+             << "," << std::dec << entry.device_id
+             << ",\"" << entry.module_name << "\""
+             << ",0x" << std::hex << entry.module_base
+             << ",0x" << std::hex << entry.call_offset << "\n";
   }
   
   csv_file.close();
