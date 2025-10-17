@@ -236,7 +236,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         entry.timestamp = timestamp_ss.str();
         entry.pointer = reinterpret_cast<uintptr_t>(ptr);
         entry.size = bytes;
-        entry.stream = stream.value();
+        entry.stream = reinterpret_cast<uintptr_t>(stream.value());  // Convert stream pointer to uint64_t
         entry.stack_trace = stack_trace_ss.str();
         
         t_stack_trace_buffer.push_back(std::move(entry));
