@@ -412,13 +412,14 @@ void registerCudf(const CudfOptions& options) {
   CudfDriverAdapter cda{mr, options.force_replace};
   exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
   exec::DriverFactory::registerAdapter(cudfAdapter);
+  
+  // Initialize CSV file with header for call site logging
+  cudf_velox::flushCallSiteBuffers();
+  
   isCudfRegistered = true;
 }
 
 void unregisterCudf() {
-  // Flush stack trace buffers before cleanup
-  cudf_velox::flushCallSiteBuffers();
-  
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),

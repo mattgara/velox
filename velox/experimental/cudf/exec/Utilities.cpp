@@ -53,61 +53,34 @@
 
 namespace facebook::velox::cudf_velox {
 
-// Thread-local storage for call site entries
-struct CallSiteEntry {
-  std::string timestamp;
-  uintptr_t pointer;
-  size_t size;
-  uint64_t stream;
-  uint64_t thread_id;
-  int device_id;
-  std::string module_name;  // dli_fname
-  uintptr_t module_base;    // dli_fbase  
-  uintptr_t call_offset;    // return_addr - module_base
-};
+// Simple direct-to-file logging to avoid deadlocks
+static std::mutex g_csv_file_mutex;
 
-// Global collection of all thread-local buffers
-static std::vector<std::vector<CallSiteEntry>*> g_thread_buffers;
-static std::mutex g_buffer_registry_mutex;
-
-// Thread-local buffer for this thread's call sites
-thread_local std::vector<CallSiteEntry> t_call_site_buffer;
-thread_local bool t_buffer_registered = false;
-
-// Signal handler registration state
-static bool g_signal_handlers_installed = false;
-static std::mutex g_signal_handler_mutex;
-
-// Forward declaration
-void flushCallSiteBuffers();
-
-// Signal handler for crash-safe call site flushing
-void crashSignalHandler(int signal) {
-  // Try to flush call sites before crashing
-  try {
-    flushCallSiteBuffers();
-  } catch (...) {
-    // Ignore any errors during crash handling
-  }
+// Simple helper to write one entry directly to CSV file
+void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
+                       uint64_t stream, uint64_t thread_id, int device_id,
+                       const std::string& module_name, uintptr_t module_base, 
+                       uintptr_t call_offset) {
+  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   
-  // Re-raise the signal to get normal crash behavior
-  std::signal(signal, SIG_DFL);
-  std::raise(signal);
-}
-
-// Install signal handlers for crash-safe flushing
-void installCrashHandlers() {
-  std::lock_guard<std::mutex> lock(g_signal_handler_mutex);
-  if (g_signal_handlers_installed) return;
+  // Open in append mode
+  std::ofstream file(csv_file, std::ios::app);
+  if (!file.is_open()) return;
   
-  // Install handlers for common crash signals
-  std::signal(SIGSEGV, crashSignalHandler);  // Segmentation fault
-  std::signal(SIGABRT, crashSignalHandler);  // Abort
-  std::signal(SIGFPE, crashSignalHandler);   // Floating point exception
-  std::signal(SIGILL, crashSignalHandler);   // Illegal instruction
-  std::signal(SIGBUS, crashSignalHandler);   // Bus error
+  // Get timestamp
+  auto now = std::chrono::high_resolution_clock::now();
+  auto ns = now.time_since_epoch().count();
   
-  g_signal_handlers_installed = true;
+  // Write entry
+  file << ns
+       << ",0x" << std::hex << pointer
+       << "," << std::dec << size
+       << ",0x" << std::hex << stream
+       << ",0x" << std::hex << thread_id
+       << "," << std::dec << device_id
+       << ",\"" << module_name << "\""
+       << ",0x" << std::hex << module_base
+       << ",0x" << std::hex << call_offset << "\n";
 }
 
 namespace {
@@ -198,20 +171,6 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
         
-        // Install crash handlers on first use
-        installCrashHandlers();
-        
-        // Register this thread's buffer if not already done
-        if (!t_buffer_registered) {
-          std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
-          g_thread_buffers.push_back(&t_call_site_buffer);
-          t_buffer_registered = true;
-        }
-        
-        // Get current timestamp (lightweight)
-        auto now = std::chrono::high_resolution_clock::now();
-        auto ns = now.time_since_epoch().count();
-        
         // Get caller address (extremely fast)
         void* return_addr = __builtin_return_address(0);
         
@@ -238,19 +197,16 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         cudaGetDevice(&device_id);  // Fast call
         uint64_t thread_id = reinterpret_cast<uint64_t>(pthread_self());
         
-        // Store in thread-local buffer (no mutex needed - thread-local)
-        CallSiteEntry entry;
-        entry.timestamp = std::to_string(ns);
-        entry.pointer = reinterpret_cast<uintptr_t>(ptr);
-        entry.size = bytes;
-        entry.stream = reinterpret_cast<uintptr_t>(stream.value());
-        entry.thread_id = thread_id;
-        entry.device_id = device_id;
-        entry.module_name = std::move(module_name);
-        entry.module_base = module_base;
-        entry.call_offset = call_offset;
-        
-        t_call_site_buffer.push_back(std::move(entry));
+        // Write directly to file (simple, no buffering)
+        writeCallSiteEntry(stack_trace_file, 
+                          reinterpret_cast<uintptr_t>(ptr),
+                          bytes,
+                          reinterpret_cast<uintptr_t>(stream.value()),
+                          thread_id,
+                          device_id,
+                          module_name,
+                          module_base,
+                          call_offset);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
@@ -264,51 +220,16 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   return mr;
 }
 
-// Function to flush all thread-local call site buffers to file
+// Simple function to write CSV header once
 void flushCallSiteBuffers() {
   const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
   if (!stack_trace_file) return;
   
-  std::lock_guard<std::mutex> lock(g_buffer_registry_mutex);
-  
+  // Just write the header once - entries are written directly by writeCallSiteEntry
+  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
-  if (!csv_file.is_open()) return;
-  
-  // Write header with new columns
-  csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset\n";
-  
-  // Collect all entries from all thread buffers
-  std::vector<CallSiteEntry> all_entries;
-  for (auto* buffer : g_thread_buffers) {
-    if (buffer) {
-      all_entries.insert(all_entries.end(), buffer->begin(), buffer->end());
-    }
-  }
-  
-  // Sort by timestamp for chronological order
-  std::sort(all_entries.begin(), all_entries.end(), 
-    [](const CallSiteEntry& a, const CallSiteEntry& b) {
-      return a.timestamp < b.timestamp;
-    });
-  
-  // Write all entries
-  for (const auto& entry : all_entries) {
-    csv_file << entry.timestamp
-             << ",0x" << std::hex << entry.pointer
-             << "," << std::dec << entry.size
-             << ",0x" << std::hex << entry.stream
-             << ",0x" << std::hex << entry.thread_id
-             << "," << std::dec << entry.device_id
-             << ",\"" << entry.module_name << "\""
-             << ",0x" << std::hex << entry.module_base
-             << ",0x" << std::hex << entry.call_offset << "\n";
-  }
-  
-  csv_file.close();
-  
-  // Clear all buffers
-  for (auto* buffer : g_thread_buffers) {
-    if (buffer) buffer->clear();
+  if (csv_file.is_open()) {
+    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset\n";
   }
 }
 
