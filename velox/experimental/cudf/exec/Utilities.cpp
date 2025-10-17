@@ -137,7 +137,18 @@ bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
   oss << module_name << "+0x" << std::hex << call_offset;
   std::string call_site_id = oss.str();
   
-  return g_sync_call_sites.find(call_site_id) != g_sync_call_sites.end();
+  bool should_sync = g_sync_call_sites.find(call_site_id) != g_sync_call_sites.end();
+  
+  // Debug output only for matches (only if debug enabled)
+  const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
+  if (debug_env && std::string(debug_env) == "1" && should_sync) {
+    static int match_count = 0;
+    match_count++;
+    std::cerr << "DEBUG: MATCH #" << match_count << ": " << call_site_id 
+              << " -> WILL SYNC" << std::endl;
+  }
+  
+  return should_sync;
 }
 
 // Simple helper to write one entry directly to CSV file
@@ -247,6 +258,17 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         
         // Conditional synchronization for bisection search
         if (shouldSyncCallSite(call_site.module_name, call_site.call_offset)) {
+          // Debug output for sync events (only if debug enabled)
+          const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
+          if (debug_env && std::string(debug_env) == "1") {
+            static int sync_count = 0;
+            sync_count++;
+            if (sync_count <= 5) {  // Only log first 5 syncs to avoid spam
+              std::cerr << "DEBUG: SYNC #" << sync_count << " at " 
+                        << call_site.module_name << "+0x" << std::hex << call_site.call_offset 
+                        << " (ptr=0x" << std::hex << ptr << ", size=" << std::dec << bytes << ")" << std::endl;
+            }
+          }
           cudaDeviceSynchronize();
         }
         
