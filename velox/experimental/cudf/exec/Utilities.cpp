@@ -142,26 +142,12 @@ CallSiteInfo getCallSiteInfo() {
     }
   }
   
-  // Debug: show what we captured (only if debug enabled)
-  const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
-  if (debug_env && std::string(debug_env) == "1") {
-    static int debug_stack_count = 0;
-    if (debug_stack_count < 3) {  // Only show first 3 to avoid spam
-      debug_stack_count++;
-      std::cerr << "DEBUG STACK #" << debug_stack_count << ": ";
-      for (size_t i = 0; i < info.stack_offsets.size(); i++) {
-        if (i > 0) std::cerr << "->";
-        std::cerr << "0x" << std::hex << info.stack_offsets[i];
-      }
-      std::cerr << " (captured " << info.stack_offsets.size() << " levels)" << std::endl;
-    }
-  }
   
   return info;
 }
 
 // Check if a call site should be synchronized
-bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
+bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
   // Check if sync is completely disabled
   const char* disable_sync = std::getenv("RMM_SYNC_DISABLE");
   if (disable_sync && std::string(disable_sync) == "1") {
@@ -178,19 +164,30 @@ bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset) {
   std::lock_guard<std::mutex> lock(g_sync_call_sites_mutex);
   if (g_sync_call_sites.empty()) return false;
   
-  // Format: "module_name+0xoffset"
-  std::ostringstream oss;
-  oss << module_name << "+0x" << std::hex << call_offset;
-  std::string call_site_id = oss.str();
+  // Try both single-level and multi-level formats
+  // Single-level format: "module_name+0xoffset"
+  std::ostringstream single_oss;
+  single_oss << module_name << "+0x" << std::hex << call_offset;
+  std::string single_call_site_id = single_oss.str();
   
-  bool should_sync = g_sync_call_sites.find(call_site_id) != g_sync_call_sites.end();
+  // Multi-level format: "module_name+0xoffset->0xoffset2->0xoffset3->..."
+  std::ostringstream multi_oss;
+  multi_oss << module_name << "+0x" << std::hex << call_offset;
+  for (size_t i = 1; i < stack_offsets.size(); i++) {
+    multi_oss << "->0x" << std::hex << stack_offsets[i];
+  }
+  std::string multi_call_site_id = multi_oss.str();
+  
+  // Check both formats
+  bool should_sync = (g_sync_call_sites.find(single_call_site_id) != g_sync_call_sites.end()) ||
+                     (g_sync_call_sites.find(multi_call_site_id) != g_sync_call_sites.end());
   
   // Debug output only for matches (only if debug enabled)
   const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
   if (debug_env && std::string(debug_env) == "1" && should_sync) {
     static int match_count = 0;
     match_count++;
-    std::cerr << "DEBUG: MATCH #" << match_count << ": " << call_site_id 
+    std::cerr << "DEBUG: MATCH #" << match_count << ": " << multi_call_site_id 
               << " -> WILL SYNC" << std::endl;
   }
   
@@ -310,7 +307,7 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         CallSiteInfo call_site = getCallSiteInfo();
         
         // Conditional synchronization for bisection search
-        if (shouldSyncCallSite(call_site.module_name, call_site.call_offset)) {
+        if (shouldSyncCallSite(call_site.module_name, call_site.call_offset, call_site.stack_offsets)) {
           // Debug output for sync events (only if debug enabled)
           const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
           if (debug_env && std::string(debug_env) == "1") {
