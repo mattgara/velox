@@ -106,9 +106,18 @@ CallSiteInfo getCallSiteInfo() {
   info.module_base = 0;
   info.call_offset = 0;
   
-  // Capture up to 8 levels of stack trace using backtrace
-  void* return_addrs[8];
-  int stack_size = backtrace(return_addrs, 8);
+  // Get stack trace depth from environment (default 8)
+  static int stack_depth = -1;
+  if (stack_depth == -1) {
+    const char* depth_env = std::getenv("RMM_STACK_TRACE_DEPTH");
+    stack_depth = depth_env ? std::atoi(depth_env) : 8;
+    if (stack_depth < 1) stack_depth = 1;  // Minimum 1 level
+    if (stack_depth > 32) stack_depth = 32; // Maximum 32 levels for safety
+  }
+  
+  // Capture stack trace using backtrace
+  void* return_addrs[32];  // Max possible size
+  int stack_size = backtrace(return_addrs, stack_depth);
   
   // Use the first (immediate caller) for primary module info
   void* primary_addr = return_addrs[0];
@@ -313,19 +322,9 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
           if (debug_env && std::string(debug_env) == "1") {
             static int sync_count = 0;
             sync_count++;
-            
-            // Get debug limit from environment (default 16)
-            static int debug_limit = -1;
-            if (debug_limit == -1) {
-              const char* limit_env = std::getenv("RMM_SYNC_DEBUG_LIMIT");
-              debug_limit = limit_env ? std::atoi(limit_env) : 16;
-            }
-            
-            if (sync_count <= debug_limit) {
-              std::cerr << "DEBUG: SYNC #" << sync_count << " at " 
-                        << call_site.module_name << "+0x" << std::hex << call_site.call_offset 
-                        << " (ptr=0x" << std::hex << ptr << ", size=" << std::dec << bytes << ")" << std::endl;
-            }
+            std::cerr << "DEBUG: SYNC #" << sync_count << " at " 
+                      << call_site.module_name << "+0x" << std::hex << call_site.call_offset 
+                      << " (ptr=0x" << std::hex << ptr << ", size=" << std::dec << bytes << ")" << std::endl;
           }
           cudaDeviceSynchronize();
         }
