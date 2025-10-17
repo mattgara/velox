@@ -54,6 +54,7 @@
 #include <csignal>     // For signal handling
 #include <dlfcn.h>     // For dladdr()
 #include <pthread.h>   // For pthread_self()
+#include <execinfo.h>  // For backtrace()
 
 namespace facebook::velox::cudf_velox {
 
@@ -105,20 +106,9 @@ CallSiteInfo getCallSiteInfo() {
   info.module_base = 0;
   info.call_offset = 0;
   
-  // Capture up to 8 levels of return addresses (fast approach)
-  // Silence the frame-address warning for this specific section
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wframe-address"
+  // Capture up to 8 levels of stack trace using backtrace
   void* return_addrs[8];
-  return_addrs[0] = __builtin_return_address(0);
-  return_addrs[1] = __builtin_return_address(1);
-  return_addrs[2] = __builtin_return_address(2);
-  return_addrs[3] = __builtin_return_address(3);
-  return_addrs[4] = __builtin_return_address(4);
-  return_addrs[5] = __builtin_return_address(5);
-  return_addrs[6] = __builtin_return_address(6);
-  return_addrs[7] = __builtin_return_address(7);
-#pragma GCC diagnostic pop
+  int stack_size = backtrace(return_addrs, 8);
   
   // Use the first (immediate caller) for primary module info
   void* primary_addr = return_addrs[0];
@@ -137,8 +127,8 @@ CallSiteInfo getCallSiteInfo() {
     }
   }
   
-  // Calculate offsets for all stack levels
-  for (int i = 0; i < 8; i++) {
+  // Calculate offsets for all captured stack levels
+  for (int i = 0; i < stack_size; i++) {
     if (return_addrs[i] != nullptr) {
       Dl_info level_info;
       if (dladdr(return_addrs[i], &level_info) != 0 && level_info.dli_fbase) {
@@ -146,10 +136,24 @@ CallSiteInfo getCallSiteInfo() {
         uintptr_t level_offset = reinterpret_cast<uintptr_t>(return_addrs[i]) - level_base;
         info.stack_offsets.push_back(level_offset);
       } else {
+        // Still include raw address even if dladdr fails
         info.stack_offsets.push_back(reinterpret_cast<uintptr_t>(return_addrs[i]));
       }
-    } else {
-      break;  // Stop at first null address
+    }
+  }
+  
+  // Debug: show what we captured (only if debug enabled)
+  const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
+  if (debug_env && std::string(debug_env) == "1") {
+    static int debug_stack_count = 0;
+    if (debug_stack_count < 3) {  // Only show first 3 to avoid spam
+      debug_stack_count++;
+      std::cerr << "DEBUG STACK #" << debug_stack_count << ": ";
+      for (size_t i = 0; i < info.stack_offsets.size(); i++) {
+        if (i > 0) std::cerr << "->";
+        std::cerr << "0x" << std::hex << info.stack_offsets[i];
+      }
+      std::cerr << " (captured " << info.stack_offsets.size() << " levels)" << std::endl;
     }
   }
   
