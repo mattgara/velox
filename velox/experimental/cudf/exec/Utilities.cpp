@@ -65,6 +65,9 @@ static std::mutex g_csv_file_mutex;
 // Global counter for memory resource wrapper instances
 static std::atomic<uint64_t> g_mr_instance_counter{0};
 
+// Row-based bisection support
+static std::atomic<uint64_t> g_deallocation_counter{0};
+
 // Bisection search support: set of call sites that should be synchronized
 static std::unordered_set<std::string> g_sync_call_sites;
 static std::mutex g_sync_call_sites_mutex;
@@ -157,6 +160,41 @@ CallSiteInfo getCallSiteInfo() {
   
   
   return info;
+}
+
+// Check if we should sync based on row-based bisection
+bool shouldSyncBasedOnRowBisection() {
+  const char* bisection_midpoint_env = std::getenv("RMM_BISECTION_MIDPOINT");
+  const char* total_rows_env = std::getenv("RMM_BISECTION_TOTAL_ROWS");
+  
+  if (!bisection_midpoint_env || !total_rows_env) {
+    return false; // No bisection configured
+  }
+  
+  double midpoint = std::atof(bisection_midpoint_env);
+  uint64_t total_rows = std::atoll(total_rows_env);
+  
+  // Get current row number (1-based)
+  uint64_t current_row = g_deallocation_counter.fetch_add(1) + 1;
+  
+  // Calculate sync threshold
+  uint64_t sync_threshold = static_cast<uint64_t>(midpoint * total_rows);
+  
+  bool should_sync = current_row <= sync_threshold;
+  
+  // Debug output
+  const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
+  if (debug_env && std::string(debug_env) == "1") {
+    static int debug_count = 0;
+    if (debug_count < 10) { // Only show first 10
+      debug_count++;
+      std::cerr << "DEBUG: Row " << current_row << "/" << total_rows 
+                << " (midpoint=" << midpoint << ", threshold=" << sync_threshold 
+                << ") -> " << (should_sync ? "SYNC" : "NO_SYNC") << std::endl;
+    }
+  }
+  
+  return should_sync;
 }
 
 // Check if a call site should be synchronized
@@ -324,7 +362,10 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         CallSiteInfo call_site = getCallSiteInfo();
         
         // Conditional synchronization for bisection search
-        if (shouldSyncCallSite(call_site.module_name, call_site.call_offset, call_site.stack_offsets)) {
+        bool should_sync = shouldSyncCallSite(call_site.module_name, call_site.call_offset, call_site.stack_offsets) ||
+                          shouldSyncBasedOnRowBisection();
+        
+        if (should_sync) {
           // Debug output for sync events (only if debug enabled)
           const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
           if (debug_env && std::string(debug_env) == "1") {
