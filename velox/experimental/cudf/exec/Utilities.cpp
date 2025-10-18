@@ -46,6 +46,7 @@
 #include <string>     // For std::string, std::getline
 #include <chrono>
 #include <mutex>
+#include <atomic>     // For std::atomic
 #include <algorithm>  // For std::sort
 #include <vector>     // For std::vector
 #include <unordered_set>  // For std::unordered_set
@@ -60,6 +61,9 @@ namespace facebook::velox::cudf_velox {
 
 // Simple direct-to-file logging to avoid deadlocks
 static std::mutex g_csv_file_mutex;
+
+// Global counter for memory resource wrapper instances
+static std::atomic<uint64_t> g_mr_instance_counter{0};
 
 // Bisection search support: set of call sites that should be synchronized
 static std::unordered_set<std::string> g_sync_call_sites;
@@ -207,7 +211,8 @@ bool shouldSyncCallSite(const std::string& module_name, uintptr_t call_offset, c
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
                        const std::string& module_name, uintptr_t module_base, 
-                       uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
+                       uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets,
+                       uint64_t mr_instance_id) {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   
   // Open in append mode
@@ -235,7 +240,8 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
        << ",\"" << module_name << "\""
        << ",0x" << std::hex << module_base
        << ",0x" << std::hex << call_offset
-       << ",\"" << stack_trace.str() << "\"\n";
+       << ",\"" << stack_trace.str() << "\""
+       << "," << std::dec << mr_instance_id << "\n";
 }
 
 namespace {
@@ -301,10 +307,12 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
     private:
       std::shared_ptr<rmm::mr::device_memory_resource> upstream_mr_;
       rmm::mr::logging_resource_adaptor<rmm::mr::device_memory_resource> logging_mr_;
+      uint64_t mr_instance_id_;  // Unique ID for this memory resource instance
       
     public:
       LoggingWrapper(std::shared_ptr<rmm::mr::device_memory_resource> upstream, const std::string& logFile)
-        : upstream_mr_(std::move(upstream)), logging_mr_(upstream_mr_.get(), logFile) {}
+        : upstream_mr_(std::move(upstream)), logging_mr_(upstream_mr_.get(), logFile), 
+          mr_instance_id_(g_mr_instance_counter.fetch_add(1)) {}
       
       // Delegate all device_memory_resource methods to logging_mr_
       void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override {
@@ -330,13 +338,13 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         }
         
         // Capture call site for logging (if enabled)
-        captureCallSite(ptr, bytes, stream);
+        captureCallSite(ptr, bytes, stream, mr_instance_id_);
         
         logging_mr_.deallocate(ptr, bytes, stream);
       }
       
     private:
-      void captureCallSite(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+      void captureCallSite(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream, uint64_t mr_id) {
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
         
@@ -358,7 +366,8 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
                           call_site.module_name,
                           call_site.module_base,
                           call_site.call_offset,
-                          call_site.stack_offsets);
+                          call_site.stack_offsets,
+                          mr_id);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
@@ -384,7 +393,7 @@ void flushCallSiteBuffers() {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
   if (csv_file.is_open()) {
-    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace\n";
+    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace,MRInstanceID\n";
   }
 }
 
