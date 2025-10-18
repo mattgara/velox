@@ -23,6 +23,18 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <thread>
+#include <chrono>
+#include <iomanip>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <cstring>
 
 #include <rmm/mr/device/arena_memory_resource.hpp>
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
@@ -361,6 +373,15 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         // Get call site info first (before any synchronization)
         CallSiteInfo call_site = getCallSiteInfo();
         
+        // UAF detection using managed memory migration (if enabled)
+        const char* uaf_detect_env = std::getenv("RMM_UAF_DETECT");
+        if (uaf_detect_env && std::string(uaf_detect_env) == "1") {
+          if (setupManagedMemoryUAFDetection(ptr, bytes, stream, call_site)) {
+            // Successfully set up UAF detection - don't actually deallocate
+            return;
+          }
+        }
+        
         // Aggressive memory poisoning (if enabled)
         const char* poison_env = std::getenv("RMM_POISON_MEMORY");
         if (poison_env && std::string(poison_env) == "1") {
@@ -391,6 +412,94 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       }
       
     private:
+      bool setupManagedMemoryUAFDetection(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream, const CallSiteInfo& call_site) {
+        // Check if this is managed memory
+        cudaPointerAttributes attrs;
+        cudaError_t result = cudaPointerGetAttributes(&attrs, ptr);
+        
+        if (result != cudaSuccess || attrs.type != cudaMemoryTypeManaged) {
+          std::cerr << "UAF_DETECT: Not managed memory, ptr=0x" << std::hex << ptr 
+                    << " (type=" << (result == cudaSuccess ? attrs.type : -1) << ")" << std::endl;
+          return false;
+        }
+        
+        // Get current device
+        int device_id;
+        cudaGetDevice(&device_id);
+        
+        // Force memory to CPU and restrict GPU access
+        cudaError_t prefetch_result = cudaMemPrefetchAsync(ptr, bytes, cudaCpuDeviceId, stream.value());
+        if (prefetch_result != cudaSuccess) {
+          std::cerr << "UAF_DETECT: Failed to prefetch to CPU: " << cudaGetErrorString(prefetch_result) << std::endl;
+          return false;
+        }
+        
+        // Set memory advice to CPU-only access
+        cudaError_t advice_result = cudaMemAdvise(ptr, bytes, cudaMemAdviseSetAccessedBy, cudaCpuDeviceId);
+        if (advice_result != cudaSuccess) {
+          std::cerr << "UAF_DETECT: Failed to set CPU-only access: " << cudaGetErrorString(advice_result) << std::endl;
+          return false;
+        }
+        
+        // Poison memory from CPU side
+        std::memset(ptr, 0xFE, bytes);
+        
+        // Start monitoring thread
+        std::thread monitor([ptr, bytes, call_site, device_id]() {
+          monitorManagedMemoryMigration(ptr, bytes, call_site, device_id);
+        });
+        monitor.detach();
+        
+        std::cerr << "UAF_DETECT: Monitoring managed memory ptr=0x" << std::hex << ptr 
+                  << ", size=" << std::dec << bytes 
+                  << " from " << call_site.module_name << "+0x" << std::hex << call_site.call_offset 
+                  << " (forced to CPU)" << std::endl;
+        
+        return true;  // Successfully set up detection
+      }
+      
+      static void monitorManagedMemoryMigration(void* ptr, std::size_t bytes, const CallSiteInfo& call_site, int original_device) {
+        const int check_interval_ms = 5;  // Check every 5ms
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        for (int checks = 0; checks < 2000; checks++) {  // Monitor for 10 seconds max
+          std::this_thread::sleep_for(std::chrono::milliseconds(check_interval_ms));
+          
+          // Check current memory location
+          int current_location = -1;
+          cudaError_t result = cudaMemRangeGetAttribute(&current_location, sizeof(current_location),
+                                                       cudaMemRangeAttributeLastPrefetchLocation, ptr, bytes);
+          
+          if (result == cudaSuccess && current_location != cudaCpuDeviceId) {
+            // Memory migrated back to GPU - UAF detected!
+            auto access_time = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(access_time - start_time);
+            
+            std::cerr << "🚨 USE-AFTER-FREE DETECTED! 🚨" << std::endl;
+            std::cerr << "  Memory: 0x" << std::hex << ptr << " (size=" << std::dec << bytes << ")" << std::endl;
+            std::cerr << "  Freed at: " << call_site.module_name << "+0x" << std::hex << call_site.call_offset << std::endl;
+            std::cerr << "  GPU access detected after: " << elapsed.count() << "ms" << std::endl;
+            std::cerr << "  Memory migrated from CPU (device " << cudaCpuDeviceId 
+                      << ") to GPU (device " << current_location << ")" << std::endl;
+            
+            // Check memory pattern to see what was accessed
+            uint8_t* mem = static_cast<uint8_t*>(ptr);
+            std::cerr << "  Memory pattern (first 32 bytes): ";
+            for (size_t i = 0; i < std::min(bytes, size_t(32)); i++) {
+              std::cerr << std::hex << std::setfill('0') << std::setw(2) << (int)mem[i] << " ";
+            }
+            std::cerr << std::endl;
+            
+            // Force crash to get stack trace
+            abort();
+          }
+        }
+        
+        // Monitoring timeout
+        std::cerr << "UAF_DETECT: Monitoring timeout for ptr=0x" << std::hex << ptr 
+                  << " (no GPU migration detected)" << std::endl;
+      }
+      
       void poisonMemoryBeforeDealloc(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
         // Aggressive memory poisoning to catch use-after-free
         const char* poison_pattern_env = std::getenv("RMM_POISON_PATTERN");
