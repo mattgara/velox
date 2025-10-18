@@ -361,6 +361,12 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         // Get call site info first (before any synchronization)
         CallSiteInfo call_site = getCallSiteInfo();
         
+        // Aggressive memory poisoning (if enabled)
+        const char* poison_env = std::getenv("RMM_POISON_MEMORY");
+        if (poison_env && std::string(poison_env) == "1") {
+          poisonMemoryBeforeDealloc(ptr, bytes, stream);
+        }
+        
         // Conditional synchronization for bisection search
         bool should_sync = shouldSyncCallSite(call_site.module_name, call_site.call_offset, call_site.stack_offsets) ||
                           shouldSyncBasedOnRowBisection();
@@ -385,6 +391,37 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       }
       
     private:
+      void poisonMemoryBeforeDealloc(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+        // Aggressive memory poisoning to catch use-after-free
+        const char* poison_pattern_env = std::getenv("RMM_POISON_PATTERN");
+        uint8_t poison_byte = 0xDE;  // Default: 0xDEADBEEF pattern
+        
+        if (poison_pattern_env) {
+          poison_byte = static_cast<uint8_t>(std::strtol(poison_pattern_env, nullptr, 16));
+        }
+        
+        // Fill memory with poison pattern
+        cudaError_t result = cudaMemsetAsync(ptr, poison_byte, bytes, stream.value());
+        
+        if (result == cudaSuccess) {
+          // Force completion of poison write before proceeding
+          cudaStreamSynchronize(stream.value());
+          
+          // Log poisoning event
+          const char* debug_env = std::getenv("RMM_SYNC_DEBUG");
+          if (debug_env && std::string(debug_env) == "1") {
+            std::cerr << "POISONED: ptr=0x" << std::hex << ptr 
+                      << ", size=" << std::dec << bytes 
+                      << ", pattern=0x" << std::hex << static_cast<int>(poison_byte)
+                      << ", stream=0x" << std::hex << stream.value() << std::endl;
+          }
+        } else {
+          // If poisoning fails, at least log the attempt
+          std::cerr << "WARNING: Failed to poison memory ptr=0x" << std::hex << ptr 
+                    << ", error=" << cudaGetErrorString(result) << std::endl;
+        }
+      }
+      
       void captureCallSite(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream, uint64_t mr_id) {
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
         if (!stack_trace_file) return;
