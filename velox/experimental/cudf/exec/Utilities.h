@@ -87,18 +87,4 @@ class CudaEvent {
 /// Initialize call site collection (writes CSV header)
 void flushCallSiteBuffers();
 
-/// Force flush buffered call site data to file
-void flushCallSiteBuffer();
-
-/// Scope guard for guaranteed buffer flush on destruction/exception
-class CallSiteFlushGuard {
-public:
-  CallSiteFlushGuard() = default;
-  ~CallSiteFlushGuard();
-  
-  // Non-copyable, non-movable
-  CallSiteFlushGuard(const CallSiteFlushGuard&) = delete;
-  CallSiteFlushGuard& operator=(const CallSiteFlushGuard&) = delete;
-};
-
 } // namespace facebook::velox::cudf_velox
