@@ -83,4 +83,8 @@ class CudaEvent {
  private:
   cudaEvent_t event_{};
 };
+
+/// Initialize call site collection and install crash handlers
+void flushCallSiteBuffers();
+
 } // namespace facebook::velox::cudf_velox
