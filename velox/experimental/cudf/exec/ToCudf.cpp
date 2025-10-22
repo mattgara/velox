@@ -28,7 +28,6 @@
 #include "velox/experimental/cudf/exec/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
-#include "velox/experimental/cudf/exec/CuptiKernelLogger.h"
 
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/TableHandle.h"
@@ -442,12 +441,6 @@ void registerCudf(const CudfOptions& options) {
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
 
-  // Initialize CUPTI kernel logging if requested
-  if (std::getenv("VELOX_CUPTI_KERNEL_LOG")) {
-    cupti_logger_init();
-    std::cout << "CUPTI kernel logging enabled - output: cupti_kernel_log.txt" << std::endl;
-  }
-
   const std::string mrMode = options.cudfMemoryResource;
   auto mr = cudf_velox::createMemoryResource(mrMode, options.memoryPercent);
   cudf::set_current_device_resource(mr.get());
@@ -465,11 +458,6 @@ void registerCudf(const CudfOptions& options) {
 }
 
 void unregisterCudf() {
-  // Finalize CUPTI logging if it was enabled
-  if (std::getenv("VELOX_CUPTI_KERNEL_LOG")) {
-    cupti_logger_finalize();
-  }
-
   exec::DriverFactory::adapters.erase(
       std::remove_if(
           exec::DriverFactory::adapters.begin(),
