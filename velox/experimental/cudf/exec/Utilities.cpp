@@ -72,10 +72,10 @@ static std::mutex g_csv_file_mutex;
 static bool g_signal_handler_installed = false;
 
 // Signal handler for crash data recovery
-static void crashSignalHandler(int signal) {
+static void crashSignalHandler(int sig) {
   // Use async-signal-safe functions only
   const char* signal_name = "UNKNOWN";
-  switch (signal) {
+  switch (sig) {
     case SIGSEGV: signal_name = "SIGSEGV"; break;
     case SIGABRT: signal_name = "SIGABRT"; break;
     case SIGFPE: signal_name = "SIGFPE"; break;
@@ -116,8 +116,8 @@ static void crashSignalHandler(int signal) {
   }
   
   // Re-raise the signal with default handler
-  signal(signal, SIG_DFL);
-  raise(signal);
+  signal(sig, SIG_DFL);
+  raise(sig);
 }
 
 // Install signal handlers for crash recovery
