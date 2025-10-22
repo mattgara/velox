@@ -57,11 +57,76 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 namespace facebook::velox::cudf_velox {
 
-// Simple direct-to-file logging
+// Call site collection with crash-safe buffering
 static std::mutex g_csv_file_mutex;
+static std::vector<std::string> g_call_site_buffer;
+static std::mutex g_buffer_mutex;
+static std::string g_trace_file_path;
+static bool g_signal_handler_installed = false;
+
+// Signal handler for crash data recovery
+static void crashSignalHandler(int sig) {
+  const char* signal_name = "UNKNOWN";
+  switch (sig) {
+    case SIGSEGV: signal_name = "SIGSEGV"; break;
+    case SIGABRT: signal_name = "SIGABRT"; break;
+    case SIGFPE: signal_name = "SIGFPE"; break;
+    case SIGILL: signal_name = "SIGILL"; break;
+    case SIGBUS: signal_name = "SIGBUS"; break;
+  }
+  
+  // Write crash info to stderr (async-signal-safe)
+  write(STDERR_FILENO, "\n*** CRASH DETECTED: ", 21);
+  write(STDERR_FILENO, signal_name, strlen(signal_name));
+  write(STDERR_FILENO, " ***\n", 5);
+  
+  // Try to flush buffered call site data
+  if (!g_trace_file_path.empty()) {
+    int fd = open(g_trace_file_path.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd >= 0) {
+      // Write crash marker
+      const char* crash_marker = "# CRASH_DETECTED,signal=";
+      write(fd, crash_marker, strlen(crash_marker));
+      write(fd, signal_name, strlen(signal_name));
+      write(fd, "\n", 1);
+      
+      // Try to flush buffered data (best effort)
+      try {
+        std::lock_guard<std::mutex> lock(g_buffer_mutex);
+        for (const auto& entry : g_call_site_buffer) {
+          write(fd, entry.c_str(), entry.length());
+          write(fd, "\n", 1);
+        }
+      } catch (...) {
+        // Ignore errors in crash handler
+      }
+      close(fd);
+    }
+  }
+  
+  // Re-raise signal with default handler
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+// Install signal handlers for crash recovery
+static void installCrashHandlers() {
+  if (g_signal_handler_installed) return;
+  
+  signal(SIGSEGV, crashSignalHandler);
+  signal(SIGABRT, crashSignalHandler);
+  signal(SIGFPE, crashSignalHandler);
+  signal(SIGILL, crashSignalHandler);
+  signal(SIGBUS, crashSignalHandler);
+  
+  g_signal_handler_installed = true;
+}
 
 // Structure to hold call site information
 struct CallSiteInfo {
@@ -126,17 +191,11 @@ CallSiteInfo getCallSiteInfo() {
   return info;
 }
 
-// Simple helper to write one entry directly to CSV file
+// Efficient helper to buffer call site entries in memory
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
                        const std::string& module_name, uintptr_t module_base, 
                        uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
-  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
-  
-  // Open in append mode
-  std::ofstream file(csv_file, std::ios::app);
-  if (!file.is_open()) return;
-  
   // Get timestamp
   auto now = std::chrono::high_resolution_clock::now();
   auto ns = now.time_since_epoch().count();
@@ -148,17 +207,29 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
     stack_trace << "0x" << std::hex << stack_offsets[i];
   }
   
-  // Write entry directly to file
-  file << ns
-       << ",0x" << std::hex << pointer
-       << "," << std::dec << size
-       << ",0x" << std::hex << stream
-       << ",0x" << std::hex << thread_id
-       << "," << std::dec << device_id
-       << ",\"" << module_name << "\""
-       << ",0x" << std::hex << module_base
-       << ",0x" << std::hex << call_offset
-       << ",\"" << stack_trace.str() << "\"\n";
+  // Build CSV entry string
+  std::ostringstream entry;
+  entry << ns
+        << ",0x" << std::hex << pointer
+        << "," << std::dec << size
+        << ",0x" << std::hex << stream
+        << ",0x" << std::hex << thread_id
+        << "," << std::dec << device_id
+        << ",\"" << module_name << "\""
+        << ",0x" << std::hex << module_base
+        << ",0x" << std::hex << call_offset
+        << ",\"" << stack_trace.str() << "\"";
+  
+  // Buffer entry in memory (fast)
+  {
+    std::lock_guard<std::mutex> lock(g_buffer_mutex);
+    g_call_site_buffer.push_back(entry.str());
+    
+    // Keep buffer size reasonable (last 1000 entries)
+    if (g_call_site_buffer.size() > 1000) {
+      g_call_site_buffer.erase(g_call_site_buffer.begin());
+    }
+  }
 }
 
 namespace {
@@ -243,10 +314,12 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, managed_pool, prefetch_managed_pool");
   }
 
-  // Check if RMM memory event logging is enabled via RMM_LOG_FILE environment variable
+  // Check if call site collection is enabled via VELOX_ENABLE_CALL_SITE_COLLECTION or RMM logging via RMM_LOG_FILE
+  const char* call_site_enabled = std::getenv("VELOX_ENABLE_CALL_SITE_COLLECTION");
   const char* rmm_log_file = std::getenv("RMM_LOG_FILE");
-  if (rmm_log_file) {
-    std::string logPath(rmm_log_file);
+  
+  if (call_site_enabled || rmm_log_file) {
+    std::string logPath = rmm_log_file ? rmm_log_file : "/dev/null";
     
     // Wrapper class that holds both resources but acts like the logging resource
     class LoggingWrapper : public rmm::mr::device_memory_resource {
@@ -307,16 +380,43 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   return mr;
 }
 
-// Simple function to write CSV header once
+// Force flush buffered call site data to file
+void forceFlushCallSiteData() {
+  if (g_trace_file_path.empty()) return;
+  
+  std::lock_guard<std::mutex> buffer_lock(g_buffer_mutex);
+  if (g_call_site_buffer.empty()) return;
+  
+  std::lock_guard<std::mutex> file_lock(g_csv_file_mutex);
+  std::ofstream file(g_trace_file_path, std::ios::app);
+  if (file.is_open()) {
+    for (const auto& entry : g_call_site_buffer) {
+      file << entry << "\n";
+    }
+    file.flush();
+    g_call_site_buffer.clear();
+  }
+}
+
+// Initialize call site collection system
 void flushCallSiteBuffers() {
   const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
-  if (!stack_trace_file) return;
+  const char* call_site_enabled = std::getenv("VELOX_ENABLE_CALL_SITE_COLLECTION");
   
-  // Just write the header once - entries are written directly by writeCallSiteEntry
+  if (!stack_trace_file && !call_site_enabled) return;
+  
+  // Use provided file or default location
+  g_trace_file_path = stack_trace_file ? stack_trace_file : "call_sites.csv";
+  
+  // Install crash handlers
+  installCrashHandlers();
+  
+  // Write CSV header
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
-  std::ofstream csv_file(stack_trace_file);
+  std::ofstream csv_file(g_trace_file_path);
   if (csv_file.is_open()) {
     csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace\n";
+    csv_file.flush();
   }
 }
 
