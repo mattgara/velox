@@ -87,7 +87,4 @@ class CudaEvent {
 /// Initialize call site collection (writes CSV header)
 void flushCallSiteBuffers();
 
-/// Force flush buffered call site data to file
-void forceFlushCallSiteData();
-
 } // namespace facebook::velox::cudf_velox
