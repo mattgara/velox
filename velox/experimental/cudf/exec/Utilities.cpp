@@ -60,8 +60,29 @@
 
 namespace facebook::velox::cudf_velox {
 
-// Simple direct-to-file logging
+// Buffered call site collection with scope guard
 static std::mutex g_csv_file_mutex;
+static std::vector<std::string> g_call_site_buffer;
+static std::mutex g_buffer_mutex;
+static std::string g_trace_file_path;
+
+// Implementation of CallSiteFlushGuard destructor
+CallSiteFlushGuard::~CallSiteFlushGuard() {
+  if (g_trace_file_path.empty()) return;
+  
+  std::lock_guard<std::mutex> buffer_lock(g_buffer_mutex);
+  if (g_call_site_buffer.empty()) return;
+  
+  std::lock_guard<std::mutex> file_lock(g_csv_file_mutex);
+  std::ofstream file(g_trace_file_path, std::ios::app);
+  if (file.is_open()) {
+    for (const auto& entry : g_call_site_buffer) {
+      file << entry << "\n";
+    }
+    file.flush();
+    g_call_site_buffer.clear();
+  }
+}
 
 // Structure to hold call site information
 struct CallSiteInfo {
@@ -126,17 +147,11 @@ CallSiteInfo getCallSiteInfo() {
   return info;
 }
 
-// Simple helper to write one entry directly to CSV file
+// Buffered helper to collect call site entries in memory (fast)
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
                        const std::string& module_name, uintptr_t module_base, 
                        uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
-  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
-  
-  // Open in append mode
-  std::ofstream file(csv_file, std::ios::app);
-  if (!file.is_open()) return;
-  
   // Get timestamp
   auto now = std::chrono::high_resolution_clock::now();
   auto ns = now.time_since_epoch().count();
@@ -148,17 +163,53 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
     stack_trace << "0x" << std::hex << stack_offsets[i];
   }
   
-  // Write entry directly to file
-  file << ns
-       << ",0x" << std::hex << pointer
-       << "," << std::dec << size
-       << ",0x" << std::hex << stream
-       << ",0x" << std::hex << thread_id
-       << "," << std::dec << device_id
-       << ",\"" << module_name << "\""
-       << ",0x" << std::hex << module_base
-       << ",0x" << std::hex << call_offset
-       << ",\"" << stack_trace.str() << "\"\n";
+  // Build CSV entry string
+  std::ostringstream entry;
+  entry << ns
+        << ",0x" << std::hex << pointer
+        << "," << std::dec << size
+        << ",0x" << std::hex << stream
+        << ",0x" << std::hex << thread_id
+        << "," << std::dec << device_id
+        << ",\"" << module_name << "\""
+        << ",0x" << std::hex << module_base
+        << ",0x" << std::hex << call_offset
+        << ",\"" << stack_trace.str() << "\"";
+  
+  // Buffer entry in memory (fast)
+  bool should_flush = false;
+  {
+    std::lock_guard<std::mutex> lock(g_buffer_mutex);
+    g_call_site_buffer.push_back(entry.str());
+    
+    // Flush when buffer reaches batch size (configurable, default 2000)
+    const char* batch_size_env = std::getenv("RMM_CALL_SITE_BATCH_SIZE");
+    size_t batch_size = batch_size_env ? std::atoi(batch_size_env) : 2000;
+    should_flush = (g_call_site_buffer.size() >= batch_size);
+  }
+  
+  // Flush batch if needed (outside of buffer lock to avoid deadlock)
+  if (should_flush) {
+    flushCallSiteBuffer();
+  }
+}
+
+// Force flush buffered call site data to file
+void flushCallSiteBuffer() {
+  if (g_trace_file_path.empty()) return;
+  
+  std::lock_guard<std::mutex> buffer_lock(g_buffer_mutex);
+  if (g_call_site_buffer.empty()) return;
+  
+  std::lock_guard<std::mutex> file_lock(g_csv_file_mutex);
+  std::ofstream file(g_trace_file_path, std::ios::app);
+  if (file.is_open()) {
+    for (const auto& entry : g_call_site_buffer) {
+      file << entry << "\n";
+    }
+    file.flush();
+    g_call_site_buffer.clear();
+  }
 }
 
 namespace {
@@ -307,16 +358,20 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   return mr;
 }
 
-// Simple function to write CSV header once
+// Initialize call site collection system
 void flushCallSiteBuffers() {
   const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
   if (!stack_trace_file) return;
   
-  // Just write the header once - entries are written directly by writeCallSiteEntry
+  // Set global trace file path for buffering
+  g_trace_file_path = stack_trace_file;
+  
+  // Write CSV header once
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
   if (csv_file.is_open()) {
     csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace\n";
+    csv_file.flush();
   }
 }
 

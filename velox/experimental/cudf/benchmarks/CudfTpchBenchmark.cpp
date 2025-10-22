@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
 #include "velox/benchmarks/tpch/TpchBenchmark.h"
@@ -236,6 +237,10 @@ int main(int argc, char** argv) {
       "This program benchmarks TPC-H queries. Run 'velox_cudf_tpch_benchmark -helpon=TpchBenchmark' for available options.\n");
   gflags::SetUsageMessage(kUsage);
   folly::Init init{&argc, &argv, false};
+  
+  // Create scope guard for guaranteed buffer flush on benchmark completion/exception
+  cudf_velox::CallSiteFlushGuard flush_guard;
+  
   benchmark = std::make_unique<CudfTpchBenchmark>();
   tpchBenchmarkMain();
 }
