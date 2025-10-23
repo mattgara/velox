@@ -73,6 +73,12 @@ static std::string g_target_call_site;  // Single target call site (indexed)
 static bool g_sync_debug = false;
 static std::once_flag g_sync_sites_loaded;
 
+// Structure to hold call site information
+struct CallSiteInfo {
+  std::string primary_symbol;  // Main caller symbol
+  std::vector<std::string> stack_symbols;  // Full stack trace symbols
+};
+
 // Load the specific call site that should trigger cudaDeviceSynchronize
 void loadSyncCallSites() {
   const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
@@ -175,12 +181,6 @@ void checkAndInjectSync(const CallSiteInfo& call_site) {
     }
   }
 }
-
-// Structure to hold call site information
-struct CallSiteInfo {
-  std::string primary_symbol;  // Main caller symbol
-  std::vector<std::string> stack_symbols;  // Full stack trace symbols
-};
 
 // Extract call site information using backtrace_symbols (fast and simple)
 CallSiteInfo getCallSiteInfo() {
