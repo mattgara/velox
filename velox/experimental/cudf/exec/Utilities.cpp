@@ -62,11 +62,15 @@
 #include <fstream>
 #include <mutex>
 #include <atomic>
+#include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
 
-// Simple direct-to-file logging
+// Dictionary encoding for stack traces to reduce file size
 static std::mutex g_csv_file_mutex;
+static std::unordered_map<std::string, int> g_stack_trace_dictionary;
+static std::mutex g_dictionary_mutex;
+static int g_next_trace_id = 1;  // Start from 1, 0 reserved for "unknown"
 
 // Selective sync injection based on call site patterns
 static std::string g_target_call_site;  // Single target call site (indexed)
@@ -227,16 +231,36 @@ CallSiteInfo getCallSiteInfo() {
   return info;
 }
 
-// Simple helper to write one entry directly to CSV file
+// Get or create dictionary ID for a stack trace
+int getStackTraceId(const std::string& stack_trace, const char* dictionary_file) {
+  std::lock_guard<std::mutex> lock(g_dictionary_mutex);
+  
+  // Check if we already have this stack trace
+  auto it = g_stack_trace_dictionary.find(stack_trace);
+  if (it != g_stack_trace_dictionary.end()) {
+    return it->second;  // Return existing ID
+  }
+  
+  // New stack trace - assign new ID
+  int new_id = g_next_trace_id++;
+  g_stack_trace_dictionary[stack_trace] = new_id;
+  
+  // Write dictionary entry to separate file
+  if (dictionary_file) {
+    std::ofstream dict_file(dictionary_file, std::ios::app);
+    if (dict_file.is_open()) {
+      dict_file << new_id << ",\"" << stack_trace << "\"\n";
+      dict_file.flush();
+    }
+  }
+  
+  return new_id;
+}
+
+// Dictionary-encoded helper to write one entry directly to CSV file
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
                        const std::string& primary_symbol, const std::vector<std::string>& stack_symbols) {
-  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
-  
-  // Open in append mode
-  std::ofstream file(csv_file, std::ios::app);
-  if (!file.is_open()) return;
-  
   // Get timestamp
   auto now = std::chrono::high_resolution_clock::now();
   auto ns = now.time_since_epoch().count();
@@ -248,7 +272,26 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
     stack_trace << stack_symbols[i];
   }
   
-  // Write entry directly to file (simplified CSV format)
+  // Get dictionary file path (same as CSV but with .dict extension)
+  std::string dict_file_path;
+  if (csv_file) {
+    std::string csv_path(csv_file);
+    size_t dot_pos = csv_path.find_last_of('.');
+    if (dot_pos != std::string::npos) {
+      dict_file_path = csv_path.substr(0, dot_pos) + ".dict";
+    } else {
+      dict_file_path = csv_path + ".dict";
+    }
+  }
+  
+  // Get or create dictionary ID for this stack trace
+  int trace_id = getStackTraceId(stack_trace.str(), dict_file_path.c_str());
+  
+  // Write entry with dictionary ID instead of full stack trace
+  std::lock_guard<std::mutex> lock(g_csv_file_mutex);
+  std::ofstream file(csv_file, std::ios::app);
+  if (!file.is_open()) return;
+  
   file << ns
        << ",0x" << std::hex << pointer
        << "," << std::dec << size
@@ -256,7 +299,7 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
        << ",0x" << std::hex << thread_id
        << "," << std::dec << device_id
        << ",\"" << primary_symbol << "\""
-       << ",\"" << stack_trace.str() << "\"\n";
+       << "," << trace_id << "\n";  // Use dictionary ID instead of full trace
 }
 
 namespace {
@@ -406,16 +449,33 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
   return mr;
 }
 
-// Simple function to write CSV header once
+// Initialize call site collection with dictionary encoding
 void flushCallSiteBuffers() {
   const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
   if (!stack_trace_file) return;
   
-  // Just write the header once - entries are written directly by writeCallSiteEntry
+  // Write CSV header (now with TraceID instead of full StackTrace)
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
   if (csv_file.is_open()) {
-    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,PrimarySymbol,StackTrace\n";
+    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,PrimarySymbol,TraceID\n";
+    csv_file.flush();
+  }
+  
+  // Initialize dictionary file
+  std::string csv_path(stack_trace_file);
+  size_t dot_pos = csv_path.find_last_of('.');
+  std::string dict_file_path;
+  if (dot_pos != std::string::npos) {
+    dict_file_path = csv_path.substr(0, dot_pos) + ".dict";
+  } else {
+    dict_file_path = csv_path + ".dict";
+  }
+  
+  std::ofstream dict_file(dict_file_path);
+  if (dict_file.is_open()) {
+    dict_file << "TraceID,StackTrace\n";
+    dict_file.flush();
   }
 }
 
