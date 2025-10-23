@@ -89,10 +89,16 @@ CallSiteInfo getCallSiteInfo() {
   
   // Capture stack trace using backtrace
   void* return_addrs[32];  // Max possible size
-  int stack_size = backtrace(return_addrs, stack_depth);
+  int stack_size = backtrace(return_addrs, stack_depth + 1); // +1 to account for this function
   
-  // Use the first (immediate caller) for primary module info
-  void* primary_addr = return_addrs[0];
+  // Safety checks for backtrace result
+  if (stack_size <= 0) return info; // backtrace failed
+  if (stack_size < 2) return info;  // Need at least caller frame
+  void* primary_addr = return_addrs[1];
+  
+  // Safety check: ensure primary address is valid
+  if (!primary_addr) return info;
+  
   info.call_offset = reinterpret_cast<uintptr_t>(primary_addr);
   
   Dl_info dl_info;
@@ -108,18 +114,25 @@ CallSiteInfo getCallSiteInfo() {
     }
   }
   
-  // Calculate offsets for all captured stack levels
-  for (int i = 0; i < stack_size; i++) {
-    if (return_addrs[i] != nullptr) {
-      Dl_info level_info;
-      if (dladdr(return_addrs[i], &level_info) != 0 && level_info.dli_fbase) {
-        uintptr_t level_base = reinterpret_cast<uintptr_t>(level_info.dli_fbase);
-        uintptr_t level_offset = reinterpret_cast<uintptr_t>(return_addrs[i]) - level_base;
-        info.stack_offsets.push_back(level_offset);
-      } else {
-        // Still include raw address even if dladdr fails
-        info.stack_offsets.push_back(reinterpret_cast<uintptr_t>(return_addrs[i]));
-      }
+  // Calculate offsets for all captured stack levels (skip frame 0 = this function)
+  for (int i = 1; i < stack_size; i++) {
+    void* addr = return_addrs[i];
+    
+    // Safety checks: skip null pointers and obviously invalid addresses
+    if (!addr) break;
+    
+    // Skip addresses that are clearly invalid (too low or too high)
+    uintptr_t addr_val = reinterpret_cast<uintptr_t>(addr);
+    if (addr_val < 0x1000 || addr_val > 0x7fffffffffff) continue;
+    
+    Dl_info level_info;
+    if (dladdr(addr, &level_info) != 0 && level_info.dli_fbase) {
+      uintptr_t level_base = reinterpret_cast<uintptr_t>(level_info.dli_fbase);
+      uintptr_t level_offset = addr_val - level_base;
+      info.stack_offsets.push_back(level_offset);
+    } else {
+      // Still include raw address even if dladdr fails (but only if it looks valid)
+      info.stack_offsets.push_back(addr_val);
     }
   }
   
