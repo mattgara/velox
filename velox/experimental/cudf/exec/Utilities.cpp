@@ -63,20 +63,16 @@ namespace facebook::velox::cudf_velox {
 // Simple direct-to-file logging
 static std::mutex g_csv_file_mutex;
 
+
 // Structure to hold call site information
 struct CallSiteInfo {
-  std::string module_name;
-  uintptr_t module_base;
-  uintptr_t call_offset;
-  std::vector<uintptr_t> stack_offsets;  // Multi-level stack trace
+  std::string primary_symbol;  // Main caller symbol
+  std::vector<std::string> stack_symbols;  // Full stack trace symbols
 };
 
-// Extract call site information with multi-level stack trace
+// Extract call site information using backtrace_symbols (fast and simple)
 CallSiteInfo getCallSiteInfo() {
   CallSiteInfo info;
-  info.module_name = "unknown";
-  info.module_base = 0;
-  info.call_offset = 0;
   
   // Get stack trace depth from environment (default 8)
   static int stack_depth = -1;
@@ -94,47 +90,27 @@ CallSiteInfo getCallSiteInfo() {
   // Safety checks for backtrace result
   if (stack_size <= 0) return info; // backtrace failed
   if (stack_size < 2) return info;  // Need at least caller frame
-  void* primary_addr = return_addrs[1];
   
-  // Safety check: ensure primary address is valid
-  if (!primary_addr) return info;
+  // Get symbols using backtrace_symbols (handles all the complex symbol resolution)
+  char** symbols = backtrace_symbols(return_addrs, stack_size);
+  if (!symbols) return info; // Symbol resolution failed
   
-  info.call_offset = reinterpret_cast<uintptr_t>(primary_addr);
-  
-  Dl_info dl_info;
-  if (dladdr(primary_addr, &dl_info) != 0) {
-    if (dl_info.dli_fname) {
-      // Extract just the filename, not full path
-      const char* filename = strrchr(dl_info.dli_fname, '/');
-      info.module_name = filename ? (filename + 1) : dl_info.dli_fname;
-    }
-    if (dl_info.dli_fbase) {
-      info.module_base = reinterpret_cast<uintptr_t>(dl_info.dli_fbase);
-      info.call_offset = reinterpret_cast<uintptr_t>(primary_addr) - info.module_base;
-    }
+  // Primary symbol is the caller (skip frame 0 = this function)
+  if (symbols[1]) {
+    info.primary_symbol = symbols[1];
   }
   
-  // Calculate offsets for all captured stack levels (skip frame 0 = this function)
+  // Collect all stack symbols (skip frame 0 = this function)
   for (int i = 1; i < stack_size; i++) {
-    void* addr = return_addrs[i];
-    
-    // Safety checks: skip null pointers and obviously invalid addresses
-    if (!addr) break;
-    
-    // Skip addresses that are clearly invalid (too low or too high)
-    uintptr_t addr_val = reinterpret_cast<uintptr_t>(addr);
-    if (addr_val < 0x1000 || addr_val > 0x7fffffffffff) continue;
-    
-    Dl_info level_info;
-    if (dladdr(addr, &level_info) != 0 && level_info.dli_fbase) {
-      uintptr_t level_base = reinterpret_cast<uintptr_t>(level_info.dli_fbase);
-      uintptr_t level_offset = addr_val - level_base;
-      info.stack_offsets.push_back(level_offset);
+    if (symbols[i]) {
+      info.stack_symbols.push_back(symbols[i]);
     } else {
-      // Still include raw address even if dladdr fails (but only if it looks valid)
-      info.stack_offsets.push_back(addr_val);
+      break; // Stop at first null symbol
     }
   }
+  
+  // Free the symbols array (required by backtrace_symbols)
+  free(symbols);
   
   return info;
 }
@@ -142,8 +118,7 @@ CallSiteInfo getCallSiteInfo() {
 // Simple helper to write one entry directly to CSV file
 void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size, 
                        uint64_t stream, uint64_t thread_id, int device_id,
-                       const std::string& module_name, uintptr_t module_base, 
-                       uintptr_t call_offset, const std::vector<uintptr_t>& stack_offsets) {
+                       const std::string& primary_symbol, const std::vector<std::string>& stack_symbols) {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   
   // Open in append mode
@@ -154,23 +129,21 @@ void writeCallSiteEntry(const char* csv_file, uintptr_t pointer, size_t size,
   auto now = std::chrono::high_resolution_clock::now();
   auto ns = now.time_since_epoch().count();
   
-  // Build stack trace string
+  // Build stack trace string (join all symbols with " -> ")
   std::ostringstream stack_trace;
-  for (size_t i = 0; i < stack_offsets.size(); i++) {
-    if (i > 0) stack_trace << "->";
-    stack_trace << "0x" << std::hex << stack_offsets[i];
+  for (size_t i = 0; i < stack_symbols.size(); i++) {
+    if (i > 0) stack_trace << " -> ";
+    stack_trace << stack_symbols[i];
   }
   
-  // Write entry directly to file
+  // Write entry directly to file (simplified CSV format)
   file << ns
        << ",0x" << std::hex << pointer
        << "," << std::dec << size
        << ",0x" << std::hex << stream
        << ",0x" << std::hex << thread_id
        << "," << std::dec << device_id
-       << ",\"" << module_name << "\""
-       << ",0x" << std::hex << module_base
-       << ",0x" << std::hex << call_offset
+       << ",\"" << primary_symbol << "\""
        << ",\"" << stack_trace.str() << "\"\n";
 }
 
@@ -303,10 +276,8 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
                           reinterpret_cast<uintptr_t>(stream.value()),
                           thread_id,
                           device_id,
-                          call_site.module_name,
-                          call_site.module_base,
-                          call_site.call_offset,
-                          call_site.stack_offsets);
+                          call_site.primary_symbol,
+                          call_site.stack_symbols);
       }
       
       bool do_is_equal(rmm::mr::device_memory_resource const& other) const noexcept override {
@@ -329,7 +300,7 @@ void flushCallSiteBuffers() {
   std::lock_guard<std::mutex> lock(g_csv_file_mutex);
   std::ofstream csv_file(stack_trace_file);
   if (csv_file.is_open()) {
-    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,Module,ModuleBase,CallOffset,StackTrace\n";
+    csv_file << "Timestamp,Pointer,Size,Stream,ThreadID,DeviceID,PrimarySymbol,StackTrace\n";
   }
 }
 
