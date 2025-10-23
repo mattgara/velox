@@ -57,12 +57,124 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <execinfo.h>
+#include <set>
+#include <regex>
+#include <fstream>
+#include <mutex>
+#include <atomic>
 
 namespace facebook::velox::cudf_velox {
 
 // Simple direct-to-file logging
 static std::mutex g_csv_file_mutex;
 
+// Selective sync injection based on call site patterns
+static std::string g_target_call_site;  // Single target call site (indexed)
+static bool g_sync_debug = false;
+static std::once_flag g_sync_sites_loaded;
+
+// Load the specific call site that should trigger cudaDeviceSynchronize
+void loadSyncCallSites() {
+  const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
+  const char* sync_index_str = std::getenv("RMM_SYNC_CALL_SITE_INDEX");
+  const char* sync_debug_str = std::getenv("RMM_SYNC_DEBUG");
+  
+  // Enable debug mode if requested
+  g_sync_debug = (sync_debug_str && strcmp(sync_debug_str, "1") == 0);
+  
+  if (!sync_file || !sync_index_str) {
+    if (g_sync_debug) {
+      fprintf(stderr, "SYNC CONFIG: No sync file or index specified\n");
+    }
+    return;
+  }
+  
+  // Parse index
+  int target_index = std::atoi(sync_index_str);
+  if (target_index < 0) {
+    fprintf(stderr, "ERROR: RMM_SYNC_CALL_SITE_INDEX must be >= 0, got: %d\n", target_index);
+    return;
+  }
+  
+  // Load all call sites from file
+  std::ifstream file(sync_file);
+  if (!file.is_open()) {
+    fprintf(stderr, "ERROR: Cannot open RMM_SYNC_CALL_SITES_FILE: %s\n", sync_file);
+    return;
+  }
+  
+  std::vector<std::string> call_sites;
+  std::string line;
+  while (std::getline(file, line)) {
+    // Skip empty lines and comments
+    if (line.empty() || line[0] == '#') continue;
+    
+    // Remove quotes if present (from CSV format)
+    if (line.front() == '"' && line.back() == '"') {
+      line = line.substr(1, line.length() - 2);
+    }
+    
+    // Normalize addresses in the pattern: [0xABCD] -> [ADDR]
+    std::regex addr_regex(R"(\[0x[0-9a-f]+\])");
+    std::string normalized = std::regex_replace(line, addr_regex, "[ADDR]");
+    
+    call_sites.push_back(normalized);
+  }
+  
+  // Validate index
+  if (target_index >= static_cast<int>(call_sites.size())) {
+    fprintf(stderr, "ERROR: RMM_SYNC_CALL_SITE_INDEX %d is out of range. File has %zu call sites (valid range: 0-%zu)\n", 
+            target_index, call_sites.size(), call_sites.size() - 1);
+    return;
+  }
+  
+  // Set the target call site
+  g_target_call_site = call_sites[target_index];
+  
+  if (g_sync_debug) {
+    fprintf(stderr, "SYNC CONFIG: Loaded %zu call sites from %s\n", call_sites.size(), sync_file);
+    fprintf(stderr, "SYNC CONFIG: Target index %d: %s\n", target_index, g_target_call_site.c_str());
+  }
+}
+
+// Check if current call site should trigger sync and inject if needed
+void checkAndInjectSync(const CallSiteInfo& call_site) {
+  // Load sync sites once
+  std::call_once(g_sync_sites_loaded, loadSyncCallSites);
+  
+  if (g_target_call_site.empty()) return;
+  
+  // Normalize the current stack trace
+  if (!call_site.stack_symbols.empty()) {
+    std::ostringstream stack_trace;
+    for (size_t i = 0; i < call_site.stack_symbols.size(); i++) {
+      if (i > 0) stack_trace << " -> ";
+      stack_trace << call_site.stack_symbols[i];
+    }
+    
+    // Normalize addresses: [0xABCD] -> [ADDR]
+    std::regex addr_regex(R"(\[0x[0-9a-f]+\])");
+    std::string normalized = std::regex_replace(stack_trace.str(), addr_regex, "[ADDR]");
+    
+    // Check if this call site matches our target
+    if (normalized == g_target_call_site) {
+      // INJECT CUDA DEVICE SYNCHRONIZATION
+      cudaDeviceSynchronize();
+      
+      // Debug logging if enabled
+      static std::atomic<int> sync_count{0};
+      int current_count = ++sync_count;
+      
+      if (g_sync_debug) {
+        fprintf(stderr, "SYNC INJECTED #%d at: %s\n", current_count, call_site.primary_symbol.c_str());
+        if (current_count == 1) {
+          // Show full stack trace for first match
+          fprintf(stderr, "SYNC FULL TRACE: %s\n", normalized.c_str());
+        }
+      }
+    }
+  }
+}
 
 // Structure to hold call site information
 struct CallSiteInfo {
@@ -263,6 +375,9 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
         
         // Get caller address and extract call site info
         CallSiteInfo call_site = getCallSiteInfo();
+        
+        // Check if we should inject cudaDeviceSynchronize for this call site
+        checkAndInjectSync(call_site);
         
         // Get current device and thread info
         int device_id = -1;
