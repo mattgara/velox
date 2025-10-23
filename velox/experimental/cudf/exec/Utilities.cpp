@@ -413,14 +413,26 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       
     private:
       void captureCallSite(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+        // Check if sync injection is enabled (independent of call site collection)
+        const char* sync_file = std::getenv("RMM_SYNC_CALL_SITES_FILE");
+        const char* sync_index = std::getenv("RMM_SYNC_CALL_SITE_INDEX");
         const char* stack_trace_file = std::getenv("RMM_STACK_TRACE_FILE");
+        
+        // Get call site info if needed for either sync injection or collection
+        CallSiteInfo call_site;
+        bool need_call_site = (sync_file && sync_index) || stack_trace_file;
+        
+        if (need_call_site) {
+          call_site = getCallSiteInfo();
+        }
+        
+        // Sync injection (independent of call site collection)
+        if (sync_file && sync_index) {
+          checkAndInjectSync(call_site);
+        }
+        
+        // Call site collection (only if RMM_STACK_TRACE_FILE is set)
         if (!stack_trace_file) return;
-        
-        // Get caller address and extract call site info
-        CallSiteInfo call_site = getCallSiteInfo();
-        
-        // Check if we should inject cudaDeviceSynchronize for this call site
-        checkAndInjectSync(call_site);
         
         // Get current device and thread info
         int device_id = -1;
