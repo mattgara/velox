@@ -130,6 +130,15 @@ bool matchTypedCallAgainstSignatures(
     if (!binder.tryBindWithCoercions(coercions)) {
       continue;
     }
+    
+    // CRITICAL: Also validate return type matches!
+    // The binder only checks input arguments, but we must also verify
+    // that the expected return type matches the signature's return type
+    auto expectedReturnType = binder.tryResolveReturnType();
+    if (!expectedReturnType || !call.type()->equivalent(*expectedReturnType)) {
+      continue;
+    }
+    
     // binder does not confirm whether positional arguments are
     // constants(scalars) as expected. we have to check manually
     const auto& constArgs = sig->constantArguments();
@@ -889,6 +898,196 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   //     },
   //     switchSigs);
 
+  // Register aggregation functions
+  // Note: These are used both in aggregation nodes and potentially in expressions
+  
+  // Register aggregation functions with signatures that match what CUDF actually supports
+  // Based on existing tests and CUDF capabilities
+  
+  registerCudfFunction(
+      prefix + "sum",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return nullptr; // Handled by CudfHashAggregation
+      },
+      {// Integer types - CUDF supports these
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("bigint")
+           .build(),
+       // Floating point types - CUDF supports these
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "count",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return nullptr; // Handled by CudfHashAggregation
+      },
+      {// Count can work on any type that CUDF supports
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("boolean")
+           .build(),
+       // count(*) case - no arguments
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "min",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return nullptr; // Handled by CudfHashAggregation
+      },
+      {// Min/Max preserve input type - CUDF supports these types
+       FunctionSignatureBuilder()
+           .returnType("tinyint")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("smallint")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("integer")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "max",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return nullptr; // Handled by CudfHashAggregation
+      },
+      {// Same as min - preserve input type
+       FunctionSignatureBuilder()
+           .returnType("tinyint")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("smallint")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("integer")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("bigint")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("varchar")
+           .argumentType("varchar")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "avg",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return nullptr; // Handled by CudfHashAggregation
+      },
+      {// Average always returns double for numeric inputs
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("bigint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build()});
+
   return true;
 }
 
@@ -1095,15 +1294,10 @@ bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
     return expr; // Return original expression if no expansion needed
   };
 
-  // Check supported aggregation functions
-  auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  // Check supported aggregation functions using the registry (like function expressions)
   for (const auto& aggregate : aggregationNode.aggregates()) {
-    const auto& functionName = aggregate.call->name();
-    if (!(functionName == prefix + "sum" ||
-          functionName == prefix + "count" ||
-          functionName == prefix + "min" ||
-          functionName == prefix + "max" ||
-          functionName == prefix + "avg")) {
+    // Use the same validation logic as function expressions
+    if (!canBeEvaluatedByCudf(aggregate.call)) {
       return false;
     }
     

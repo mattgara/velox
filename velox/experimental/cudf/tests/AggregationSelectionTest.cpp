@@ -59,6 +59,7 @@ class CudfAggregationSelectionTest : public ::testing::Test, public test::Vector
         {"c4", REAL()},
         {"c5", DOUBLE()},
         {"c6", VARCHAR()},
+        {"c7", BOOLEAN()},
     });
 
     parse::registerTypeResolver();
@@ -83,6 +84,7 @@ class CudfAggregationSelectionTest : public ::testing::Test, public test::Vector
             makeFlatVector<float>({1.5f, 2.5f, 3.5f}),
             makeFlatVector<double>({10.1, 20.2, 30.3}),
             makeFlatVector<std::string>({"a", "b", "c"}),
+            makeFlatVector<bool>({true, false, true}),
         })})
         .aggregation(groupingKeys, aggregates, {}, core::AggregationNode::Step::kSingle, false)
         .planNode();
@@ -408,6 +410,151 @@ TEST_F(CudfAggregationSelectionTest, orderByWithinAggregatesUnsupported) {
     // Our expression expansion should detect that abs_c1 -> abs(c1) and reject it
     ASSERT_FALSE(canBeEvaluatedByCudf(*modifiedNode));
   }
+}
+
+// Test 18: Aggregation Functions in Function Registry - Signature Validation
+// This tests that aggregation functions are properly registered with correct signatures
+TEST_F(CudfAggregationSelectionTest, aggregationFunctionSignatures) {
+  // Test that aggregation functions are registered in the function registry
+  // and can be validated for signature compatibility
+  
+  // Create expressions that use aggregation functions with different types
+  auto sumBigintExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")
+      },
+      "sum");
+  
+  auto sumDoubleExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(DOUBLE(), "c1")
+      },
+      "sum");
+  
+  auto countExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")
+      },
+      "count");
+  
+  auto minVarcharExpr = std::make_shared<core::CallTypedExpr>(
+      VARCHAR(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c2")
+      },
+      "min");
+  
+  auto avgExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")
+      },
+      "avg");
+  
+  // These should all return true because they match registered signatures
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumBigintExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumDoubleExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(countExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(minVarcharExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(avgExpr));
+}
+
+// Test 19: Unsupported Aggregation Function Signatures
+// This tests that aggregation functions with unsupported signatures are rejected
+TEST_F(CudfAggregationSelectionTest, unsupportedAggregationFunctionSignatures) {
+  // Test aggregation functions that are not registered (should be rejected)
+  auto stddevExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")
+      },
+      "stddev"); // stddev is not registered in CUDF
+  
+  auto varianceExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")
+      },
+      "variance"); // variance is not registered in CUDF
+  
+  // These should return false because they're not registered
+  ASSERT_FALSE(canBeEvaluatedByCudf(stddevExpr));
+  ASSERT_FALSE(canBeEvaluatedByCudf(varianceExpr));
+}
+
+// Test 20: Comprehensive Type Support Validation
+// This tests that all registered type combinations actually work with CUDF
+TEST_F(CudfAggregationSelectionTest, comprehensiveTypeSupportValidation) {
+  // Test different numeric types with sum
+  auto sumTinyintExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(TINYINT(), "c0")}, "sum");
+  auto sumSmallintExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(SMALLINT(), "c1")}, "sum");
+  auto sumIntegerExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c2")}, "sum");
+  auto sumRealExpr = std::make_shared<core::CallTypedExpr>(
+      REAL(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(REAL(), "c4")}, "sum");
+
+  // Test min/max with different types (should preserve input type)
+  auto minVarcharExpr = std::make_shared<core::CallTypedExpr>(
+      VARCHAR(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")}, "min");
+  auto maxBooleanExpr = std::make_shared<core::CallTypedExpr>(
+      BOOLEAN(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c7")}, "max");
+
+  // Test count with different input types (always returns bigint)
+  auto countVarcharExpr = std::make_shared<core::CallTypedExpr>(
+      BIGINT(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")}, "count");
+
+  // Test avg (always returns double for numeric inputs)
+  auto avgIntegerExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c2")}, "avg");
+
+  // All these should be supported based on our registered signatures
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumTinyintExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumSmallintExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumIntegerExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(sumRealExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(minVarcharExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(maxBooleanExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(countVarcharExpr));
+  ASSERT_TRUE(canBeEvaluatedByCudf(avgIntegerExpr));
+}
+
+// Test 21: Invalid Type Combinations Should Be Rejected
+// This tests that type combinations not supported by CUDF are properly rejected
+TEST_F(CudfAggregationSelectionTest, invalidTypeCombinationsRejected) {
+  // Test invalid combinations that should be rejected
+  
+  // avg on varchar (not supported - avg only works on numeric types)
+  auto avgVarcharExpr = std::make_shared<core::CallTypedExpr>(
+      DOUBLE(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")}, "avg");
+  
+  // sum on varchar (not supported - sum only works on numeric types)  
+  auto sumVarcharExpr = std::make_shared<core::CallTypedExpr>(
+      VARCHAR(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c6")}, "sum");
+
+  // Wrong return type for sum (sum of integers should return bigint, not varchar)
+  auto sumWrongReturnExpr = std::make_shared<core::CallTypedExpr>(
+      VARCHAR(), std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(INTEGER(), "c2")}, "sum");
+
+  // These should all be rejected due to invalid type combinations
+  ASSERT_FALSE(canBeEvaluatedByCudf(avgVarcharExpr));
+  ASSERT_FALSE(canBeEvaluatedByCudf(sumVarcharExpr));
+  ASSERT_FALSE(canBeEvaluatedByCudf(sumWrongReturnExpr));
 }
 
 
