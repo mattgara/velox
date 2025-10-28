@@ -132,6 +132,76 @@ bool CompileState::compile(bool force_replace) {
     return false;
   };
 
+  auto isHashAggregationSupported = [getPlanNode](const exec::Operator* op) {
+    if (!isAnyOf<exec::HashAggregation, exec::StreamingAggregation>(op)) {
+      return false;
+    }
+    
+    auto aggregationPlanNode = std::dynamic_pointer_cast<const core::AggregationNode>(
+        getPlanNode(op->planNodeId()));
+    if (!aggregationPlanNode) {
+      return false;
+    }
+    
+    // Expression Expansion Approach: 
+    // Instead of tracing back through projections, we expand field references
+    // to their underlying expressions by looking at the source projection
+    
+    // Helper function to expand expressions through projections
+    auto expandExpression = [&](const core::TypedExprPtr& expr) -> core::TypedExprPtr {
+      // If this is a field reference and we have a source projection, expand it
+      if (expr->kind() == core::ExprKind::kFieldAccess) {
+        auto sourceNode = aggregationPlanNode->sources().empty() ? nullptr : aggregationPlanNode->sources()[0];
+        auto projectNode = std::dynamic_pointer_cast<const core::ProjectNode>(sourceNode);
+        if (projectNode) {
+          auto fieldExpr = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+          if (fieldExpr) {
+            // Find the corresponding projection expression
+            const auto& projections = projectNode->projections();
+            const auto& names = projectNode->names();
+            for (size_t i = 0; i < names.size(); ++i) {
+              if (names[i] == fieldExpr->name()) {
+                return projections[i]; // Return the underlying expression
+              }
+            }
+          }
+        }
+      }
+      return expr; // Return original expression if no expansion needed
+    };
+
+    // Check supported aggregation functions (minimal set for now)
+    auto prefix = CudfConfig::getInstance().functionNamePrefix;
+    for (const auto& aggregate : aggregationPlanNode->aggregates()) {
+      const auto& functionName = aggregate.call->name();
+      if (!(functionName == prefix + "sum" ||
+            functionName == prefix + "count" ||
+            functionName == prefix + "min" ||
+            functionName == prefix + "max" ||
+            functionName == prefix + "avg")) {
+        return false;
+      }
+      
+      // Check input expressions can be evaluated by CUDF (with expansion)
+      for (const auto& input : aggregate.call->inputs()) {
+        auto expandedInput = expandExpression(input);
+        if (!canBeEvaluatedByCudf(expandedInput)) {
+          return false;
+        }
+      }
+    }
+    
+    // Check grouping key expressions (now expanded)
+    for (const auto& groupingKey : aggregationPlanNode->groupingKeys()) {
+      auto expandedKey = expandExpression(groupingKey);
+      if (!canBeEvaluatedByCudf(expandedKey)) {
+        return false; // Expression expansion successfully detected unsupported expression
+      }
+    }
+    
+    return true;
+  };
+
   auto isJoinSupported = [getPlanNode](const exec::Operator* op) {
     if (!isAnyOf<exec::HashBuild, exec::HashProbe>(op)) {
       return false;
@@ -153,19 +223,17 @@ bool CompileState::compile(bool force_replace) {
   };
 
   auto isSupportedGpuOperator =
-      [isFilterProjectSupported, isJoinSupported, isTableScanSupported](
+      [isFilterProjectSupported, isJoinSupported, isTableScanSupported, isHashAggregationSupported](
           const exec::Operator* op) {
         return isAnyOf<
                    exec::OrderBy,
                    exec::TopN,
-                   exec::HashAggregation,
-                   exec::StreamingAggregation,
                    exec::Limit,
                    exec::LocalPartition,
                    exec::LocalExchange,
                    exec::AssignUniqueId>(op) ||
             isFilterProjectSupported(op) || isJoinSupported(op) ||
-            isTableScanSupported(op);
+            isTableScanSupported(op) || isHashAggregationSupported(op);
       };
 
   std::vector<bool> isSupportedGpuOperators(operators.size());
@@ -175,31 +243,27 @@ bool CompileState::compile(bool force_replace) {
       isSupportedGpuOperators.begin(),
       isSupportedGpuOperator);
   auto acceptsGpuInput = [isFilterProjectSupported,
-                          isJoinSupported](const exec::Operator* op) {
+                          isJoinSupported, isHashAggregationSupported](const exec::Operator* op) {
     return isAnyOf<
                exec::OrderBy,
                exec::TopN,
-               exec::HashAggregation,
-               exec::StreamingAggregation,
                exec::Limit,
                exec::LocalPartition,
                exec::AssignUniqueId>(op) ||
-        isFilterProjectSupported(op) || isJoinSupported(op);
+        isFilterProjectSupported(op) || isJoinSupported(op) || isHashAggregationSupported(op);
   };
   auto producesGpuOutput = [isFilterProjectSupported,
                             isJoinSupported,
-                            isTableScanSupported](const exec::Operator* op) {
+                            isTableScanSupported, isHashAggregationSupported](const exec::Operator* op) {
     return isAnyOf<
                exec::OrderBy,
                exec::TopN,
-               exec::HashAggregation,
-               exec::StreamingAggregation,
                exec::Limit,
                exec::LocalExchange,
                exec::AssignUniqueId>(op) ||
         isFilterProjectSupported(op) ||
         (isAnyOf<exec::HashProbe>(op) && isJoinSupported(op)) ||
-        (isTableScanSupported(op));
+        (isTableScanSupported(op)) || isHashAggregationSupported(op);
   };
 
   int32_t operatorsOffset = 0;
@@ -278,9 +342,7 @@ bool CompileState::compile(bool force_replace) {
           getPlanNode(topNOp->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
       replaceOp.push_back(std::make_unique<CudfTopN>(id, ctx, planNode));
-    } else if (
-        dynamic_cast<exec::HashAggregation*>(oper) or
-        dynamic_cast<exec::StreamingAggregation*>(oper)) {
+    } else if (isHashAggregationSupported(oper)) {
       auto planNode = std::dynamic_pointer_cast<const core::AggregationNode>(
           getPlanNode(oper->planNodeId()));
       VELOX_CHECK(planNode != nullptr);

@@ -16,6 +16,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 
 #include "velox/core/Expressions.h"
 #include "velox/expression/ConstantExpr.h"
@@ -1067,6 +1068,37 @@ std::shared_ptr<CudfExpression> createCudfExpression(
   }
 
   return FunctionExpression::create(expr, inputRowSchema);
+}
+
+bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
+  // Check supported aggregation functions
+  auto prefix = CudfConfig::getInstance().functionNamePrefix;
+  for (const auto& aggregate : aggregationNode.aggregates()) {
+    const auto& functionName = aggregate.call->name();
+    if (!(functionName == prefix + "sum" ||
+          functionName == prefix + "count" ||
+          functionName == prefix + "min" ||
+          functionName == prefix + "max" ||
+          functionName == prefix + "avg")) {
+      return false;
+    }
+    
+    // Check input expressions can be evaluated by CUDF
+    for (const auto& input : aggregate.call->inputs()) {
+      if (!canBeEvaluatedByCudf(input)) {
+        return false;
+      }
+    }
+  }
+  
+  // Check grouping key expressions
+  for (const auto& groupingKey : aggregationNode.groupingKeys()) {
+    if (!canBeEvaluatedByCudf(groupingKey)) {
+      return false;
+    }
+  }
+  
+  return true;
 }
 
 } // namespace facebook::velox::cudf_velox

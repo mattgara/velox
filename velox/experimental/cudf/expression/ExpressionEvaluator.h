@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/core/ITypedExpr.h"
+#include "velox/core/PlanNode.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/type/Type.h"
@@ -171,5 +172,9 @@ bool canBeEvaluatedByCudf(
 bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr);
 
 bool canBeEvaluatedByCudf(const std::vector<core::TypedExprPtr>& exprs);
+
+/// Check if an AggregationNode can be evaluated by CUDF
+/// This is a STUB implementation for testing - will always return false
+bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode);
 
 } // namespace facebook::velox::cudf_velox
