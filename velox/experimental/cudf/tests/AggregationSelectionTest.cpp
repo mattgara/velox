@@ -230,5 +230,110 @@ TEST_F(CudfAggregationSelectionTest, complexGroupbyClauseExpressions) {
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode));
 }
 
+// Test 12: Nested Aggregation - Allowed -> Not Allowed
+// Inner aggregation (sum) is allowed, outer aggregation (stddev) is not allowed
+TEST_F(CudfAggregationSelectionTest, nestedAggregationAllowedToNotAllowed) {
+  // Step 1: Create inner aggregation (ALLOWED: sum)
+  auto innerPlan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"sum(c1) AS inner_sum"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  // Step 2: Create outer aggregation (NOT ALLOWED: stddev)
+  auto outerPlan = PlanBuilder()
+      .addNode([&](std::string id, core::PlanNodePtr input) {
+        return innerPlan;
+      })
+      .aggregation({}, {"stddev(inner_sum) AS outer_stddev"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto outerAggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(outerPlan);
+  
+  // Should return FALSE because outer aggregation uses unsupported stddev
+  ASSERT_FALSE(canBeEvaluatedByCudf(*outerAggregationNode));
+}
+
+// Test 13: Nested Aggregation - Allowed -> Allowed
+// Both inner (sum) and outer (sum) aggregations are allowed
+TEST_F(CudfAggregationSelectionTest, nestedAggregationAllowedToAllowed) {
+  // Step 1: Create inner aggregation (ALLOWED: sum)
+  auto innerPlan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"sum(c1) AS inner_sum"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  // Step 2: Create outer aggregation (ALLOWED: sum)
+  auto outerPlan = PlanBuilder()
+      .addNode([&](std::string id, core::PlanNodePtr input) {
+        return innerPlan;
+      })
+      .aggregation({}, {"sum(inner_sum) AS outer_sum"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto outerAggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(outerPlan);
+  
+  // Should return TRUE because both aggregations use supported functions
+  ASSERT_TRUE(canBeEvaluatedByCudf(*outerAggregationNode));
+}
+
+// Test 14: Nested Aggregation - Not Allowed -> Allowed
+// Inner aggregation (stddev) is not allowed, outer aggregation (sum) is allowed
+TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToAllowed) {
+  // Step 1: Create inner aggregation (NOT ALLOWED: stddev)
+  auto innerPlan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"stddev(c1) AS inner_stddev"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  // Step 2: Create outer aggregation (ALLOWED: sum)
+  auto outerPlan = PlanBuilder()
+      .addNode([&](std::string id, core::PlanNodePtr input) {
+        return innerPlan;
+      })
+      .aggregation({}, {"sum(inner_stddev) AS outer_sum"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto outerAggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(outerPlan);
+  
+  // Should return TRUE because we only validate the current (outer) aggregation node
+  // The inner aggregation's unsupported function doesn't affect the outer node's validation
+  ASSERT_TRUE(canBeEvaluatedByCudf(*outerAggregationNode));
+}
+
+// Test 15: Nested Aggregation - Not Allowed -> Not Allowed
+// Both inner (stddev) and outer (variance) aggregations are not allowed
+TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
+  // Step 1: Create inner aggregation (NOT ALLOWED: stddev)
+  auto innerPlan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"stddev(c1) AS inner_stddev"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  // Step 2: Create outer aggregation (NOT ALLOWED: variance)
+  auto outerPlan = PlanBuilder()
+      .addNode([&](std::string id, core::PlanNodePtr input) {
+        return innerPlan;
+      })
+      .aggregation({}, {"variance(inner_stddev) AS outer_variance"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto outerAggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(outerPlan);
+  
+  // Should return FALSE because outer aggregation uses unsupported variance
+  ASSERT_FALSE(canBeEvaluatedByCudf(*outerAggregationNode));
+}
+
 
 } // namespace
