@@ -143,63 +143,8 @@ bool CompileState::compile(bool force_replace) {
       return false;
     }
     
-    // Expression Expansion Approach: 
-    // Instead of tracing back through projections, we expand field references
-    // to their underlying expressions by looking at the source projection
-    
-    // Helper function to expand expressions through projections
-    auto expandExpression = [&](const core::TypedExprPtr& expr) -> core::TypedExprPtr {
-      // If this is a field reference and we have a source projection, expand it
-      if (expr->kind() == core::ExprKind::kFieldAccess) {
-        auto sourceNode = aggregationPlanNode->sources().empty() ? nullptr : aggregationPlanNode->sources()[0];
-        auto projectNode = std::dynamic_pointer_cast<const core::ProjectNode>(sourceNode);
-        if (projectNode) {
-          auto fieldExpr = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
-          if (fieldExpr) {
-            // Find the corresponding projection expression
-            const auto& projections = projectNode->projections();
-            const auto& names = projectNode->names();
-            for (size_t i = 0; i < names.size(); ++i) {
-              if (names[i] == fieldExpr->name()) {
-                return projections[i]; // Return the underlying expression
-              }
-            }
-          }
-        }
-      }
-      return expr; // Return original expression if no expansion needed
-    };
-
-    // Check supported aggregation functions (minimal set for now)
-    auto prefix = CudfConfig::getInstance().functionNamePrefix;
-    for (const auto& aggregate : aggregationPlanNode->aggregates()) {
-      const auto& functionName = aggregate.call->name();
-      if (!(functionName == prefix + "sum" ||
-            functionName == prefix + "count" ||
-            functionName == prefix + "min" ||
-            functionName == prefix + "max" ||
-            functionName == prefix + "avg")) {
-        return false;
-      }
-      
-      // Check input expressions can be evaluated by CUDF (with expansion)
-      for (const auto& input : aggregate.call->inputs()) {
-        auto expandedInput = expandExpression(input);
-        if (!canBeEvaluatedByCudf(expandedInput)) {
-          return false;
-        }
-      }
-    }
-    
-    // Check grouping key expressions (now expanded)
-    for (const auto& groupingKey : aggregationPlanNode->groupingKeys()) {
-      auto expandedKey = expandExpression(groupingKey);
-      if (!canBeEvaluatedByCudf(expandedKey)) {
-        return false; // Expression expansion successfully detected unsupported expression
-      }
-    }
-    
-    return true;
+    // Use the centralized canBeEvaluatedByCudf function which includes expression expansion
+    return canBeEvaluatedByCudf(*aggregationPlanNode);
   };
 
   auto isJoinSupported = [getPlanNode](const exec::Operator* op) {

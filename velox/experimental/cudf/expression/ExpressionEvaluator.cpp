@@ -1071,6 +1071,30 @@ std::shared_ptr<CudfExpression> createCudfExpression(
 }
 
 bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
+  // Expression Expansion Helper: 
+  // Expand field references to their underlying expressions by looking at source projections
+  auto expandExpression = [&](const core::TypedExprPtr& expr) -> core::TypedExprPtr {
+    // If this is a field reference and we have a source projection, expand it
+    if (expr->kind() == core::ExprKind::kFieldAccess) {
+      auto sourceNode = aggregationNode.sources().empty() ? nullptr : aggregationNode.sources()[0];
+      auto projectNode = std::dynamic_pointer_cast<const core::ProjectNode>(sourceNode);
+      if (projectNode) {
+        auto fieldExpr = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+        if (fieldExpr) {
+          // Find the corresponding projection expression
+          const auto& projections = projectNode->projections();
+          const auto& names = projectNode->names();
+          for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == fieldExpr->name()) {
+              return projections[i]; // Return the underlying expression
+            }
+          }
+        }
+      }
+    }
+    return expr; // Return original expression if no expansion needed
+  };
+
   // Check supported aggregation functions
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   for (const auto& aggregate : aggregationNode.aggregates()) {
@@ -1083,17 +1107,19 @@ bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
       return false;
     }
     
-    // Check input expressions can be evaluated by CUDF
+    // Check input expressions can be evaluated by CUDF (with expansion)
     for (const auto& input : aggregate.call->inputs()) {
-      if (!canBeEvaluatedByCudf(input)) {
+      auto expandedInput = expandExpression(input);
+      if (!canBeEvaluatedByCudf(expandedInput)) {
         return false;
       }
     }
   }
   
-  // Check grouping key expressions
+  // Check grouping key expressions (with expansion)
   for (const auto& groupingKey : aggregationNode.groupingKeys()) {
-    if (!canBeEvaluatedByCudf(groupingKey)) {
+    auto expandedKey = expandExpression(groupingKey);
+    if (!canBeEvaluatedByCudf(expandedKey)) {
       return false;
     }
   }

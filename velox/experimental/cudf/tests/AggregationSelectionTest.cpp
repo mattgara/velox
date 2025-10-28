@@ -210,4 +210,25 @@ TEST_F(CudfAggregationSelectionTest, distinctOnlyAggregation) {
   ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode));
 }
 
+// Test 11: Complex Groupby Clause with Expressions
+// This specifically tests the groupby clause validation with expression expansion
+TEST_F(CudfAggregationSelectionTest, complexGroupbyClauseExpressions) {
+  // Create a plan with complex expressions in GROUP BY that should be unsupported
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50}),
+      })})
+      .project({"c0", "c1", "abs(c0) AS abs_c0"}) // abs is unsupported by CUDF
+      .aggregation({"abs_c0"}, {"sum(c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // This should return false because abs() in groupby clause is unsupported
+  // This tests that our expression expansion correctly validates groupby expressions
+  ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode));
+}
+
+
 } // namespace
