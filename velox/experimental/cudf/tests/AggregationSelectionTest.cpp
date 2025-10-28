@@ -335,5 +335,80 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
   ASSERT_FALSE(canBeEvaluatedByCudf(*outerAggregationNode));
 }
 
+// Test 16: ORDER BY within Aggregates - Supported Expressions
+// This tests ORDER BY expressions within aggregates that should be supported by CUDF
+TEST_F(CudfAggregationSelectionTest, orderByWithinAggregatesSupported) {
+  // Create an aggregation node with ORDER BY using simple field references (supported)
+  auto aggregationNode = createAggregationNode(
+      {"c0"}, 
+      {"sum(c1)"});
+  
+  // Manually add sorting keys to the aggregate (simulating ORDER BY within aggregate)
+  // This would be like: SELECT c0, array_agg(c2 ORDER BY c1) FROM table GROUP BY c0
+  auto modifiedAggregates = aggregationNode->aggregates();
+  if (!modifiedAggregates.empty()) {
+    // Add a simple field reference as sorting key (c1 - should be supported)
+    modifiedAggregates[0].sortingKeys.push_back(
+        std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c1"));
+    modifiedAggregates[0].sortingOrders.push_back(core::kAscNullsLast);
+    
+    // Create a new aggregation node with the modified aggregates
+    auto modifiedNode = std::make_shared<core::AggregationNode>(
+        aggregationNode->id(),
+        aggregationNode->step(),
+        aggregationNode->groupingKeys(),
+        std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
+        aggregationNode->aggregateNames(),
+        modifiedAggregates,
+        aggregationNode->ignoreNullKeys(),
+        aggregationNode->sources()[0]);
+    
+    // Should return TRUE because ORDER BY uses simple field reference (supported)
+    ASSERT_TRUE(canBeEvaluatedByCudf(*modifiedNode));
+  }
+}
+
+// Test 17: ORDER BY within Aggregates - Unsupported Expressions  
+// This tests ORDER BY expressions within aggregates that should NOT be supported by CUDF
+TEST_F(CudfAggregationSelectionTest, orderByWithinAggregatesUnsupported) {
+  // Create a plan with complex ORDER BY expression within aggregate
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+          makeFlatVector<int64_t>({100, 200, 300, 400, 500, 600}),
+      })})
+      .project({"c0", "c1", "c2", "abs(c1) AS abs_c1"}) // abs is unsupported by CUDF
+      .aggregation({"c0"}, {"sum(c2)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Manually add sorting keys with complex expression (simulating ORDER BY abs(c1) within aggregate)
+  // This would be like: SELECT c0, array_agg(c2 ORDER BY abs(c1)) FROM table GROUP BY c0
+  auto modifiedAggregates = aggregationNode->aggregates();
+  if (!modifiedAggregates.empty()) {
+    // Add abs_c1 as sorting key (which expands to abs(c1) - should be unsupported)
+    modifiedAggregates[0].sortingKeys.push_back(
+        std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "abs_c1"));
+    modifiedAggregates[0].sortingOrders.push_back(core::kAscNullsLast);
+    
+    // Create a new aggregation node with the modified aggregates
+    auto modifiedNode = std::make_shared<core::AggregationNode>(
+        aggregationNode->id(),
+        aggregationNode->step(),
+        aggregationNode->groupingKeys(),
+        std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
+        aggregationNode->aggregateNames(),
+        modifiedAggregates,
+        aggregationNode->ignoreNullKeys(),
+        aggregationNode->sources()[0]);
+    
+    // Should return FALSE because ORDER BY uses abs() which is unsupported by CUDF
+    // Our expression expansion should detect that abs_c1 -> abs(c1) and reject it
+    ASSERT_FALSE(canBeEvaluatedByCudf(*modifiedNode));
+  }
+}
+
 
 } // namespace

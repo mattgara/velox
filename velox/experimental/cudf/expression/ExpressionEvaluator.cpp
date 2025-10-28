@@ -1114,6 +1114,14 @@ bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
         return false;
       }
     }
+    
+    // Check ORDER BY expressions within aggregates (with expansion)
+    for (const auto& sortingKey : aggregate.sortingKeys) {
+      auto expandedSortingKey = expandExpression(sortingKey);
+      if (!canBeEvaluatedByCudf(expandedSortingKey)) {
+        return false;
+      }
+    }
   }
   
   // Check grouping key expressions (with expansion)
