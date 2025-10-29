@@ -152,4 +152,13 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   CudfVectorPtr partialOutput_;
 };
 
+// Expose createAggregator for testing
+std::unique_ptr<CudfHashAggregation::Aggregator> createAggregator(
+    core::AggregationNode::Step step,
+    std::string const& kind,
+    uint32_t inputIndex,
+    VectorPtr constant,
+    bool isGlobal,
+    const TypePtr& resultType);
+
 } // namespace facebook::velox::cudf_velox

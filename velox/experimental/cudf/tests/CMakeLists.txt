@@ -29,6 +29,7 @@ add_executable(velox_cudf_tocudf_selection_test Main.cpp ToCudfSelectionTest.cpp
 add_executable(velox_cudf_feature_validation_test Main.cpp CudfFeatureValidationTest.cpp)
 add_executable(velox_cudf_config_test Main.cpp ConfigTest.cpp)
 add_executable(velox_cudf_assign_unique_id_test Main.cpp AssignUniqueIdTest.cpp)
+add_executable(velox_cudf_create_aggregator_simple_test Main.cpp CudfCreateAggregatorSimpleTest.cpp)
 
 add_test(
   NAME velox_cudf_hash_join_test
@@ -117,6 +118,12 @@ add_test(
 )
 
 add_test(
+  NAME velox_cudf_create_aggregator_simple_test
+  COMMAND velox_cudf_create_aggregator_simple_test
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(
   NAME velox_cudf_config_test
   COMMAND velox_cudf_config_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -150,6 +157,7 @@ set_tests_properties(
 )
 set_tests_properties(velox_cudf_config_test PROPERTIES LABELS cuda_driver TIMEOUT 300)
 set_tests_properties(velox_cudf_assign_unique_id_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
+set_tests_properties(velox_cudf_create_aggregator_simple_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 
 target_link_libraries(
   velox_cudf_hash_join_test
@@ -315,6 +323,17 @@ target_link_libraries(
   velox_exec_test_lib
   velox_test_util
   velox_vector_fuzzer
+  gtest
+  gtest_main
+)
+
+target_link_libraries(
+  velox_cudf_create_aggregator_simple_test
+  velox_cudf_exec
+  velox_exec
+  velox_exec_test_lib
+  velox_test_util
+  velox_functions_spark
   gtest
   gtest_main
 )
