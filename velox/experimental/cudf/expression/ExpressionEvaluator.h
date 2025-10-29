@@ -175,6 +175,13 @@ bool canBeEvaluatedByCudf(const std::vector<core::TypedExprPtr>& exprs);
 
 /// Check if an AggregationNode can be evaluated by CUDF
 /// This is a STUB implementation for testing - will always return false
+// Generic GROUP BY validation (reusable across operators)
+// TODO: Move this to ToCudf.cpp and apply to ALL operators with grouping keys
+// (AggregationNode, GroupIdNode, WindowNode), not just aggregation-specific validation
+bool canGroupingKeysBeEvaluatedByCudf(
+    const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
+    const core::PlanNode* sourceNode = nullptr);
+
 bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode);
 
 } // namespace facebook::velox::cudf_velox

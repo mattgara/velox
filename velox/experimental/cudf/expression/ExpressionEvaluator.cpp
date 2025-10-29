@@ -1269,8 +1269,51 @@ std::shared_ptr<CudfExpression> createCudfExpression(
   return FunctionExpression::create(expr, inputRowSchema);
 }
 
-bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
+bool canGroupingKeysBeEvaluatedByCudf(
+    const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
+    const core::PlanNode* sourceNode) {
+  
+  // TODO: This GROUP BY validation should be moved to ToCudf.cpp and applied to ALL operators
+  // that use grouping keys (AggregationNode, GroupIdNode, WindowNode), not just aggregation.
+  // Currently it's only called from AggregationNode validation, but GROUP BY validation is a
+  // general concern that should be handled at the operator replacement level in ToCudf.cpp.
+  
   // Expression Expansion Helper: 
+  // Expand field references to their underlying expressions by looking at source projections
+  auto expandExpression = [&](const core::TypedExprPtr& expr) -> core::TypedExprPtr {
+    // If this is a field reference and we have a source projection, expand it
+    if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
+      auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode);
+      if (projectNode) {
+        auto fieldExpr = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
+        if (fieldExpr) {
+          // Find the corresponding projection expression
+          const auto& projections = projectNode->projections();
+          const auto& names = projectNode->names();
+          for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == fieldExpr->name()) {
+              return projections[i]; // Return the underlying expression
+            }
+          }
+        }
+      }
+    }
+    return expr; // Return original expression if no expansion needed
+  };
+
+  // Check grouping key expressions (with expansion)
+  for (const auto& groupingKey : groupingKeys) {
+    auto expandedKey = expandExpression(groupingKey);
+    if (!canBeEvaluatedByCudf(expandedKey)) {
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
+  // Expression Expansion Helper for aggregate inputs: 
   // Expand field references to their underlying expressions by looking at source projections
   auto expandExpression = [&](const core::TypedExprPtr& expr) -> core::TypedExprPtr {
     // If this is a field reference and we have a source projection, expand it
@@ -1323,12 +1366,10 @@ bool canBeEvaluatedByCudf(const core::AggregationNode& aggregationNode) {
     // CUDF doesn't support order-sensitive aggregates anyway, so this is not a concern
   }
   
-  // Check grouping key expressions (with expansion)
-  for (const auto& groupingKey : aggregationNode.groupingKeys()) {
-    auto expandedKey = expandExpression(groupingKey);
-    if (!canBeEvaluatedByCudf(expandedKey)) {
-      return false;
-    }
+  // Check grouping key expressions using centralized validation
+  const core::PlanNode* sourceNode = aggregationNode.sources().empty() ? nullptr : aggregationNode.sources()[0].get();
+  if (!canGroupingKeysBeEvaluatedByCudf(aggregationNode.groupingKeys(), sourceNode)) {
+    return false;
   }
   
   // Check for unsupported advanced grouping features
