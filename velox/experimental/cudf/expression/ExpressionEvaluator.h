@@ -173,10 +173,7 @@ bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr);
 
 bool canBeEvaluatedByCudf(const std::vector<core::TypedExprPtr>& exprs);
 
-/// Check if an AggregationNode can be evaluated by CUDF
-/// This is a STUB implementation for testing - will always return false
-// Generic GROUP BY validation (reusable across operators)
-// TODO: Move this to ToCudf.cpp and apply to ALL operators with grouping keys
+// TODO: Move this check to ToCudf.cpp and apply to all operators with grouping keys
 // (AggregationNode, GroupIdNode, WindowNode), not just aggregation-specific validation
 bool canGroupingKeysBeEvaluatedByCudf(
     const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
