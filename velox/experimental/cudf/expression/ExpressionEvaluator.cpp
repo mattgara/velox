@@ -16,7 +16,6 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
-#include "velox/experimental/cudf/CudfConfig.h"
 
 #include "velox/core/Expressions.h"
 #include "velox/expression/ConstantExpr.h"
@@ -118,56 +117,18 @@ namespace {
 bool matchTypedCallAgainstSignatures(
     const core::CallTypedExpr& call,
     const std::vector<exec::FunctionSignaturePtr>& sigs) {
-  
-  // DEBUG: Print detailed signature matching info
-  std::cout << "\n=== SIGNATURE MATCHING DEBUG ===" << std::endl;
-  std::cout << "Function: " << call.name() << std::endl;
-  std::cout << "Call return type: " << call.type()->toString() << std::endl;
-  std::cout << "Number of arguments: " << call.inputs().size() << std::endl;
-  
   const auto n = call.inputs().size();
   std::vector<TypePtr> argTypes;
   argTypes.reserve(n);
   for (const auto& in : call.inputs()) {
     argTypes.push_back(in->type());
   }
-  
-  std::cout << "Argument types: ";
-  for (size_t i = 0; i < argTypes.size(); ++i) {
-    if (i > 0) std::cout << ", ";
-    std::cout << argTypes[i]->toString();
-  }
-  std::cout << std::endl;
-  
-  std::cout << "Available signatures (" << sigs.size() << "):" << std::endl;
-  
-  for (size_t sigIdx = 0; sigIdx < sigs.size(); ++sigIdx) {
-    const auto& sig = sigs[sigIdx];
-    std::cout << "  [" << sigIdx << "] " << sig->toString() << std::endl;
-    
+  for (const auto& sig : sigs) {
     std::vector<Coercion> coercions(n);
     exec::SignatureBinder binder(*sig, argTypes);
-    
-    std::cout << "    Trying to bind..." << std::endl;
     if (!binder.tryBindWithCoercions(coercions)) {
-      std::cout << "    ❌ Binding failed (argument types don't match)" << std::endl;
       continue;
     }
-    std::cout << "    ✅ Binding succeeded" << std::endl;
-    
-    // CRITICAL: Also validate return type matches!
-    // The binder only checks input arguments, but we must also verify
-    // that the expected return type matches the signature's return type
-    auto expectedReturnType = binder.tryResolveReturnType();
-    std::cout << "    Expected return type: " << (expectedReturnType ? expectedReturnType->toString() : "NULL") << std::endl;
-    std::cout << "    Call return type: " << call.type()->toString() << std::endl;
-    
-    if (!expectedReturnType || !call.type()->equivalent(*expectedReturnType)) {
-      std::cout << "    ❌ Return type mismatch!" << std::endl;
-      continue;
-    }
-    std::cout << "    ✅ Return type matches" << std::endl;
-    
     // binder does not confirm whether positional arguments are
     // constants(scalars) as expected. we have to check manually
     const auto& constArgs = sig->constantArguments();
@@ -176,7 +137,6 @@ bool matchTypedCallAgainstSignatures(
     for (size_t i = 0; i < fixed; ++i) {
       if (constArgs[i] &&
           call.inputs()[i]->kind() != core::ExprKind::kConstant) {
-        std::cout << "    ❌ Argument " << i << " should be constant but isn't" << std::endl;
         ok = false;
         break;
       }
@@ -184,14 +144,8 @@ bool matchTypedCallAgainstSignatures(
     if (!ok) {
       continue;
     }
-    
-    std::cout << "    🎉 SIGNATURE MATCH FOUND!" << std::endl;
-    std::cout << "=== END SIGNATURE MATCHING DEBUG ===\n" << std::endl;
     return true;
   }
-  
-  std::cout << "❌ NO MATCHING SIGNATURE FOUND" << std::endl;
-  std::cout << "=== END SIGNATURE MATCHING DEBUG ===\n" << std::endl;
   return false;
 }
 
@@ -935,17 +889,13 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   //     switchSigs);
 
   // Register aggregation functions
-  // Note: These are used both in aggregation nodes and potentially in expressions
-  
-  // Register aggregation functions with signatures that match what CUDF actually supports
-  // Based on existing tests and CUDF capabilities
   
   registerCudfFunction(
       prefix + "sum",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return nullptr; // Handled by CudfHashAggregation
+        return nullptr;
       },
-      {// Integer types - CUDF supports these
+      {
        FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("tinyint")
@@ -962,7 +912,6 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("bigint")
            .argumentType("bigint")
            .build(),
-       // Floating point types - CUDF supports these
        FunctionSignatureBuilder()
            .returnType("real")
            .argumentType("real")
@@ -975,9 +924,9 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunction(
       prefix + "count",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return nullptr; // Handled by CudfHashAggregation
+        return nullptr;
       },
-      {// Count can work on any type that CUDF supports
+      {
        FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("tinyint")
@@ -1010,7 +959,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("bigint")
            .argumentType("boolean")
            .build(),
-       // count(*) case - no arguments
+       // count(*) case: no arguments specified
        FunctionSignatureBuilder()
            .returnType("bigint")
            .build()});
@@ -1018,9 +967,9 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunction(
       prefix + "min",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return nullptr; // Handled by CudfHashAggregation
+        return nullptr;
       },
-      {// Min/Max preserve input type - CUDF only supports NUMERIC types
+      {
        FunctionSignatureBuilder()
            .returnType("tinyint")
            .argumentType("tinyint")
@@ -1045,15 +994,15 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("double")
            .argumentType("double")
            .build()
-       // ❌ REMOVED: varchar and boolean - CUDF doesn't support string/boolean min/max!
+       // varchar & boolean omitted
       });
 
   registerCudfFunction(
       prefix + "max",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return nullptr; // Handled by CudfHashAggregation
+        return nullptr;
       },
-      {// Same as min - preserve input type - CUDF only supports NUMERIC types
+      {
        FunctionSignatureBuilder()
            .returnType("tinyint")
            .argumentType("tinyint")
@@ -1078,16 +1027,16 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("double")
            .argumentType("double")
            .build()
-       // ❌ REMOVED: varchar and boolean - CUDF doesn't support string/boolean min/max!
+       // varchar & boolean omitted
       });
 
   registerCudfFunction(
       prefix + "avg",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return nullptr; // Handled by CudfHashAggregation
+        return nullptr;
       },
       {// Average always returns double for numeric inputs
-       // ❌ REMOVED: tinyint - throws "Constants and lambdas not yet supported" exception
+       // tinyint case: throws "Constants and lambdas not yet supported" exception
        FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("smallint")
@@ -1100,7 +1049,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .returnType("double")
            .argumentType("bigint")
            .build(),
-       // ❌ REMOVED: real - falls back to CPU due to return type mismatch
+       // real case: falls back to CPU due to return type mismatch
        FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("double")

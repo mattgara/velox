@@ -173,8 +173,8 @@ bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr);
 
 bool canBeEvaluatedByCudf(const std::vector<core::TypedExprPtr>& exprs);
 
-// TODO: Move this check to ToCudf.cpp and apply to all operators with grouping keys
-// (AggregationNode, GroupIdNode, WindowNode), not just aggregation-specific validation
+// TODO: apply to all operators with grouping keys
+// (AggregationNode, GroupIdNode, WindowNode), this is not just aggregation-specific validation
 bool canGroupingKeysBeEvaluatedByCudf(
     const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
     const core::PlanNode* sourceNode = nullptr);

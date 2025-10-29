@@ -287,7 +287,9 @@ bool CompileState::compile(bool force_replace) {
           getPlanNode(topNOp->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
       replaceOp.push_back(std::make_unique<CudfTopN>(id, ctx, planNode));
-    } else if (isAggregationSupported(oper)) {
+    } else if (
+        dynamic_cast<exec::HashAggregation*>(oper) or
+        dynamic_cast<exec::StreamingAggregation*>(oper)) {
       auto planNode = std::dynamic_pointer_cast<const core::AggregationNode>(
           getPlanNode(oper->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
