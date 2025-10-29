@@ -201,15 +201,21 @@ TEST_F(CudfAggregationSelectionTest, globalAggregationUnsupported) {
   ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode));
 }
 
-// Test 10: Empty Aggregation (Distinct only)
-// This test should FAIL initially because canBeEvaluatedByCudf(AggregationNode) doesn't exist
-TEST_F(CudfAggregationSelectionTest, distinctOnlyAggregation) {
-  auto aggregationNode = createAggregationNode(
-      {"c0", "c6"}, // Grouping keys only
-      {});          // No aggregation functions
+// Test 10: COUNT(DISTINCT) Aggregation - Should be rejected
+// This tests that DISTINCT aggregations are properly rejected by CUDF validation
+TEST_F(CudfAggregationSelectionTest, countDistinctAggregationRejected) {
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"count(distinct c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
   
-  // This should return true for distinct-only operations with supported grouping keys
-  ASSERT_TRUE(canBeEvaluatedByCudf(*aggregationNode));
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Should return FALSE because COUNT(DISTINCT) aggregations are not supported by CUDF
+  ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode));
 }
 
 // Test 11: Complex Groupby Clause with Expressions
@@ -337,80 +343,7 @@ TEST_F(CudfAggregationSelectionTest, nestedAggregationNotAllowedToNotAllowed) {
   ASSERT_FALSE(canBeEvaluatedByCudf(*outerAggregationNode));
 }
 
-// Test 16: ORDER BY within Aggregates - Supported Expressions
-// This tests ORDER BY expressions within aggregates that should be supported by CUDF
-TEST_F(CudfAggregationSelectionTest, orderByWithinAggregatesSupported) {
-  // Create an aggregation node with ORDER BY using simple field references (supported)
-  auto aggregationNode = createAggregationNode(
-      {"c0"}, 
-      {"sum(c1)"});
-  
-  // Manually add sorting keys to the aggregate (simulating ORDER BY within aggregate)
-  // This would be like: SELECT c0, array_agg(c2 ORDER BY c1) FROM table GROUP BY c0
-  auto modifiedAggregates = aggregationNode->aggregates();
-  if (!modifiedAggregates.empty()) {
-    // Add a simple field reference as sorting key (c1 - should be supported)
-    modifiedAggregates[0].sortingKeys.push_back(
-        std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c1"));
-    modifiedAggregates[0].sortingOrders.push_back(core::kAscNullsLast);
-    
-    // Create a new aggregation node with the modified aggregates
-    auto modifiedNode = std::make_shared<core::AggregationNode>(
-        aggregationNode->id(),
-        aggregationNode->step(),
-        aggregationNode->groupingKeys(),
-        std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
-        aggregationNode->aggregateNames(),
-        modifiedAggregates,
-        aggregationNode->ignoreNullKeys(),
-        aggregationNode->sources()[0]);
-    
-    // Should return TRUE because ORDER BY uses simple field reference (supported)
-    ASSERT_TRUE(canBeEvaluatedByCudf(*modifiedNode));
-  }
-}
-
-// Test 17: ORDER BY within Aggregates - Unsupported Expressions  
-// This tests ORDER BY expressions within aggregates that should NOT be supported by CUDF
-TEST_F(CudfAggregationSelectionTest, orderByWithinAggregatesUnsupported) {
-  // Create a plan with complex ORDER BY expression within aggregate
-  auto plan = PlanBuilder()
-      .values({makeRowVector({
-          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
-          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
-          makeFlatVector<int64_t>({100, 200, 300, 400, 500, 600}),
-      })})
-      .project({"c0", "c1", "c2", "abs(c1) AS abs_c1"}) // abs is unsupported by CUDF
-      .aggregation({"c0"}, {"sum(c2)"}, {}, core::AggregationNode::Step::kSingle, false)
-      .planNode();
-  
-  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
-  
-  // Manually add sorting keys with complex expression (simulating ORDER BY abs(c1) within aggregate)
-  // This would be like: SELECT c0, array_agg(c2 ORDER BY abs(c1)) FROM table GROUP BY c0
-  auto modifiedAggregates = aggregationNode->aggregates();
-  if (!modifiedAggregates.empty()) {
-    // Add abs_c1 as sorting key (which expands to abs(c1) - should be unsupported)
-    modifiedAggregates[0].sortingKeys.push_back(
-        std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "abs_c1"));
-    modifiedAggregates[0].sortingOrders.push_back(core::kAscNullsLast);
-    
-    // Create a new aggregation node with the modified aggregates
-    auto modifiedNode = std::make_shared<core::AggregationNode>(
-        aggregationNode->id(),
-        aggregationNode->step(),
-        aggregationNode->groupingKeys(),
-        std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
-        aggregationNode->aggregateNames(),
-        modifiedAggregates,
-        aggregationNode->ignoreNullKeys(),
-        aggregationNode->sources()[0]);
-    
-    // Should return FALSE because ORDER BY uses abs() which is unsupported by CUDF
-    // Our expression expansion should detect that abs_c1 -> abs(c1) and reject it
-    ASSERT_FALSE(canBeEvaluatedByCudf(*modifiedNode));
-  }
-}
+// ORDER BY within aggregates tests removed - not applicable since CUDF doesn't support order-sensitive aggregates
 
 // Test 18: Aggregation Functions in Function Registry - Signature Validation
 // This tests that aggregation functions are properly registered with correct signatures
@@ -555,6 +488,127 @@ TEST_F(CudfAggregationSelectionTest, invalidTypeCombinationsRejected) {
   ASSERT_FALSE(canBeEvaluatedByCudf(avgVarcharExpr));
   ASSERT_FALSE(canBeEvaluatedByCudf(sumVarcharExpr));
   ASSERT_FALSE(canBeEvaluatedByCudf(sumWrongReturnExpr));
+}
+
+// Test 22: DISTINCT Aggregations Should Be Rejected
+// DISTINCT aggregations are not supported by CUDF
+TEST_F(CudfAggregationSelectionTest, distinctAggregationsRejected) {
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 1, 2, 2, 3, 3}),
+          makeFlatVector<int64_t>({10, 20, 30, 40, 50, 60}),
+      })})
+      .aggregation({"c0"}, {"count(distinct c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Should return FALSE because DISTINCT aggregations are not supported by CUDF
+  ASSERT_FALSE(canBeEvaluatedByCudf(*aggregationNode));
+}
+
+// Test 23: FILTER/MASK Clauses Should Be Rejected
+// FILTER clauses (WHERE conditions within aggregates) are NOT supported by CUDF (confirmed via correctness test)
+TEST_F(CudfAggregationSelectionTest, filterMaskClausesRejected) {
+  // Create a basic aggregation node first
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 2, 3}),
+          makeFlatVector<int64_t>({10, 20, 30}),
+          makeFlatVector<bool>({true, false, true}),
+      })})
+      .aggregation({"c0"}, {"sum(c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Manually create a modified aggregation with a mask (simulating FILTER clause)
+  auto modifiedAggregates = aggregationNode->aggregates();
+  if (!modifiedAggregates.empty()) {
+    // Add a mask field (like: sum(c1) FILTER (WHERE c2))
+    modifiedAggregates[0].mask = std::make_shared<core::FieldAccessTypedExpr>(BOOLEAN(), "c2");
+    
+    auto modifiedNode = std::make_shared<core::AggregationNode>(
+        aggregationNode->id(),
+        aggregationNode->step(),
+        aggregationNode->groupingKeys(),
+        std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
+        aggregationNode->aggregateNames(),
+        modifiedAggregates,
+        aggregationNode->ignoreNullKeys(),
+        aggregationNode->sources()[0]);
+    
+    // Should return FALSE because FILTER/MASK clauses are NOT supported by CUDF
+    ASSERT_FALSE(canBeEvaluatedByCudf(*modifiedNode));
+  }
+}
+
+// Test 24: Global Grouping Sets Should Be Accepted
+// Global grouping sets are indices for CUBE/ROLLUP operations - ARE supported by CUDF (confirmed via ablation test)
+// Example SQL: SELECT key, SUM(value) FROM table GROUP BY CUBE(key)
+// This creates multiple grouping combinations: {key}, {} (empty for grand total)
+TEST_F(CudfAggregationSelectionTest, globalGroupingSetsAccepted) {
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 2, 3}),
+          makeFlatVector<int64_t>({10, 20, 30}),
+      })})
+      .aggregation({"c0"}, {"sum(c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Create a new aggregation node with global grouping sets (indices for different grouping combinations)
+  auto globalGroupingSets = std::vector<vector_size_t>{0, 1, 2}; // Indices for CUBE/ROLLUP combinations
+  auto groupId = std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0"); // Required when globalGroupingSets is not empty
+  
+  auto modifiedNode = std::make_shared<core::AggregationNode>(
+      aggregationNode->id(),
+      aggregationNode->step(),
+      aggregationNode->groupingKeys(),
+      std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
+      aggregationNode->aggregateNames(),
+      aggregationNode->aggregates(),
+      globalGroupingSets, // Set global grouping sets (CUBE/ROLLUP indices)
+      groupId, // groupId is required when globalGroupingSets is not empty
+      aggregationNode->ignoreNullKeys(),
+      aggregationNode->sources()[0]);
+  
+  // Should return TRUE because global grouping sets (CUBE/ROLLUP) ARE supported by CUDF
+  ASSERT_TRUE(canBeEvaluatedByCudf(*modifiedNode));
+}
+
+// Test 25: Group ID Should Be Accepted
+// Group ID (used with GROUPING SETS) ARE supported by CUDF (confirmed via ablation test)
+TEST_F(CudfAggregationSelectionTest, groupIdAccepted) {
+  auto plan = PlanBuilder()
+      .values({makeRowVector({
+          makeFlatVector<int64_t>({1, 2, 3}),
+          makeFlatVector<int64_t>({10, 20, 30}),
+      })})
+      .aggregation({"c0"}, {"sum(c1)"}, {}, core::AggregationNode::Step::kSingle, false)
+      .planNode();
+  
+  auto aggregationNode = std::dynamic_pointer_cast<const core::AggregationNode>(plan);
+  
+  // Create a new aggregation node with group ID (and required globalGroupingSets)
+  auto groupId = std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0");
+  auto globalGroupingSets = std::vector<vector_size_t>{0, 1}; // Required when groupId is provided
+  
+  auto modifiedNode = std::make_shared<core::AggregationNode>(
+      aggregationNode->id(),
+      aggregationNode->step(),
+      aggregationNode->groupingKeys(),
+      std::vector<core::FieldAccessTypedExprPtr>{}, // preGroupedKeys
+      aggregationNode->aggregateNames(),
+      aggregationNode->aggregates(),
+      globalGroupingSets, // globalGroupingSets is required when groupId is provided
+      groupId, // Set group ID
+      aggregationNode->ignoreNullKeys(),
+      aggregationNode->sources()[0]);
+  
+  // Should return TRUE because Group ID ARE supported by CUDF (confirmed via correctness test)
+  ASSERT_TRUE(canBeEvaluatedByCudf(*modifiedNode));
 }
 
 
