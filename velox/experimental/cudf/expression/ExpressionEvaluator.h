@@ -173,7 +173,13 @@ bool canBeEvaluatedByCudf(const core::TypedExprPtr& expr);
 
 bool canBeEvaluatedByCudf(const std::vector<core::TypedExprPtr>& exprs);
 
-// TODO: apply to all operators with grouping keys
+// Utility function to expand field references to their underlying expressions
+// by looking at source projections
+core::TypedExprPtr expandFieldReference(
+    const core::TypedExprPtr& expr, 
+    const core::PlanNode* sourceNode);
+
+// TODO: this probably should be applied to all operators with grouping keys
 // (AggregationNode, GroupIdNode, WindowNode), this is not just aggregation-specific validation
 bool canGroupingKeysBeEvaluatedByCudf(
     const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
