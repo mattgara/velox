@@ -207,25 +207,54 @@ bool CompileState::compile(bool allow_cpu_fallback) {
 
   // Pairwise dependency check: for each A->B pair, if A is CPU and B is GPU,
   // ensure A's output can be converted to CUDF. If not, force B to CPU.
+  std::cerr << "=== PAIRWISE DEPENDENCY CHECK START ===" << std::endl;
+  std::cerr << "Total operators: " << operators.size() << std::endl;
+  
+  for (size_t i = 0; i < operators.size(); ++i) {
+    std::cerr << "Operator[" << i << "]: " << operators[i]->toString() 
+              << " (GPU supported: " << (isSupportedGpuOperators[i] ? "YES" : "NO") << ")" << std::endl;
+  }
+  
   for (size_t i = 0; i < operators.size() - 1; ++i) {
+    std::cerr << "Checking pair [" << i << "]->[" << (i+1) << "]: ";
+    std::cerr << "A(CPU:" << (!isSupportedGpuOperators[i] ? "YES" : "NO") << ") -> ";
+    std::cerr << "B(GPU:" << (isSupportedGpuOperators[i + 1] ? "YES" : "NO") << ")" << std::endl;
+    
     if (!isSupportedGpuOperators[i] && isSupportedGpuOperators[i + 1]) {
+      std::cerr << "  Found CPU->GPU pair! Checking conversion compatibility..." << std::endl;
+      
       auto aPlanNode = getPlanNode(operators[i]->planNodeId());
       auto aOutputType = aPlanNode->outputType();
       
+      std::cerr << "  A output type: " << aOutputType->toString() << std::endl;
+      
       bool canConvert = true;
+      std::string failedType = "";
       try {
         for (int j = 0; j < aOutputType->size(); ++j) {
-          facebook::velox::cudf_velox::veloxToCudfTypeId(aOutputType->childAt(j));
+          auto childType = aOutputType->childAt(j);
+          std::cerr << "    Checking child[" << j << "]: " << childType->toString() << std::endl;
+          facebook::velox::cudf_velox::veloxToCudfTypeId(childType);
         }
+      } catch (const std::exception& e) {
+        canConvert = false;
+        failedType = e.what();
+        std::cerr << "    Conversion failed: " << failedType << std::endl;
       } catch (...) {
         canConvert = false;
+        failedType = "Unknown error";
+        std::cerr << "    Conversion failed: " << failedType << std::endl;
       }
       
       if (!canConvert) {
+        std::cerr << "  FORCING B to CPU due to conversion failure!" << std::endl;
         isSupportedGpuOperators[i + 1] = false;
+      } else {
+        std::cerr << "  Conversion OK, keeping B as GPU" << std::endl;
       }
     }
   }
+  std::cerr << "=== PAIRWISE DEPENDENCY CHECK END ===" << std::endl;
 
   auto acceptsGpuInput = [isFilterProjectSupported,
                           isJoinSupported,
