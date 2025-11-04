@@ -205,9 +205,9 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       isSupportedGpuOperators.begin(),
       isSupportedGpuOperator);
 
-  // Pairwise dependency check: for each A->B pair, if A is CPU and B is GPU,
-  // ensure A's output can be converted to CUDF. If not, force B to CPU.
-  std::cerr << "=== PAIRWISE DEPENDENCY CHECK START ===" << std::endl;
+  // Comprehensive dependency check: for each CPU operator, check if any downstream
+  // GPU operators can handle its output. If not, force all dependent GPU operators to CPU.
+  std::cerr << "=== COMPREHENSIVE DEPENDENCY CHECK START ===" << std::endl;
   std::cerr << "Total operators: " << operators.size() << std::endl;
   
   for (size_t i = 0; i < operators.size(); ++i) {
@@ -215,65 +215,73 @@ bool CompileState::compile(bool allow_cpu_fallback) {
               << " (GPU supported: " << (isSupportedGpuOperators[i] ? "YES" : "NO") << ")" << std::endl;
   }
   
-  for (size_t i = 0; i < operators.size() - 1; ++i) {
-    std::cerr << "Checking pair [" << i << "]->[" << (i+1) << "]: ";
-    std::cerr << "A(CPU:" << (!isSupportedGpuOperators[i] ? "YES" : "NO") << ") -> ";
-    std::cerr << "B(GPU:" << (isSupportedGpuOperators[i + 1] ? "YES" : "NO") << ")" << std::endl;
+  // For each CPU operator, check if its output can be converted to CUDF
+  // If not, force ALL downstream GPU operators to CPU (not just immediate neighbors)
+  for (size_t cpuOpIdx = 0; cpuOpIdx < operators.size(); ++cpuOpIdx) {
+    if (isSupportedGpuOperators[cpuOpIdx]) {
+      continue; // Skip GPU operators
+    }
     
-    if (!isSupportedGpuOperators[i] && isSupportedGpuOperators[i + 1]) {
-      std::cerr << "  Found CPU->GPU pair! Checking conversion compatibility..." << std::endl;
+    std::cerr << "Checking CPU operator[" << cpuOpIdx << "] output compatibility..." << std::endl;
+    
+    auto cpuPlanNode = getPlanNode(operators[cpuOpIdx]->planNodeId());
+    auto cpuOutputType = cpuPlanNode->outputType();
+    
+    std::cerr << "  CPU output type: " << cpuOutputType->toString() << std::endl;
+    
+    bool canConvert = true;
+    std::string failedType = "";
+    try {
+      // Create a dummy row vector with null values to test actual conversion
+      auto pool = memory::MemoryManager::getInstance()->addLeafPool();
+      std::vector<VectorPtr> children;
+      for (int j = 0; j < cpuOutputType->size(); ++j) {
+        auto childType = cpuOutputType->childAt(j);
+        std::cerr << "    Checking child[" << j << "]: " << childType->toString() << std::endl;
+        children.push_back(BaseVector::createNullConstant(childType, 1, pool.get()));
+      }
       
-      auto aPlanNode = getPlanNode(operators[i]->planNodeId());
-      auto aOutputType = aPlanNode->outputType();
+      auto dummyRowVector = std::make_shared<RowVector>(
+          pool.get(),
+          cpuOutputType,
+          nullptr,
+          1,
+          children);
       
-      std::cerr << "  A output type: " << aOutputType->toString() << std::endl;
+      // Try the actual CUDF conversion
+      std::cerr << "    Attempting dummy CUDF conversion..." << std::endl;
+      auto cudfTable = facebook::velox::cudf_velox::with_arrow::toCudfTable(
+          dummyRowVector,
+          pool.get(),
+          rmm::cuda_stream_default);
+      std::cerr << "    Dummy conversion succeeded!" << std::endl;
       
-      bool canConvert = true;
-      std::string failedType = "";
-      try {
-        // Create a dummy row vector with null values to test actual conversion
-        auto pool = memory::MemoryManager::getInstance()->addLeafPool();
-        std::vector<VectorPtr> children;
-        for (int j = 0; j < aOutputType->size(); ++j) {
-          auto childType = aOutputType->childAt(j);
-          std::cerr << "    Checking child[" << j << "]: " << childType->toString() << std::endl;
-          children.push_back(BaseVector::createNullConstant(childType, 1, pool.get()));
+    } catch (const std::exception& e) {
+      canConvert = false;
+      failedType = e.what();
+      std::cerr << "    Conversion failed: " << failedType << std::endl;
+    } catch (...) {
+      canConvert = false;
+      failedType = "Unknown error";
+      std::cerr << "    Conversion failed: " << failedType << std::endl;
+    }
+    
+    if (!canConvert) {
+      std::cerr << "  CPU operator[" << cpuOpIdx << "] produces non-CUDF-compatible output!" << std::endl;
+      std::cerr << "  FORCING ALL DOWNSTREAM GPU OPERATORS TO CPU..." << std::endl;
+      
+      // Force all downstream operators to CPU (they might depend on this CPU operator's output)
+      for (size_t downstreamIdx = cpuOpIdx + 1; downstreamIdx < operators.size(); ++downstreamIdx) {
+        if (isSupportedGpuOperators[downstreamIdx]) {
+          std::cerr << "    Forcing operator[" << downstreamIdx << "] to CPU" << std::endl;
+          isSupportedGpuOperators[downstreamIdx] = false;
         }
-        
-        auto dummyRowVector = std::make_shared<RowVector>(
-            pool.get(),
-            aOutputType,
-            nullptr,
-            1,
-            children);
-        
-        // Try the actual CUDF conversion
-        std::cerr << "    Attempting dummy CUDF conversion..." << std::endl;
-        auto cudfTable = facebook::velox::cudf_velox::with_arrow::toCudfTable(
-            dummyRowVector,
-            pool.get(),
-            rmm::cuda_stream_default);
-        std::cerr << "    Dummy conversion succeeded!" << std::endl;
-        
-      } catch (const std::exception& e) {
-        canConvert = false;
-        failedType = e.what();
-        std::cerr << "    Conversion failed: " << failedType << std::endl;
-      } catch (...) {
-        canConvert = false;
-        failedType = "Unknown error";
-        std::cerr << "    Conversion failed: " << failedType << std::endl;
       }
-      
-      if (!canConvert) {
-        std::cerr << "  FORCING B to CPU due to conversion failure!" << std::endl;
-        isSupportedGpuOperators[i + 1] = false;
-      } else {
-        std::cerr << "  Conversion OK, keeping B as GPU" << std::endl;
-      }
+    } else {
+      std::cerr << "  CPU operator[" << cpuOpIdx << "] output is CUDF-compatible" << std::endl;
     }
   }
-  std::cerr << "=== PAIRWISE DEPENDENCY CHECK END ===" << std::endl;
+  std::cerr << "=== COMPREHENSIVE DEPENDENCY CHECK END ===" << std::endl;
 
   auto acceptsGpuInput = [isFilterProjectSupported,
                           isJoinSupported,
