@@ -214,7 +214,7 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       bool canConvert = true;
       try {
         for (int j = 0; j < aOutputType->size(); ++j) {
-          facebook::velox::cudf_velox::getCudfTypeId(aOutputType->childAt(j));
+          facebook::velox::cudf_velox::veloxToCudfTypeId(aOutputType->childAt(j));
         }
       } catch (...) {
         canConvert = false;
