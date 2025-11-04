@@ -209,6 +209,7 @@ bool CompileState::compile(bool allow_cpu_fallback) {
   // GPU operators can handle its output. If not, force all dependent GPU operators to CPU.
   std::cerr << "=== COMPREHENSIVE DEPENDENCY CHECK START ===" << std::endl;
   std::cerr << "Total operators: " << operators.size() << std::endl;
+  std::cerr << "Driver factory consumer node: " << (driverFactory_.consumerNode ? driverFactory_.consumerNode->toString() : "NULL") << std::endl;
   
   for (size_t i = 0; i < operators.size(); ++i) {
     std::cerr << "Operator[" << i << "]: " << operators[i]->toString() 
@@ -336,7 +337,7 @@ bool CompileState::compile(bool allow_cpu_fallback) {
         driverFactory_.outputDriver and operatorIndex == operators.size() - 1;
 
     auto id = oper->operatorId();
-    if (previousOperatorIsNotGpu and acceptsGpuInput(oper)) {
+    if (previousOperatorIsNotGpu and acceptsGpuInput(oper) and isSupportedGpuOperators[operatorIndex]) {
       auto planNode = getPlanNode(oper->planNodeId());
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
