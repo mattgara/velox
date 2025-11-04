@@ -237,7 +237,7 @@ bool CompileState::compile(bool allow_cpu_fallback) {
         for (int j = 0; j < aOutputType->size(); ++j) {
           auto childType = aOutputType->childAt(j);
           std::cerr << "    Checking child[" << j << "]: " << childType->toString() << std::endl;
-          children.push_back(BaseVector::createNullConstant(childType, 1, pool));
+          children.push_back(BaseVector::createNullConstant(childType, 1, pool.get()));
         }
         
         auto dummyRowVector = std::make_shared<RowVector>(
