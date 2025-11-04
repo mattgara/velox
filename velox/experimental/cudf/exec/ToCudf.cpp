@@ -275,6 +275,39 @@ bool CompileState::compile(bool allow_cpu_fallback) {
     auto id = oper->operatorId();
     if (previousOperatorIsNotGpu and acceptsGpuInput(oper)) {
       auto planNode = getPlanNode(oper->planNodeId());
+      
+      // DEBUG LOGGING: Log operator transition details
+      std::cout << "=== INSERTING CudfFromVelox OPERATOR ===" << std::endl;
+      std::cout << "Previous operator (CPU): " << operators[operatorIndex - 1]->toString() << std::endl;
+      std::cout << "Previous operator ID: " << operators[operatorIndex - 1]->operatorId() << std::endl;
+      std::cout << "Previous operator plan node: " << operators[operatorIndex - 1]->planNodeId() << std::endl;
+      
+      std::cout << "Current operator (GPU): " << oper->toString() << std::endl;
+      std::cout << "Current operator ID: " << oper->operatorId() << std::endl;
+      std::cout << "Current operator plan node: " << oper->planNodeId() << std::endl;
+      
+      std::cout << "Output type being marshalled: " << planNode->outputType()->toString() << std::endl;
+      
+      // Log detailed type information
+      auto outputRowType = std::dynamic_pointer_cast<const RowType>(planNode->outputType());
+      for (int i = 0; i < planNode->outputType()->size(); ++i) {
+        auto childType = planNode->outputType()->childAt(i);
+        std::string columnName = outputRowType ? outputRowType->nameOf(i) : "col_" + std::to_string(i);
+        std::cout << "Column " << i << " (" << columnName << "): " 
+                  << childType->toString() << std::endl;
+        
+        // If it's a ROW type, log its children too
+        if (childType->isRow()) {
+          auto rowType = std::dynamic_pointer_cast<const RowType>(childType);
+          std::cout << "  ROW type with " << rowType->size() << " children:" << std::endl;
+          for (int j = 0; j < rowType->size(); ++j) {
+            std::cout << "    Child " << j << " (" << rowType->nameOf(j) << "): " 
+                      << rowType->childAt(j)->toString() << std::endl;
+          }
+        }
+      }
+      std::cout << "=== END INSERTING CudfFromVelox OPERATOR ===" << std::endl;
+      
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
               id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));

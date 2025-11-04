@@ -37,12 +37,23 @@
 namespace facebook::velox::cudf_velox {
 
 cudf::type_id veloxToCudfTypeId(const TypePtr& type) {
+  // DEBUG LOGGING: Log type conversion attempts
+  std::cout << "=== veloxToCudfTypeId DEBUG ===" << std::endl;
+  std::cout << "Converting type: " << type->toString() << std::endl;
+  std::cout << "Type kind: " << TypeKindName::toName(type->kind()) << std::endl;
+  
   switch (type->kind()) {
     case TypeKind::BOOLEAN:
+      std::cout << "Mapped to: BOOL8" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::BOOL8;
     case TypeKind::TINYINT:
+      std::cout << "Mapped to: INT8" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::INT8;
     case TypeKind::SMALLINT:
+      std::cout << "Mapped to: INT16" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::INT16;
     case TypeKind::INTEGER:
       // TODO: handle interval types (durations?)
@@ -50,20 +61,36 @@ cudf::type_id veloxToCudfTypeId(const TypePtr& type) {
       //   return cudf::type_id::...;
       // }
       if (type->isDate()) {
+        std::cout << "Mapped to: TIMESTAMP_DAYS (date)" << std::endl;
+        std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
         return cudf::type_id::TIMESTAMP_DAYS;
       }
+      std::cout << "Mapped to: INT32" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::INT32;
     case TypeKind::BIGINT:
+      std::cout << "Mapped to: INT64" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::INT64;
     case TypeKind::REAL:
+      std::cout << "Mapped to: FLOAT32" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::FLOAT32;
     case TypeKind::DOUBLE:
+      std::cout << "Mapped to: FLOAT64" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::FLOAT64;
     case TypeKind::VARCHAR:
+      std::cout << "Mapped to: STRING" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::STRING;
     case TypeKind::VARBINARY:
+      std::cout << "Mapped to: STRING (varbinary)" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::STRING;
     case TypeKind::TIMESTAMP:
+      std::cout << "Mapped to: TIMESTAMP_NANOSECONDS" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::TIMESTAMP_NANOSECONDS;
     // case TypeKind::HUGEINT: return cudf::type_id::DURATION_DAYS;
     // TODO: DATE was converted to a logical type:
@@ -75,15 +102,30 @@ cudf::type_id veloxToCudfTypeId(const TypePtr& type) {
     // case TypeKind::SHORT_DECIMAL: return cudf::type_id::DECIMAL64;
     // case TypeKind::LONG_DECIMAL: return cudf::type_id::DECIMAL128;
     case TypeKind::ARRAY:
+      std::cout << "Mapped to: LIST" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::LIST;
     // case TypeKind::MAP: return cudf::type_id::EMPTY;
     case TypeKind::ROW:
+      std::cout << "Mapped to: STRUCT" << std::endl;
+      // For ROW types, also log the children
+      if (type->isRow()) {
+        auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+        std::cout << "ROW type children:" << std::endl;
+        for (int i = 0; i < rowType->size(); ++i) {
+          std::cout << "  Child " << i << " (" << rowType->nameOf(i) << "): " 
+                    << rowType->childAt(i)->toString() << std::endl;
+        }
+      }
+      std::cout << "=== END veloxToCudfTypeId DEBUG ===" << std::endl;
       return cudf::type_id::STRUCT;
     // case TypeKind::UNKNOWN: return cudf::type_id::EMPTY;
     // case TypeKind::FUNCTION: return cudf::type_id::EMPTY;
     // case TypeKind::OPAQUE: return cudf::type_id::EMPTY;
     // case TypeKind::INVALID: return cudf::type_id::EMPTY;
     default:
+      std::cout << "ERROR: Unsupported Velox type!" << std::endl;
+      std::cout << "=== END veloxToCudfTypeId DEBUG (ERROR) ===" << std::endl;
       CUDF_FAIL(
           "Unsupported Velox type: " +
           std::string(TypeKindName::toName(type->kind())));
@@ -97,21 +139,49 @@ std::unique_ptr<cudf::table> toCudfTable(
     const facebook::velox::RowVectorPtr& veloxTable,
     facebook::velox::memory::MemoryPool* pool,
     rmm::cuda_stream_view stream) {
+  // DEBUG LOGGING: Log Arrow conversion details
+  std::cout << "=== toCudfTable DEBUG ===" << std::endl;
+  std::cout << "Input table type: " << veloxTable->type()->toString() << std::endl;
+  std::cout << "Input table size: " << veloxTable->size() << std::endl;
+  
   // Need to flattenDictionary and flattenConstant, otherwise we observe issues
   // in the null mask.
   ArrowOptions arrowOptions{true, true};
   ArrowArray arrowArray;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowArray,
-      pool,
-      arrowOptions);
+  
+  std::cout << "Exporting to Arrow array..." << std::endl;
+  try {
+    exportToArrow(
+        std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
+        arrowArray,
+        pool,
+        arrowOptions);
+  } catch (const std::exception& e) {
+    std::cout << "ERROR in exportToArrow (array): " << e.what() << std::endl;
+    throw;
+  }
+  
   ArrowSchema arrowSchema;
-  exportToArrow(
-      std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
-      arrowSchema,
-      arrowOptions);
-  auto tbl = cudf::from_arrow(&arrowSchema, &arrowArray, stream);
+  std::cout << "Exporting to Arrow schema..." << std::endl;
+  try {
+    exportToArrow(
+        std::dynamic_pointer_cast<facebook::velox::BaseVector>(veloxTable),
+        arrowSchema,
+        arrowOptions);
+  } catch (const std::exception& e) {
+    std::cout << "ERROR in exportToArrow (schema): " << e.what() << std::endl;
+    throw;
+  }
+  
+  std::cout << "Converting from Arrow to cudf..." << std::endl;
+  std::unique_ptr<cudf::table> tbl;
+  try {
+    tbl = cudf::from_arrow(&arrowSchema, &arrowArray, stream);
+  } catch (const std::exception& e) {
+    std::cout << "ERROR in cudf::from_arrow: " << e.what() << std::endl;
+    std::cout << "=== END toCudfTable DEBUG (ERROR) ===" << std::endl;
+    throw;
+  }
 
   // Release Arrow resources
   if (arrowArray.release) {
@@ -120,6 +190,9 @@ std::unique_ptr<cudf::table> toCudfTable(
   if (arrowSchema.release) {
     arrowSchema.release(&arrowSchema);
   }
+  
+  std::cout << "Successfully converted to cudf table" << std::endl;
+  std::cout << "=== END toCudfTable DEBUG ===" << std::endl;
   return tbl;
 }
 

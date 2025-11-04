@@ -136,20 +136,57 @@ RowVectorPtr CudfFromVelox::getOutput() {
     return nullptr;
   }
 
+  // DEBUG LOGGING: Log detailed information about the CPU->GPU conversion
+  std::cout << "=== CudfFromVelox::getOutput() DEBUG ===" << std::endl;
+  std::cout << "Operator ID: " << operatorId() << std::endl;
+  std::cout << "Plan Node ID: " << planNodeId() << std::endl;
+  std::cout << "Input type: " << input->type()->toString() << std::endl;
+  std::cout << "Input size: " << input->size() << std::endl;
+  std::cout << "Output type: " << outputType_->toString() << std::endl;
+  
+  // Log detailed type information for each column
+  auto inputRowType = std::dynamic_pointer_cast<const RowType>(input->type());
+  for (int i = 0; i < input->type()->size(); ++i) {
+    auto childType = input->type()->childAt(i);
+    std::string columnName = inputRowType ? inputRowType->nameOf(i) : "col_" + std::to_string(i);
+    std::cout << "Column " << i << " (" << columnName << "): " 
+              << childType->toString() << std::endl;
+    
+    // If it's a ROW type, log its children too
+    if (childType->isRow()) {
+      auto rowType = std::dynamic_pointer_cast<const RowType>(childType);
+      std::cout << "  ROW type with " << rowType->size() << " children:" << std::endl;
+      for (int j = 0; j < rowType->size(); ++j) {
+        std::cout << "    Child " << j << " (" << rowType->nameOf(j) << "): " 
+                  << rowType->childAt(j)->toString() << std::endl;
+      }
+    }
+  }
+
   // Get a stream from the global stream pool
   auto stream = cudfGlobalStreamPool().get_stream();
 
   // Convert RowVector to cudf table
-  auto tbl = with_arrow::toCudfTable(input, input->pool(), stream);
-
-  stream.synchronize();
-
-  VELOX_CHECK_NOT_NULL(tbl);
-
-  // Return a CudfVector that owns the cudf table
-  const auto size = tbl->num_rows();
-  return std::make_shared<CudfVector>(
-      input->pool(), outputType_, size, std::move(tbl), stream);
+  std::cout << "About to call with_arrow::toCudfTable..." << std::endl;
+  try {
+    auto tbl = with_arrow::toCudfTable(input, input->pool(), stream);
+    
+    stream.synchronize();
+    
+    VELOX_CHECK_NOT_NULL(tbl);
+    
+    std::cout << "Successfully converted to cudf table with " << tbl->num_rows() << " rows" << std::endl;
+    std::cout << "=== END CudfFromVelox::getOutput() DEBUG ===" << std::endl;
+    
+    // Return a CudfVector that owns the cudf table
+    const auto size = tbl->num_rows();
+    return std::make_shared<CudfVector>(
+        input->pool(), outputType_, size, std::move(tbl), stream);
+  } catch (const std::exception& e) {
+    std::cout << "ERROR in toCudfTable conversion: " << e.what() << std::endl;
+    std::cout << "=== END CudfFromVelox::getOutput() DEBUG (ERROR) ===" << std::endl;
+    throw;
+  }
 }
 
 void CudfFromVelox::close() {
