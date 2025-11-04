@@ -143,22 +143,19 @@ bool CompileState::compile(bool allow_cpu_fallback) {
     return false;
   };
 
-  auto isAggregationSupported = [getPlanNode, ctx](const exec::Operator* op) {
+  auto isAggregationSupported = [getPlanNode](const exec::Operator* op) {
     if (!isAnyOf<exec::HashAggregation, exec::StreamingAggregation>(op)) {
       return false;
     }
-
-    auto aggregationPlanNode =
-        std::dynamic_pointer_cast<const core::AggregationNode>(
-            getPlanNode(op->planNodeId()));
+    
+    auto aggregationPlanNode = std::dynamic_pointer_cast<const core::AggregationNode>(
+        getPlanNode(op->planNodeId()));
     if (!aggregationPlanNode) {
       return false;
     }
-
-    // Use the centralized canBeEvaluatedByCudf function which includes
-    // expression expansion
-    return canBeEvaluatedByCudf(
-        *aggregationPlanNode, ctx->task->queryCtx().get());
+    
+    // Use the centralized canBeEvaluatedByCudf function which includes expression expansion
+    return canBeEvaluatedByCudf(*aggregationPlanNode);
   };
 
   auto isJoinSupported = [getPlanNode](const exec::Operator* op) {
@@ -182,10 +179,8 @@ bool CompileState::compile(bool allow_cpu_fallback) {
   };
 
   auto isSupportedGpuOperator =
-      [isFilterProjectSupported,
-       isJoinSupported,
-       isTableScanSupported,
-       isAggregationSupported](const exec::Operator* op) {
+      [isFilterProjectSupported, isJoinSupported, isTableScanSupported, isAggregationSupported](
+          const exec::Operator* op) {
         return isAnyOf<
                    exec::OrderBy,
                    exec::TopN,
@@ -203,22 +198,41 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       operators.end(),
       isSupportedGpuOperators.begin(),
       isSupportedGpuOperator);
+
+  // Pairwise dependency check: for each A->B pair, if A is CPU and B is GPU,
+  // ensure A's output can be converted to CUDF. If not, force B to CPU.
+  for (size_t i = 0; i < operators.size() - 1; ++i) {
+    if (!isSupportedGpuOperators[i] && isSupportedGpuOperators[i + 1]) {
+      auto aPlanNode = getPlanNode(operators[i]->planNodeId());
+      auto aOutputType = aPlanNode->outputType();
+      
+      bool canConvert = true;
+      try {
+        for (int j = 0; j < aOutputType->size(); ++j) {
+          facebook::velox::cudf_velox::getCudfTypeId(aOutputType->childAt(j));
+        }
+      } catch (...) {
+        canConvert = false;
+      }
+      
+      if (!canConvert) {
+        isSupportedGpuOperators[i + 1] = false;
+      }
+    }
+  }
   auto acceptsGpuInput = [isFilterProjectSupported,
-                          isJoinSupported,
-                          isAggregationSupported](const exec::Operator* op) {
+                          isJoinSupported, isAggregationSupported](const exec::Operator* op) {
     return isAnyOf<
                exec::OrderBy,
                exec::TopN,
                exec::Limit,
                exec::LocalPartition,
                exec::AssignUniqueId>(op) ||
-        isFilterProjectSupported(op) || isJoinSupported(op) ||
-        isAggregationSupported(op);
+        isFilterProjectSupported(op) || isJoinSupported(op) || isAggregationSupported(op);
   };
   auto producesGpuOutput = [isFilterProjectSupported,
                             isJoinSupported,
-                            isTableScanSupported,
-                            isAggregationSupported](const exec::Operator* op) {
+                            isTableScanSupported, isAggregationSupported](const exec::Operator* op) {
     return isAnyOf<
                exec::OrderBy,
                exec::TopN,
@@ -307,7 +321,8 @@ bool CompileState::compile(bool allow_cpu_fallback) {
           getPlanNode(topNOp->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
       replaceOp.push_back(std::make_unique<CudfTopN>(id, ctx, planNode));
-    } else if (isAggregationSupported(oper)) {
+    } else if (
+        isAggregationSupported(oper)) {
       auto planNode = std::dynamic_pointer_cast<const core::AggregationNode>(
           getPlanNode(oper->planNodeId()));
       VELOX_CHECK(planNode != nullptr);
@@ -472,7 +487,7 @@ void registerCudf() {
 
   auto prefix = CudfConfig::getInstance().functionNamePrefix;
   registerBuiltinFunctions(prefix);
-  registerStepAwareBuiltinAggregationFunctions(prefix);
+  registerBuiltinAggregationFunctions(prefix);
 
   CUDF_FUNC_RANGE();
   cudaFree(nullptr); // Initialize CUDA context at startup
