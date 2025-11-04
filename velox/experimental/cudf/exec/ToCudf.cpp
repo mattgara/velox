@@ -203,6 +203,29 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       operators.end(),
       isSupportedGpuOperators.begin(),
       isSupportedGpuOperator);
+
+  // Pairwise dependency check: for each A->B pair, if A is CPU and B is GPU,
+  // ensure A's output can be converted to CUDF. If not, force B to CPU.
+  for (size_t i = 0; i < operators.size() - 1; ++i) {
+    if (!isSupportedGpuOperators[i] && isSupportedGpuOperators[i + 1]) {
+      auto aPlanNode = getPlanNode(operators[i]->planNodeId());
+      auto aOutputType = aPlanNode->outputType();
+      
+      bool canConvert = true;
+      try {
+        for (int j = 0; j < aOutputType->size(); ++j) {
+          facebook::velox::cudf_velox::getCudfTypeId(aOutputType->childAt(j));
+        }
+      } catch (...) {
+        canConvert = false;
+      }
+      
+      if (!canConvert) {
+        isSupportedGpuOperators[i + 1] = false;
+      }
+    }
+  }
+
   auto acceptsGpuInput = [isFilterProjectSupported,
                           isJoinSupported,
                           isAggregationSupported](const exec::Operator* op) {
