@@ -232,15 +232,16 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       std::string failedType = "";
       try {
         // Create a dummy row vector with null values to test actual conversion
+        auto pool = memory::MemoryManager::getInstance()->addLeafPool();
         std::vector<VectorPtr> children;
         for (int j = 0; j < aOutputType->size(); ++j) {
           auto childType = aOutputType->childAt(j);
           std::cerr << "    Checking child[" << j << "]: " << childType->toString() << std::endl;
-          children.push_back(BaseVector::createNullConstant(childType, 1, memory::MemoryManager::getInstance()->addLeafPool()));
+          children.push_back(BaseVector::createNullConstant(childType, 1, pool));
         }
         
         auto dummyRowVector = std::make_shared<RowVector>(
-            memory::MemoryManager::getInstance()->addLeafPool(),
+            pool.get(),
             aOutputType,
             nullptr,
             1,
@@ -250,7 +251,7 @@ bool CompileState::compile(bool allow_cpu_fallback) {
         std::cerr << "    Attempting dummy CUDF conversion..." << std::endl;
         auto cudfTable = facebook::velox::cudf_velox::with_arrow::toCudfTable(
             dummyRowVector,
-            memory::MemoryManager::getInstance()->addLeafPool(),
+            pool.get(),
             rmm::cuda_stream_default);
         std::cerr << "    Dummy conversion succeeded!" << std::endl;
         
