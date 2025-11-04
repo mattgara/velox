@@ -222,6 +222,14 @@ bool CompileState::compile(bool allow_cpu_fallback) {
       continue; // Skip GPU operators
     }
     
+    // Skip sink operators (they don't produce output for downstream consumption)
+    std::string opString = operators[cpuOpIdx]->toString();
+    if (opString.find("Sink") != std::string::npos || 
+        opString.find("Output") != std::string::npos) {
+      std::cerr << "Skipping sink operator[" << cpuOpIdx << "] - no downstream output" << std::endl;
+      continue;
+    }
+    
     std::cerr << "Checking CPU operator[" << cpuOpIdx << "] output compatibility..." << std::endl;
     
     auto cpuPlanNode = getPlanNode(operators[cpuOpIdx]->planNodeId());
