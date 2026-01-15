@@ -26,6 +26,8 @@
 #include "velox/vector/VectorTypeUtils.h"
 #include "velox/vector/arrow/Abi.h"
 
+#include <iostream>
+
 namespace facebook::velox {
 
 namespace {
@@ -2296,9 +2298,17 @@ VectorPtr importFromArrowImpl(
       new ArrowSchema(arrowSchema), [](ArrowSchema* toDelete) {
         if (toDelete != nullptr) {
           if (toDelete->release != nullptr) {
+            std::cout << "**** DEBUG **** Velox custom deleter releasing schema at " << (void*)toDelete << std::endl;
             toDelete->release(toDelete);
+            std::cout << "**** DEBUG **** Velox custom deleter nulling schema->release at " << (void*)toDelete << std::endl;
+            toDelete->release = nullptr;
+          } else {
+            std::cout << "**** DEBUG **** Velox custom deleter NOT releasing schema at " << (void*)toDelete << std::endl;
           }
+          std::cout << "**** DEBUG **** Velox custom deleter deleting schema at " << (void*)toDelete << std::endl;
           delete toDelete;
+        } else {
+          std::cout << "**** DEBUG **** Velox custom deleter NOT releasing schema at " << (void*)toDelete << std::endl;
         }
       });
   std::shared_ptr<ArrowArray> arrayReleaser(
@@ -2310,6 +2320,7 @@ VectorPtr importFromArrowImpl(
           delete toDelete;
         }
       });
+  std::cout << "**** DEBUG **** importing now" << std::endl;
   VectorPtr imported = importFromArrowImpl(
       arrowSchema,
       arrowArray,
@@ -2319,8 +2330,11 @@ VectorPtr importFromArrowImpl(
         return wrapInBufferViewAsOwner(
             buffer, length, schemaReleaser, arrayReleaser);
       });
+  std::cout << "**** DEBUG **** imported" << std::endl;
 
+  std::cout << "**** DEBUG **** marking schema as released at " << (void*)&arrowSchema << std::endl;
   arrowSchema.release = nullptr;
+  std::cout << "**** DEBUG **** marked schema as released at " << (void*)&arrowSchema << std::endl;
   arrowArray.release = nullptr;
 
   return imported;
