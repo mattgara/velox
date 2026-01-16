@@ -1001,6 +1001,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerBinaryOp({prefix + "minus", prefix + "subtract"}, cudf::binary_operator::SUB);
   registerBinaryOp({prefix + "multiply"}, cudf::binary_operator::MUL);
   registerBinaryOp({prefix + "divide"}, cudf::binary_operator::DIV);
+  registerBinaryOp({prefix + "mod"}, cudf::binary_operator::MOD);
 
   auto registerComparisonOp = [&](const std::vector<std::string>& aliases, cudf::binary_operator op) {
     registerCudfFunctions(
