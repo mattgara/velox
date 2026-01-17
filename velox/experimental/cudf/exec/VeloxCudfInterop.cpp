@@ -152,9 +152,6 @@ RowVectorPtr toVeloxColumn(
   // Prevent CUDF unique_ptr deleter from invoking the original release.
   arrowSchema->release = nullptr;
   }
-  // Keep release on the copy so Velox can clean up once.
-  adjustDecimalFormat(&schemaCopy);
-
   auto veloxTable = importFromArrowAsOwner(schemaCopy, arrayCopy, pool);
 
   // BaseVector to RowVector
