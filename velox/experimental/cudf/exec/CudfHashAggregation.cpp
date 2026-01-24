@@ -35,6 +35,9 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
+#include <unordered_map>
+#include <unordered_set>
+
 namespace {
 
 using namespace facebook::velox;
@@ -1311,6 +1314,11 @@ bool canAggregationBeEvaluatedByCudf(
   return matchTypedCallAgainstSignatures(call, stepIt->second);
 }
 
+bool canBeEvaluatedByCudfWithAliases(
+    const core::TypedExprPtr& expr,
+    const core::PlanNode* sourceNode,
+    core::QueryCtx* queryCtx);
+
 bool canBeEvaluatedByCudf(
     const core::AggregationNode& aggregationNode,
     core::QueryCtx* queryCtx) {
@@ -1343,9 +1351,7 @@ bool canBeEvaluatedByCudf(
 
     // Check input expressions can be evaluated by CUDF, expand the input first
     for (const auto& input : aggregate.call->inputs()) {
-      auto expandedInput = expandFieldReference(input, sourceNode);
-      std::vector<core::TypedExprPtr> exprs = {expandedInput};
-      if (!canBeEvaluatedByCudf(exprs, queryCtx)) {
+      if (!canBeEvaluatedByCudfWithAliases(input, sourceNode, queryCtx)) {
         return false;
       }
     }
@@ -1360,28 +1366,93 @@ bool canBeEvaluatedByCudf(
   return true;
 }
 
-core::TypedExprPtr expandFieldReference(
+namespace {
+struct ExprKey {
+  const core::ITypedExpr* expr;
+  const core::PlanNode* source;
+
+  bool operator==(const ExprKey& other) const {
+    return expr == other.expr && source == other.source;
+  }
+};
+
+struct ExprKeyHash {
+  size_t operator()(const ExprKey& key) const {
+    auto h1 = std::hash<const void*>{}(key.expr);
+    auto h2 = std::hash<const void*>{}(key.source);
+    return h1 ^ (h2 << 1);
+  }
+};
+
+bool canBeEvaluatedByCudfWithAliasesImpl(
     const core::TypedExprPtr& expr,
-    const core::PlanNode* sourceNode) {
-  // If this is a field reference and we have a source projection, expand it
-  if (expr->kind() == core::ExprKind::kFieldAccess && sourceNode) {
-    auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode);
-    if (projectNode) {
-      auto fieldExpr =
-          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr);
-      if (fieldExpr) {
-        // Find the corresponding projection expression
+    const core::PlanNode* sourceNode,
+    core::QueryCtx* queryCtx,
+    std::unordered_set<ExprKey, ExprKeyHash>& visiting,
+    std::unordered_map<ExprKey, bool, ExprKeyHash>& memo) {
+  if (!expr) {
+    return true;
+  }
+  if (expr->isInputKind()) {
+    return true;
+  }
+
+  ExprKey key{expr.get(), sourceNode};
+  if (auto it = memo.find(key); it != memo.end()) {
+    return it->second;
+  }
+  if (!visiting.insert(key).second) {
+    // Cycle in alias definitions, should never happen
+    return false;
+  }
+
+  if (auto field =
+          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(expr)) {
+    if (field->isInputColumn()) {
+      auto projectNode = dynamic_cast<const core::ProjectNode*>(sourceNode);
+      if (projectNode) {
         const auto& projections = projectNode->projections();
         const auto& names = projectNode->names();
         for (size_t i = 0; i < names.size(); ++i) {
-          if (names[i] == fieldExpr->name()) {
-            return projections[i];
+          if (names[i] == field->name()) {
+            const auto* nextSource = projectNode->sources().empty()
+                ? nullptr
+                : projectNode->sources()[0].get();
+            auto ok = canBeEvaluatedByCudfWithAliasesImpl(
+                projections[i], nextSource, queryCtx, visiting, memo);
+            visiting.erase(key);
+            memo.emplace(key, ok);
+            return ok;
           }
         }
       }
     }
   }
-  return expr;
+
+  for (const auto& child : expr->inputs()) {
+    if (!canBeEvaluatedByCudfWithAliasesImpl(
+            child, sourceNode, queryCtx, visiting, memo)) {
+      visiting.erase(key);
+      memo.emplace(key, false);
+      return false;
+    }
+  }
+
+  auto ok = canBeEvaluatedByCudf({expr}, queryCtx);
+  visiting.erase(key);
+  memo.emplace(key, ok);
+  return ok;
+}
+} // namespace
+
+bool canBeEvaluatedByCudfWithAliases(
+    const core::TypedExprPtr& expr,
+    const core::PlanNode* sourceNode,
+    core::QueryCtx* queryCtx) {
+  std::unordered_set<ExprKey, ExprKeyHash> visiting;
+  std::unordered_map<ExprKey, bool, ExprKeyHash> memo;
+  return canBeEvaluatedByCudfWithAliasesImpl(
+      expr, sourceNode, queryCtx, visiting, memo);
 }
 
 bool canGroupingKeysBeEvaluatedByCudf(
@@ -1390,9 +1461,7 @@ bool canGroupingKeysBeEvaluatedByCudf(
     core::QueryCtx* queryCtx) {
   // Check grouping key expressions (with expansion)
   for (const auto& groupingKey : groupingKeys) {
-    auto expandedKey = expandFieldReference(groupingKey, sourceNode);
-    std::vector<core::TypedExprPtr> exprs = {expandedKey};
-    if (!canBeEvaluatedByCudf(exprs, queryCtx)) {
+    if (!canBeEvaluatedByCudfWithAliases(groupingKey, sourceNode, queryCtx)) {
       return false;
     }
   }

@@ -303,6 +303,88 @@ TEST_F(ToCudfSelectionTest, complexGroupingKeyExpressionsFallsBack) {
   ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
 }
 
+// Test complex grouping key expressions without explicit alias should fall back
+TEST_F(ToCudfSelectionTest, complexGroupingKeyNoAliasFallsBack) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"c0", "c1", "c2", "abs(c0)"})
+                  .aggregation(
+                      {"p3"},
+                      {"sum(c2)"},
+                      {},
+                      core::AggregationNode::Step::kSingle,
+                      false)
+                  .project({"a0"})
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config("cudf.enabled", true)
+          .plan(plan)
+          .assertResults("SELECT sum(c2) FROM tmp GROUP BY abs(c0)");
+
+  ASSERT_FALSE(wasCudfAggregationUsed(task));
+  ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
+}
+
+// Test nested grouping key expressions without alias should fall back
+TEST_F(ToCudfSelectionTest, nestedGroupingKeyNoAliasFallsBack) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"c0", "c1", "c2", "abs(c0 - abs(c1))"})
+                  .aggregation(
+                      {"p3"},
+                      {"sum(c2)"},
+                      {},
+                      core::AggregationNode::Step::kSingle,
+                      false)
+                  .project({"a0"})
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config("cudf.enabled", true)
+          .plan(plan)
+          .assertResults(
+              "SELECT sum(c2) FROM tmp GROUP BY abs(c0 - abs(c1))");
+
+  ASSERT_FALSE(wasCudfAggregationUsed(task));
+  ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
+}
+
+// Test deeper grouping key expressions should fall back
+TEST_F(ToCudfSelectionTest, deepGroupingKeyExpressionsFallsBack) {
+  auto vectors = makeVectors(rowType_, 10, 100);
+  createDuckDbTable(vectors);
+
+  auto plan = PlanBuilder()
+                  .values(vectors)
+                  .project({"c0", "c1", "c2", "abs(c0) AS key1"})
+                  .project({"c0", "c1", "c2", "key1 + 1 AS key2"})
+                  .aggregation(
+                      {"key2"},
+                      {"sum(c2)"},
+                      {},
+                      core::AggregationNode::Step::kSingle,
+                      false)
+                  .planNode();
+
+  auto task =
+      AssertQueryBuilder(duckDbQueryRunner_)
+          .config("cudf.enabled", true)
+          .plan(plan)
+          .assertResults("SELECT abs(c0) + 1, sum(c2) FROM tmp GROUP BY abs(c0) + 1");
+
+  ASSERT_FALSE(wasCudfAggregationUsed(task));
+  ASSERT_TRUE(wasDefaultHashAggregationUsed(task));
+}
+
 // Test supported aggregation input expressions should use CUDF
 TEST_F(ToCudfSelectionTest, supportedAggregationInputExpressionsUsesCudf) {
   auto vectors = makeVectors(rowType_, 10, 100);

@@ -191,10 +191,6 @@ bool canBeEvaluatedByCudf(
     core::QueryCtx* queryCtx);
 
 // Utility functions
-core::TypedExprPtr expandFieldReference(
-    const core::TypedExprPtr& expr,
-    const core::PlanNode* sourceNode);
-
 bool canGroupingKeysBeEvaluatedByCudf(
     const std::vector<core::FieldAccessTypedExprPtr>& groupingKeys,
     const core::PlanNode* sourceNode,
