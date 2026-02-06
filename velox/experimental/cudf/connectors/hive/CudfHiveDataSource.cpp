@@ -95,22 +95,30 @@ CudfHiveDataSource::CudfHiveDataSource(
   VELOX_CHECK_NOT_NULL(
       tableHandle_, "TableHandle must be an instance of HiveTableHandle");
 
-  // Copy subfield filters
-  for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
-    subfieldFilters_.emplace(k.clone(), v->clone());
-    // Add fields in the filter to the columns to read if not there
-    for (const auto& [field, _] : subfieldFilters_) {
-      if (std::find(
-              readColumnNames_.begin(),
-              readColumnNames_.end(),
-              field.toString()) == readColumnNames_.end()) {
-        readColumnNames_.push_back(field.toString());
-      }
+  // Create subfield filters and remaining filter expression.
+  auto remainingFilter = tableHandle_->remainingFilter();
+  if (remainingFilter) {
+    double sampleRate = 1;
+    remainingFilter = extractFiltersFromRemainingFilter(
+        remainingFilter, expressionEvaluator_, subfieldFilters_, sampleRate);
+  } else {
+    // Copy subfield filters provided by the table handle.
+    for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
+      subfieldFilters_.emplace(k.clone(), v->clone());
+    }
+  }
+
+  // Add fields in the subfield filters to the columns to read if not there.
+  for (const auto& [field, _] : subfieldFilters_) {
+    if (std::find(
+            readColumnNames_.begin(),
+            readColumnNames_.end(),
+            field.toString()) == readColumnNames_.end()) {
+      readColumnNames_.push_back(field.toString());
     }
   }
 
   // Create remaining filter
-  auto remainingFilter = tableHandle_->remainingFilter();
   if (remainingFilter) {
     remainingFilterExprSet_ = expressionEvaluator_->compile(remainingFilter);
     for (const auto& field : remainingFilterExprSet_->distinctFields()) {
