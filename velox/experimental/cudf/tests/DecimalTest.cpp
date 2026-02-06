@@ -51,6 +51,10 @@ int64_t computeAvgRaw(const std::vector<int64_t>& values) {
   return static_cast<int64_t>(avg);
 }
 
+int32_t toDays(const std::string& date) {
+  return DATE()->toDays(date);
+}
+
 constexpr int kBitsPerWord = 8 * sizeof(cudf::bitmask_type);
 
 std::pair<rmm::device_buffer, cudf::size_type> makeNullMask(
@@ -798,6 +802,40 @@ TEST_F(CudfDecimalTest, decimalLogicalAndOrFilter) {
           "AND a > CAST('1.00' AS DECIMAL(10, 2))) "
           "OR a = CAST('4.00' AS DECIMAL(10, 2)) "
           "OR a = CAST('5.00' AS DECIMAL(10, 2)))");
+}
+
+TEST_F(CudfDecimalTest, decimalQ6FilterWithNumericLiterals) {
+  auto input = makeRowVector(
+      {"l_shipdate", "l_discount", "l_quantity", "l_extendedprice"},
+      {
+          makeFlatVector<int32_t>(
+              {toDays("1994-06-01"), toDays("1993-06-01")}, DATE()),
+          makeFlatVector<int64_t>({6, 4}, DECIMAL(15, 2)),
+          makeFlatVector<int64_t>({1000, 2500}, DECIMAL(15, 2)),
+          makeFlatVector<int64_t>({100000, 200000}, DECIMAL(15, 2)),
+      });
+
+  std::vector<RowVectorPtr> vectors = {input};
+  createDuckDbTable(vectors);
+
+  const std::string filter =
+      "l_shipdate >= DATE '1994-01-01' AND "
+      "l_shipdate < DATE '1995-01-01' AND "
+      "l_discount BETWEEN 0.05 AND 0.07 AND "
+      "l_quantity < 24";
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .filter(filter)
+                  .project({"l_extendedprice * l_discount AS revenue_part"})
+                  .partialAggregation({}, {"sum(revenue_part) AS revenue"})
+                  .finalAggregation()
+                  .planNode();
+
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .assertResults(
+          "SELECT sum(l_extendedprice * l_discount) AS revenue FROM tmp WHERE " +
+          filter);
 }
 
 TEST_F(CudfDecimalTest, decimalBinaryNullPropagation) {

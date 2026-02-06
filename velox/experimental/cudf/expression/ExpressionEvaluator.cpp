@@ -438,6 +438,21 @@ class BinaryFunction : public CudfFunction {
       }
       auto lhsView = asView(inputColumns[0]);
       auto rhsView = asView(inputColumns[1]);
+      std::unique_ptr<cudf::column> lhsCastForComparison;
+      std::unique_ptr<cudf::column> rhsCastForComparison;
+      if (isComparisonOp(op_)) {
+        if (cudf::is_fixed_point(lhsView.type()) &&
+            !cudf::is_fixed_point(rhsView.type()) &&
+            cudf::is_numeric(rhsView.type())) {
+          rhsCastForComparison = cudf::cast(rhsView, lhsView.type(), stream, mr);
+          rhsView = rhsCastForComparison->view();
+        } else if (cudf::is_fixed_point(rhsView.type()) &&
+                   !cudf::is_fixed_point(lhsView.type()) &&
+                   cudf::is_numeric(lhsView.type())) {
+          lhsCastForComparison = cudf::cast(lhsView, rhsView.type(), stream, mr);
+          lhsView = lhsCastForComparison->view();
+        }
+      }
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(rhsView.type())) {
         auto lhsScale = -lhsView.type().scale();
@@ -556,6 +571,20 @@ class BinaryFunction : public CudfFunction {
       }
       auto lhsView = asView(inputColumns[0]);
       if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
+          !cudf::is_fixed_point(right_->type()) &&
+          cudf::is_numeric(right_->type())) {
+        auto rhsCol = cudf::make_column_from_scalar(
+            *right_, lhsView.size(), stream, mr);
+        auto rhsCast = cudf::cast(rhsCol->view(), lhsView.type(), stream, mr);
+        return cudf::binary_operation(
+            lhsView,
+            rhsCast->view(),
+            op_,
+            type_,
+            stream,
+            mr);
+      }
+      if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
           cudf::is_fixed_point(right_->type())) {
         auto rhsCol = cudf::make_column_from_scalar(
             *right_, lhsView.size(), stream, mr);
@@ -673,6 +702,20 @@ class BinaryFunction : public CudfFunction {
       return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
     }
     auto rhsView = asView(inputColumns[0]);
+    if (isComparisonOp(op_) && cudf::is_fixed_point(rhsView.type()) &&
+        !cudf::is_fixed_point(left_->type()) &&
+        cudf::is_numeric(left_->type())) {
+      auto lhsCol =
+          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
+      auto lhsCast = cudf::cast(lhsCol->view(), rhsView.type(), stream, mr);
+      return cudf::binary_operation(
+          lhsCast->view(),
+          rhsView,
+          op_,
+          type_,
+          stream,
+          mr);
+    }
     if (isComparisonOp(op_) && cudf::is_fixed_point(left_->type()) &&
         cudf::is_fixed_point(rhsView.type())) {
       auto lhsCol =
@@ -909,19 +952,63 @@ class BetweenFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     // return (value >= min) && (value <= max)
+    auto valueView = asView(inputColumns[0]);
+    auto targetType = valueView.type();
+    auto makeLiteralColumn = [&](const std::unique_ptr<cudf::scalar>& literal) {
+      auto column =
+          cudf::make_column_from_scalar(*literal, valueView.size(), stream, mr);
+      if (cudf::is_fixed_point(targetType) &&
+          column->type() != targetType &&
+          cudf::is_numeric(column->type())) {
+        column = cudf::cast(column->view(), targetType, stream, mr);
+      }
+      return column;
+    };
+
     std::unique_ptr<cudf::column> geResultColumn, leResultColumn;
+    std::unique_ptr<cudf::column> minColumn;
+    std::unique_ptr<cudf::column> maxColumn;
+    std::unique_ptr<cudf::column> minCast;
+    std::unique_ptr<cudf::column> maxCast;
+    auto minView = [&]() -> cudf::column_view {
+      if (minLiteral_) {
+        minColumn = makeLiteralColumn(minLiteral_);
+        return minColumn->view();
+      }
+      auto view = asView(inputColumns[1]);
+      if (cudf::is_fixed_point(targetType) && view.type() != targetType &&
+          cudf::is_numeric(view.type())) {
+        minCast = cudf::cast(view, targetType, stream, mr);
+        return minCast->view();
+      }
+      return view;
+    }();
+    auto maxView = [&]() -> cudf::column_view {
+      if (maxLiteral_) {
+        maxColumn = makeLiteralColumn(maxLiteral_);
+        return maxColumn->view();
+      }
+      auto view = asView(inputColumns[2]);
+      if (cudf::is_fixed_point(targetType) && view.type() != targetType &&
+          cudf::is_numeric(view.type())) {
+        maxCast = cudf::cast(view, targetType, stream, mr);
+        return maxCast->view();
+      }
+      return view;
+    }();
+
     if (minLiteral_) {
       geResultColumn = std::move(cudf::binary_operation(
-          asView(inputColumns[0]),
-          *minLiteral_,
+          valueView,
+          minView,
           cudf::binary_operator::GREATER_EQUAL,
           kBoolType,
           stream,
           mr));
     } else {
       geResultColumn = std::move(cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[1]),
+          valueView,
+          minView,
           cudf::binary_operator::GREATER_EQUAL,
           kBoolType,
           stream,
@@ -929,16 +1016,16 @@ class BetweenFunction : public CudfFunction {
     }
     if (maxLiteral_) {
       leResultColumn = std::move(cudf::binary_operation(
-          asView(inputColumns[0]),
-          *maxLiteral_,
+          valueView,
+          maxView,
           cudf::binary_operator::LESS_EQUAL,
           kBoolType,
           stream,
           mr));
     } else {
       leResultColumn = std::move(cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[2]),
+          valueView,
+          maxView,
           cudf::binary_operator::LESS_EQUAL,
           kBoolType,
           stream,
