@@ -53,6 +53,7 @@
 
 #include <cuda.h>
 
+#include <cstdlib>
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
@@ -64,6 +65,14 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+bool cudfExchangeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VELOX_CUDF_EXCHANGE_DEBUG");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
 }
 
 } // namespace
@@ -429,6 +438,17 @@ bool CompileState::compile(bool allowCpuFallback) {
     if (!allowCpuFallback) {
       VELOX_CHECK(condition, "Replacement with cuDF operator failed");
     } else if (!condition) {
+      if (cudfExchangeDebugEnabled()) {
+        std::cout << "[cudf-adapt] fallback op task=" << oper->taskId()
+                  << " plan=" << oper->planNodeId()
+                  << " op=" << oper->operatorId()
+                  << " type=" << oper->operatorType()
+                  << " keep=" << keepOperator
+                  << " replaceOps=" << replaceOp.size()
+                  << " gpuReplaced=" << GpuReplacedOperator(oper)
+                  << " gpuRetained=" << GpuRetainedOperator(oper)
+                  << std::endl;
+      }
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
     }
