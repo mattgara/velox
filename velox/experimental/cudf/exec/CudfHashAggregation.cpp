@@ -37,9 +37,20 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <cstdlib>
+#include <iostream>
+
 namespace {
 
 using namespace facebook::velox;
+
+bool cudfExchangeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VELOX_CUDF_EXCHANGE_DEBUG");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
+}
 
 
 #define DEFINE_SIMPLE_AGGREGATOR(Name, name, KIND)                            \
@@ -1174,6 +1185,16 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
+  if (cudfExchangeDebugEnabled() && !loggedEmptyInput_ && inputs_.empty() &&
+      noMoreInput_) {
+    loggedEmptyInput_ = true;
+    std::cout << "[cudf-agg] empty inputs on getOutput task=" << taskId()
+              << " plan=" << planNodeId() << " op=" << operatorId()
+              << " type=" << operatorType() << " global=" << isGlobal_
+              << " partial=" << isPartialOutput_
+              << " numInputRows=" << numInputRows_ << std::endl;
+  }
+
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {
     if (partialOutput_ &&
@@ -1236,6 +1257,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
   if (isPartialOutput_ && inputs_.empty()) {
+    if (cudfExchangeDebugEnabled()) {
+      std::cout << "[cudf-agg] noMoreInput with empty inputs task=" << taskId()
+                << " plan=" << planNodeId() << " op=" << operatorId()
+                << " type=" << operatorType() << " global=" << isGlobal_
+                << " partial=" << isPartialOutput_
+                << " numInputRows=" << numInputRows_ << std::endl;
+    }
     finished_ = true;
   }
 }

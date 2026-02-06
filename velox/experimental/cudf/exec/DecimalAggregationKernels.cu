@@ -25,12 +25,22 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <thrust/iterator/counting_iterator.h>
 
 namespace facebook::velox::cudf_velox {
 namespace {
+
+bool cudfExchangeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VELOX_CUDF_EXCHANGE_DEBUG");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
+}
 
 constexpr int32_t kStateSize = 32;
 
@@ -172,6 +182,10 @@ DecimalSumStateColumns deserializeDecimalSumStateWithCount(
       "Decimal sum state requires STRING/VARBINARY column");
   auto numRows = stateCol.size();
   if (numRows == 0) {
+    if (cudfExchangeDebugEnabled()) {
+      std::cout << "[cudf-decimal] empty state column decode scale=" << scale
+                << std::endl;
+    }
     DecimalSumStateColumns empty;
     empty.sum = cudf::make_fixed_width_column(
         cudf::data_type{cudf::type_id::DECIMAL128, -scale},

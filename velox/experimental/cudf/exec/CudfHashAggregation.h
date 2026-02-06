@@ -141,6 +141,7 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   int64_t numInputRows_ = 0;
 
   bool finished_ = false;
+  bool loggedEmptyInput_ = false;
 
   size_t numAggregates_;
   bool ignoreNullKeys_;

@@ -18,14 +18,23 @@
 #include "velox/experimental/cudf/exec/DecimalAggregationKernels.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/file/FileSystems.h"
+#include "velox/common/config/Config.h"
+#include "velox/exec/Exchange.h"
+#include "velox/exec/ExchangeSource.h"
+#include "velox/exec/Task.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
+#include "velox/exec/tests/utils/HiveConnectorTestBase.h"
+#include "velox/exec/tests/utils/LocalExchangeSource.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/core/QueryConfig.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
+#include "velox/parse/ExpressionsParser.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/type/DecimalUtil.h"
 
@@ -34,10 +43,18 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
+#include <cstdlib>
+#include <filesystem>
+#include <glog/logging.h>
+#include <iostream>
 #include <optional>
 #include <type_traits>
 
 namespace facebook::velox::cudf_velox {
+namespace exec::test {
+using ::facebook::velox::exec::test::OperatorTestBase;
+using ::facebook::velox::exec::test::PlanBuilder;
+} // namespace exec::test
 namespace {
 
 int64_t computeAvgRaw(const std::vector<int64_t>& values) {
@@ -213,7 +230,30 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
 
   void TearDown() override {
     unregisterCudf();
-    exec::test::OperatorTestBase::TearDown();
+    OperatorTestBase::TearDown();
+  }
+};
+
+class CudfDecimalTpchReproTest
+    : public facebook::velox::cudf_velox::exec::test::CudfHiveConnectorTestBase {
+ protected:
+  void SetUp() override {
+    CudfHiveConnectorTestBase::SetUp();
+    parse::registerTypeResolver();
+    functions::prestosql::registerAllScalarFunctions();
+    aggregate::prestosql::registerAllAggregateFunctions();
+    CudfConfig::getInstance().allowCpuFallback = false;
+    int deviceCount = 0;
+    auto status = cudaGetDeviceCount(&deviceCount);
+    if (status != cudaSuccess) {
+      GTEST_SKIP() << "cudaGetDeviceCount failed: " << static_cast<int>(status)
+                   << " (" << cudaGetErrorString(status) << ")";
+    }
+    if (deviceCount == 0) {
+      GTEST_SKIP() << "No CUDA devices visible (check CUDA_VISIBLE_DEVICES)";
+    }
+    VELOX_CHECK_EQ(0, static_cast<int>(cudaSetDevice(0)));
+    VELOX_CHECK_EQ(0, static_cast<int>(cudaFree(0)));
   }
 };
 
@@ -819,12 +859,15 @@ TEST_F(CudfDecimalTest, decimalQ6FilterWithNumericLiterals) {
   createDuckDbTable(vectors);
 
   const std::string filter =
-      "l_shipdate >= DATE '1994-01-01' AND "
-      "l_shipdate < DATE '1995-01-01' AND "
-      "l_discount BETWEEN 0.05 AND 0.07 AND "
-      "l_quantity < 24";
+      "l_shipdate BETWEEN DATE '1994-01-01' AND DATE '1994-12-31' AND "
+      "l_discount BETWEEN CAST(0.05 AS DECIMAL(15, 2)) AND "
+      "CAST(0.07 AS DECIMAL(15, 2)) AND "
+      "l_quantity < CAST(24 AS DECIMAL(15, 2))";
 
-  auto plan = exec::test::PlanBuilder()
+  parse::ParseOptions parseOptions;
+  parseOptions.parseDecimalAsDouble = false;
+  auto plan = ::facebook::velox::exec::test::PlanBuilder()
+                  .setParseOptions(parseOptions)
                   .values(vectors)
                   .filter(filter)
                   .project({"l_extendedprice * l_discount AS revenue_part"})
@@ -836,6 +879,438 @@ TEST_F(CudfDecimalTest, decimalQ6FilterWithNumericLiterals) {
       .assertResults(
           "SELECT sum(l_extendedprice * l_discount) AS revenue FROM tmp WHERE " +
           filter);
+}
+
+TEST_F(CudfDecimalTpchReproTest, tpchQ6IncrementalScan) {
+  const std::string lineitemPath =
+      "/home/mgara/software/velox-testing-repro-base/data/sf10dec/lineitem/"
+      "lineitem-1.parquet";
+  if (!std::filesystem::exists(lineitemPath)) {
+    GTEST_SKIP() << "Missing test data file: " << lineitemPath;
+  }
+
+  auto rowType = ROW(
+      {"l_shipdate", "l_discount", "l_quantity", "l_extendedprice"},
+      {DATE(), DECIMAL(15, 2), DECIMAL(15, 2), DECIMAL(15, 2)});
+
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+
+  const std::string filter =
+      "l_shipdate >= DATE '1994-01-01' AND "
+      "l_shipdate < DATE '1995-01-01' AND "
+      "l_discount >= CAST(0.05 AS DECIMAL(15, 2)) AND "
+      "l_discount <= CAST(0.07 AS DECIMAL(15, 2)) AND "
+      "l_quantity < CAST(24 AS DECIMAL(15, 2))";
+
+  parse::ParseOptions parseOptions;
+  parseOptions.parseDecimalAsDouble = false;
+
+  const std::vector<int64_t> limits = {
+      1000, 10'000, 100'000, 1'000'000, 5'000'000, 10'000'000, 20'000'000};
+
+  auto split = makeCudfHiveConnectorSplit(lineitemPath);
+
+  auto runScan = [&](const std::optional<int64_t>& limit,
+                     const std::string& label) -> bool {
+    auto config = std::unordered_map<std::string, std::string>{};
+    if (limit.has_value()) {
+      config.insert(
+          {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::
+               kNumRows,
+           std::to_string(limit.value())});
+    }
+    resetCudfHiveConnector(
+        std::make_shared<::facebook::velox::config::ConfigBase>(
+            std::move(config)));
+
+    auto plan = ::facebook::velox::exec::test::PlanBuilder(pool())
+                    .setParseOptions(parseOptions)
+                    .startTableScan()
+                    .connectorId(
+                        facebook::velox::cudf_velox::exec::test::
+                            kCudfHiveConnectorId)
+                    .tableName("lineitem")
+                    .outputType(rowType)
+                    .dataColumns(rowType)
+                    .assignments(assignments)
+                    .endTableScan()
+                    .filter(filter)
+                    .project({"l_extendedprice * l_discount AS revenue_part"})
+                    .partialAggregation(
+                        {},
+                        {"sum(revenue_part) AS revenue",
+                         "count(1) AS match_count"})
+                    .finalAggregation()
+                    .planNode();
+
+    auto results = facebook::velox::exec::test::AssertQueryBuilder(plan)
+                       .splits({split})
+                       .copyResults(pool());
+    if (results->size() != 1) {
+      ADD_FAILURE() << "Expected a single row for " << label;
+      return false;
+    }
+    if (results->childrenSize() != 2) {
+      ADD_FAILURE() << "Expected two columns for " << label;
+      return false;
+    }
+
+    auto revenue = results->childAt(0);
+    auto matchCount =
+        results->childAt(1)->asFlatVector<int64_t>()->valueAt(0);
+    auto revenueText = revenue->isNullAt(0) ? "NULL" : revenue->toString(0);
+
+    std::cout << "Q6 " << label << " match_count=" << matchCount
+              << " revenue=" << revenueText << std::endl;
+
+    if (matchCount > 0 && revenue->isNullAt(0)) {
+      ADD_FAILURE() << "NULL revenue at " << label;
+      return false;
+    }
+    return true;
+  };
+
+  for (auto limit : limits) {
+    SCOPED_TRACE(std::string("numRows=") + std::to_string(limit));
+    if (!runScan(
+            std::make_optional(limit),
+            std::string("numRows=") + std::to_string(limit))) {
+      return;
+    }
+  }
+
+  runScan(std::nullopt, "full");
+}
+
+TEST_F(CudfDecimalTpchReproTest, tpchQ6ExchangeRepro) {
+  const std::string lineitemPath =
+      "/home/mgara/software/velox-testing-repro-base/data/sf10dec/lineitem/"
+      "lineitem-1.parquet";
+  if (!std::filesystem::exists(lineitemPath)) {
+    GTEST_SKIP() << "Missing test data file: " << lineitemPath;
+  }
+
+  auto rowType = ROW(
+      {"l_orderkey",
+       "l_shipdate",
+       "l_discount",
+       "l_quantity",
+       "l_extendedprice"},
+      {BIGINT(), DATE(), DECIMAL(15, 2), DECIMAL(15, 2), DECIMAL(15, 2)});
+
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+
+  const std::string filter =
+      "l_shipdate >= DATE '1994-01-01' AND "
+      "l_shipdate < DATE '1995-01-01' AND "
+      "l_discount >= CAST(0.05 AS DECIMAL(15, 2)) AND "
+      "l_discount <= CAST(0.07 AS DECIMAL(15, 2)) AND "
+      "l_quantity < CAST(24 AS DECIMAL(15, 2))";
+
+  parse::ParseOptions parseOptions;
+  parseOptions.parseDecimalAsDouble = false;
+
+  auto split = makeCudfHiveConnectorSplit(lineitemPath);
+
+  int64_t rowLimit = 10'000;
+  if (const char* envLimit =
+          std::getenv("VELOX_TPCH_Q6_EXCHANGE_ROWS")) {
+    try {
+      rowLimit = std::stoll(envLimit);
+    } catch (const std::exception&) {
+      rowLimit = 10'000;
+    }
+  }
+  auto config = std::unordered_map<std::string, std::string>{};
+  if (rowLimit > 0) {
+    config.insert(
+        {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::kNumRows,
+         std::to_string(rowLimit)});
+  }
+  resetCudfHiveConnector(
+      std::make_shared<::facebook::velox::config::ConfigBase>(
+          std::move(config)));
+
+  auto buildPlan = [&](bool withExchange) {
+    auto builder = ::facebook::velox::exec::test::PlanBuilder(pool())
+                       .setParseOptions(parseOptions)
+                       .startTableScan()
+                       .connectorId(
+                           facebook::velox::cudf_velox::exec::test::
+                               kCudfHiveConnectorId)
+                       .tableName("lineitem")
+                       .outputType(rowType)
+                       .dataColumns(rowType)
+                       .assignments(assignments)
+                       .endTableScan()
+                       .filter(filter)
+                       .project({"l_extendedprice * l_discount AS revenue_part",
+                                 "l_orderkey"});
+    if (withExchange) {
+      builder.localPartition({"l_orderkey"});
+    }
+    return builder
+        .partialAggregation({}, {"sum(revenue_part) AS revenue",
+                                 "count(1) AS match_count"})
+        .finalAggregation()
+        .planNode();
+  };
+
+  auto baseline =
+      facebook::velox::exec::test::AssertQueryBuilder(buildPlan(false))
+          .splits({split})
+          .copyResults(pool());
+
+  ASSERT_EQ(baseline->size(), 1) << "Baseline expected single row";
+  ASSERT_EQ(baseline->childrenSize(), 2) << "Baseline expected two columns";
+  auto baselineCount =
+      baseline->childAt(1)->asFlatVector<int64_t>()->valueAt(0);
+  ASSERT_GT(baselineCount, 0) << "Baseline count is zero";
+  auto revenueType = baseline->childAt(0)->type();
+  auto getRevenueValue = [&](const VectorPtr& vec, vector_size_t i) -> int128_t {
+    VELOX_CHECK(revenueType->isDecimal());
+    if (revenueType->kind() == TypeKind::BIGINT) {
+      return static_cast<int128_t>(
+          vec->asFlatVector<int64_t>()->valueAt(i));
+    }
+    return vec->asFlatVector<int128_t>()->valueAt(i);
+  };
+  auto baselineRevenue =
+      baseline->childAt(0)->isNullAt(0)
+      ? int128_t{0}
+      : getRevenueValue(baseline->childAt(0), 0);
+
+  auto exchanged =
+      facebook::velox::exec::test::AssertQueryBuilder(buildPlan(true))
+          .maxDrivers(3)
+          .config(core::QueryConfig::kMaxLocalExchangePartitionCount, "3")
+          .splits({split})
+          .copyResults(pool());
+
+  ASSERT_EQ(exchanged->childrenSize(), 2)
+      << "Exchange expected two columns";
+  int64_t exchangeCount = 0;
+  int128_t exchangeRevenue = 0;
+  auto exchangeRevenueVec = exchanged->childAt(0);
+  auto exchangeCountVec = exchanged->childAt(1)->asFlatVector<int64_t>();
+  for (vector_size_t i = 0; i < exchanged->size(); ++i) {
+    if (!exchangeCountVec->isNullAt(i)) {
+      exchangeCount += exchangeCountVec->valueAt(i);
+    }
+    if (!exchangeRevenueVec->isNullAt(i)) {
+      exchangeRevenue += getRevenueValue(exchangeRevenueVec, i);
+    }
+  }
+
+  std::cout << "Q6 baseline count=" << baselineCount
+            << " revenue="
+            << DecimalUtil::toString(baselineRevenue, revenueType)
+            << " | exchange rows=" << exchanged->size()
+            << " count=" << exchangeCount
+            << " revenue="
+            << DecimalUtil::toString(exchangeRevenue, revenueType)
+            << " rowLimit=" << rowLimit << std::endl;
+
+  ASSERT_EQ(exchangeCount, baselineCount)
+      << "Exchange count mismatch";
+  ASSERT_EQ(exchangeRevenue, baselineRevenue)
+      << "Exchange revenue mismatch";
+}
+
+TEST_F(CudfDecimalTpchReproTest, tpchQ6SerializedExchangeRepro) {
+  const std::string lineitemPath =
+      "/home/mgara/software/velox-testing-repro-base/data/sf10dec/lineitem/"
+      "lineitem-1.parquet";
+  if (!std::filesystem::exists(lineitemPath)) {
+    GTEST_SKIP() << "Missing test data file: " << lineitemPath;
+  }
+
+  auto rowType = ROW(
+      {"l_orderkey",
+       "l_shipdate",
+       "l_discount",
+       "l_quantity",
+       "l_extendedprice"},
+      {BIGINT(), DATE(), DECIMAL(15, 2), DECIMAL(15, 2), DECIMAL(15, 2)});
+
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+
+  const std::string filter =
+      "l_shipdate >= DATE '1994-01-01' AND "
+      "l_shipdate < DATE '1995-01-01' AND "
+      "l_discount >= CAST(0.05 AS DECIMAL(15, 2)) AND "
+      "l_discount <= CAST(0.07 AS DECIMAL(15, 2)) AND "
+      "l_quantity < CAST(24 AS DECIMAL(15, 2))";
+  auto revenuePartType = DECIMAL(30, 4);
+  std::vector<std::vector<TypePtr>> rawInputTypes{{revenuePartType}};
+
+  parse::ParseOptions parseOptions;
+  parseOptions.parseDecimalAsDouble = false;
+
+  if (facebook::velox::exec::ExchangeSource::factories().empty()) {
+    facebook::velox::exec::ExchangeSource::registerFactory(
+        facebook::velox::exec::test::createLocalExchangeSource);
+  }
+
+  auto connectorSplit = makeCudfHiveConnectorSplit(lineitemPath);
+
+  int64_t rowLimit = 10'000;
+  if (const char* envLimit =
+          std::getenv("VELOX_TPCH_Q6_EXCHANGE_ROWS")) {
+    try {
+      rowLimit = std::stoll(envLimit);
+    } catch (const std::exception&) {
+      rowLimit = 10'000;
+    }
+  }
+  auto config = std::unordered_map<std::string, std::string>{};
+  if (rowLimit > 0) {
+    config.insert(
+        {facebook::velox::cudf_velox::connector::hive::CudfHiveConfig::kNumRows,
+         std::to_string(rowLimit)});
+  }
+  resetCudfHiveConnector(
+      std::make_shared<::facebook::velox::config::ConfigBase>(
+          std::move(config)));
+
+  core::PlanNodeId scanNodeId;
+  auto producerPlan = ::facebook::velox::exec::test::PlanBuilder(pool())
+                          .setParseOptions(parseOptions)
+                          .startTableScan()
+                          .connectorId(
+                              facebook::velox::cudf_velox::exec::test::
+                                  kCudfHiveConnectorId)
+                          .tableName("lineitem")
+                          .outputType(rowType)
+                          .dataColumns(rowType)
+                          .assignments(assignments)
+                          .endTableScan()
+                          .capturePlanNodeId(scanNodeId)
+                          .filter(filter)
+                          .project(
+                              {"CAST(l_extendedprice * l_discount AS DECIMAL(30, 4)) AS revenue_part"})
+                          .partialAggregation({}, {"sum(revenue_part)"})
+                          .partitionedOutput(
+                              {}, 1, /*outputLayout=*/{}, VectorSerde::Kind::kPresto)
+                          .planNode();
+
+  auto makeTask = [&](const std::string& taskId,
+                      const core::PlanNodePtr& planNode,
+                      int destination) {
+    auto queryCtx = core::QueryCtx::create(
+        driverExecutor_.get(), core::QueryConfig({}));
+    core::PlanFragment planFragment{planNode};
+    return facebook::velox::exec::Task::create(
+        taskId,
+        std::move(planFragment),
+        destination,
+        std::move(queryCtx),
+        facebook::velox::exec::Task::ExecutionMode::kParallel);
+  };
+
+  auto remoteSplit = [](const std::string& taskId) {
+    return facebook::velox::exec::Split(
+        std::make_shared<facebook::velox::exec::RemoteConnectorSplit>(taskId));
+  };
+
+  const std::string producerTaskId = "local://q6-producer";
+  auto producerTask = makeTask(producerTaskId, producerPlan, 0);
+  producerTask->start(1);
+  producerTask->addSplit(
+      scanNodeId,
+      facebook::velox::exec::Split(
+          std::shared_ptr<facebook::velox::connector::ConnectorSplit>(
+              connectorSplit)));
+  producerTask->noMoreSplits(scanNodeId);
+
+  auto consumerPlan =
+      ::facebook::velox::exec::test::PlanBuilder()
+          .exchange(producerPlan->outputType(), VectorSerde::Kind::kPresto)
+          .finalAggregation({}, {"sum(a0) AS revenue"}, rawInputTypes)
+          .planNode();
+
+  auto exchangeResults =
+      facebook::velox::exec::test::AssertQueryBuilder(consumerPlan)
+          .splits({remoteSplit(producerTaskId)})
+          .copyResults(pool());
+
+  ASSERT_TRUE(facebook::velox::exec::test::waitForTaskCompletion(
+      producerTask.get()))
+      << producerTask->taskId();
+
+  auto baselinePlan = ::facebook::velox::exec::test::PlanBuilder(pool())
+                          .setParseOptions(parseOptions)
+                          .startTableScan()
+                          .connectorId(
+                              facebook::velox::cudf_velox::exec::test::
+                                  kCudfHiveConnectorId)
+                          .tableName("lineitem")
+                          .outputType(rowType)
+                          .dataColumns(rowType)
+                          .assignments(assignments)
+                          .endTableScan()
+                          .filter(filter)
+                          .project(
+                              {"CAST(l_extendedprice * l_discount AS DECIMAL(30, 4)) AS revenue_part"})
+                          .partialAggregation({}, {"sum(revenue_part)"})
+                          .finalAggregation()
+                          .planNode();
+
+  auto baselineResults =
+      facebook::velox::exec::test::AssertQueryBuilder(baselinePlan)
+          .splits({connectorSplit})
+          .copyResults(pool());
+
+  ASSERT_EQ(exchangeResults->size(), 1)
+      << "Exchange expected single row";
+  ASSERT_EQ(baselineResults->size(), 1)
+      << "Baseline expected single row";
+  ASSERT_EQ(exchangeResults->childrenSize(), 1)
+      << "Exchange expected single column";
+  ASSERT_EQ(baselineResults->childrenSize(), 1)
+      << "Baseline expected single column";
+
+  auto exchangeType = exchangeResults->childAt(0)->type();
+  auto baselineType = baselineResults->childAt(0)->type();
+  ASSERT_TRUE(exchangeType->equivalent(*baselineType))
+      << "Exchange type=" << exchangeType->toString()
+      << " baseline type=" << baselineType->toString();
+  auto getRevenueValue = [&](const VectorPtr& vec,
+                             const TypePtr& type,
+                             vector_size_t i) -> int128_t {
+    VELOX_CHECK(type->isDecimal());
+    if (type->kind() == TypeKind::BIGINT) {
+      return static_cast<int128_t>(
+          vec->asFlatVector<int64_t>()->valueAt(i));
+    }
+    return vec->asFlatVector<int128_t>()->valueAt(i);
+  };
+
+  auto exchangeRevenue =
+      exchangeResults->childAt(0)->isNullAt(0)
+      ? int128_t{0}
+      : getRevenueValue(exchangeResults->childAt(0), exchangeType, 0);
+  auto baselineRevenue =
+      baselineResults->childAt(0)->isNullAt(0)
+      ? int128_t{0}
+      : getRevenueValue(baselineResults->childAt(0), baselineType, 0);
+
+  std::cout << "Q6 serialized exchange revenue="
+            << DecimalUtil::toString(exchangeRevenue, exchangeType)
+            << " baseline="
+            << DecimalUtil::toString(baselineRevenue, baselineType)
+            << " exchangeType=" << exchangeType->toString()
+            << " baselineType=" << baselineType->toString()
+            << " rowLimit=" << rowLimit << std::endl;
+
+  ASSERT_EQ(exchangeRevenue, baselineRevenue)
+      << "Serialized exchange revenue mismatch";
 }
 
 TEST_F(CudfDecimalTest, decimalBinaryNullPropagation) {
