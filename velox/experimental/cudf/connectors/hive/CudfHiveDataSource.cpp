@@ -591,6 +591,15 @@ void CudfHiveDataSource::setupCudfDataSourceAndOptions() {
   }
 
   if (subfieldFilters_.size()) {
+    if (cudfExchangeDebugEnabled()) {
+      std::cout << "[cudf-scan] subfieldFilters=" << subfieldFilters_.size()
+                << " task=" << connectorQueryCtx_->taskId()
+                << " plan=" << connectorQueryCtx_->planNodeId() << std::endl;
+      for (const auto& [subfield, filter] : subfieldFilters_) {
+        std::cout << "  [cudf-scan] filter " << subfield.toString()
+                  << " -> " << filter->toString() << std::endl;
+      }
+    }
     const RowTypePtr readerFilterType = [&] {
       if (tableHandle_->dataColumns()) {
         std::vector<std::string> newNames;
