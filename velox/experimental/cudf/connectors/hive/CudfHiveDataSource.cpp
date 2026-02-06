@@ -48,7 +48,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -56,6 +58,16 @@ namespace facebook::velox::cudf_velox::connector::hive {
 
 using namespace facebook::velox::connector;
 using namespace facebook::velox::connector::hive;
+
+namespace {
+bool cudfExchangeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VELOX_CUDF_EXCHANGE_DEBUG");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
+}
+} // namespace
 
 CudfHiveDataSource::CudfHiveDataSource(
     const RowTypePtr& outputType,
@@ -330,6 +342,8 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     }
   }
 
+  const auto readRows = cudfTable->num_rows();
+
   TotalScanTimeCallbackData* callbackData =
       new TotalScanTimeCallbackData{startTimeUs, ioStats_};
 
@@ -370,6 +384,14 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
 
   // Output RowVectorPtr
   const auto nRows = cudfTable->num_rows();
+  if (cudfExchangeDebugEnabled()) {
+    std::cout << "[cudf-scan] task=" << connectorQueryCtx_->taskId()
+              << " plan=" << connectorQueryCtx_->planNodeId()
+              << " split=" << (split_ ? split_->filePath : "<none>")
+              << " readRows=" << readRows << " outRows=" << nRows
+              << " remainingFilter=" << static_cast<bool>(remainingFilterExprSet_)
+              << std::endl;
+  }
 
   // keep only outputType_.size() columns in cudfTable_
   if (outputType_->size() < cudfTable->num_columns()) {

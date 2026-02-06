@@ -29,6 +29,8 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
+#include <cstdlib>
+#include <iostream>
 #include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
@@ -61,6 +63,14 @@ bool checkAddIdentityProjection(
   }
 
   return false;
+}
+
+bool cudfExchangeDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("VELOX_CUDF_EXCHANGE_DEBUG");
+    return env != nullptr && env[0] != '0';
+  }();
+  return enabled;
 }
 
 // Split stats to attrbitute cardinality reduction to the Filter node.
@@ -240,6 +250,7 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
   VELOX_CHECK_NOT_NULL(cudfInput);
   auto stream = cudfInput->stream();
+  auto inputRows = cudfInput->size();
   auto inputTableColumns = cudfInput->release()->release();
 
   if (hasFilter_) {
@@ -251,6 +262,14 @@ RowVectorPtr CudfFilterProject::getOutput() {
   stream.synchronize();
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
+  if (cudfExchangeDebugEnabled()) {
+    std::cout << "[cudf-filter] task=" << taskId()
+              << " plan=" << planNodeId() << " op=" << operatorId()
+              << " in=" << inputRows << " out=" << size
+              << " hasFilter=" << hasFilter_
+              << " identity=" << isIdentityProjection_
+              << " cols=" << numColumns << std::endl;
+  }
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
             << " columns " << std::endl;
