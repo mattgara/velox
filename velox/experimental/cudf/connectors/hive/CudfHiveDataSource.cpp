@@ -108,16 +108,30 @@ CudfHiveDataSource::CudfHiveDataSource(
       tableHandle_, "TableHandle must be an instance of HiveTableHandle");
 
   // Create subfield filters and remaining filter expression.
+  auto isDecimalSubfield = [&](const common::Subfield& subfield) {
+    if (!tableHandle_->dataColumns()) {
+      return false;
+    }
+    const auto& name = getColumnName(subfield);
+    if (!tableHandle_->dataColumns()->containsChild(name)) {
+      return false;
+    }
+    return tableHandle_->dataColumns()->findChild(name)->isDecimal();
+  };
+
+  // Copy subfield filters provided by the table handle, skipping decimals.
+  for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
+    if (isDecimalSubfield(k)) {
+      continue;
+    }
+    subfieldFilters_.emplace(k.clone(), v->clone());
+  }
+
   auto remainingFilter = tableHandle_->remainingFilter();
   if (remainingFilter) {
     double sampleRate = 1;
     remainingFilter = extractFiltersFromRemainingFilter(
         remainingFilter, expressionEvaluator_, subfieldFilters_, sampleRate);
-  } else {
-    // Copy subfield filters provided by the table handle.
-    for (const auto& [k, v] : tableHandle_->subfieldFilters()) {
-      subfieldFilters_.emplace(k.clone(), v->clone());
-    }
   }
 
   // Add fields in the subfield filters to the columns to read if not there.
