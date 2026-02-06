@@ -63,6 +63,10 @@ std::unique_ptr<T> asUniquePtr(std::unique_ptr<U> ptr) {
   return std::unique_ptr<T>(static_cast<T*>(ptr.release()));
 }
 
+bool isDecimalConstant(const VectorPtr& vector) {
+  return vector && vector->type()->isDecimal();
+}
+
 std::unique_ptr<common::BigintRange> asBigintRange(
     std::unique_ptr<common::Filter>& ptr) {
   return asUniquePtr<common::BigintRange>(std::move(ptr));
@@ -210,6 +214,9 @@ std::unique_ptr<common::Filter> ExprToSubfieldFilterParser::makeEqualFilter(
   if (value->isNullAt(0)) {
     return std::make_unique<common::AlwaysFalse>();
   }
+  if (isDecimalConstant(value)) {
+    return nullptr;
+  }
   switch (value->typeKind()) {
     case TypeKind::BOOLEAN:
       return boolEqual(singleValue<bool>(value));
@@ -243,6 +250,9 @@ ExprToSubfieldFilterParser::makeGreaterThanFilter(
   }
   if (lower->isNullAt(0)) {
     return std::make_unique<common::AlwaysFalse>();
+  }
+  if (isDecimalConstant(lower)) {
+    return nullptr;
   }
   switch (lower->typeKind()) {
     case TypeKind::TINYINT:
@@ -278,6 +288,9 @@ std::unique_ptr<common::Filter> ExprToSubfieldFilterParser::makeLessThanFilter(
   }
   if (upper->isNullAt(0)) {
     return std::make_unique<common::AlwaysFalse>();
+  }
+  if (isDecimalConstant(upper)) {
+    return nullptr;
   }
   switch (upper->typeKind()) {
     case TypeKind::TINYINT:
@@ -315,6 +328,9 @@ ExprToSubfieldFilterParser::makeLessThanOrEqualFilter(
   if (upper->isNullAt(0)) {
     return std::make_unique<common::AlwaysFalse>();
   }
+  if (isDecimalConstant(upper)) {
+    return nullptr;
+  }
   switch (upper->typeKind()) {
     case TypeKind::TINYINT:
       return lessThanOrEqual(singleValue<int8_t>(upper));
@@ -350,6 +366,9 @@ ExprToSubfieldFilterParser::makeGreaterThanOrEqualFilter(
   }
   if (lower->isNullAt(0)) {
     return std::make_unique<common::AlwaysFalse>();
+  }
+  if (isDecimalConstant(lower)) {
+    return nullptr;
   }
   switch (lower->typeKind()) {
     case TypeKind::TINYINT:
@@ -392,6 +411,9 @@ std::unique_ptr<common::Filter> ExprToSubfieldFilterParser::makeInFilter(
   auto elements = arrayVector->elements();
 
   auto elementType = arrayVector->type()->asArray().elementType();
+  if (elementType->isDecimal()) {
+    return nullptr;
+  }
   switch (elementType->kind()) {
     case TypeKind::TINYINT:
       return toInt64In<int8_t>(elements, offset, size, negated);
@@ -447,6 +469,9 @@ std::unique_ptr<common::Filter> ExprToSubfieldFilterParser::makeBetweenFilter(
   }
   auto upper = toConstant(upperExpr, evaluator);
   if (!upper) {
+    return nullptr;
+  }
+  if (isDecimalConstant(lower) || isDecimalConstant(upper)) {
     return nullptr;
   }
   switch (lower->typeKind()) {
