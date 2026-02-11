@@ -30,6 +30,7 @@
 #include "velox/dwio/common/Statistics.h"
 #include "velox/type/Type.h"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
@@ -154,8 +155,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   std::vector<std::string> mapToPhysicalColumnNames(
       const std::vector<std::string>& logicalNames) const;
 
-  std::shared_ptr<io::IoStatistics> ioStats_;
-  std::shared_ptr<filesystems::File::IoStats> fsStats_;
+  std::shared_ptr<io::IoStatistics> ioStatistics_;
+  std::shared_ptr<velox::IoStats> ioStats_;
 
   dwio::common::ReaderOptions baseReaderOpts_;
 
@@ -174,6 +175,8 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   std::vector<std::unique_ptr<cudf::scalar>> subfieldScalars_;
   cudf::ast::tree subfieldTree_;
   common::SubfieldFilters subfieldFilters_;
+  // Cached combined subfield filter expression owned by 'subfieldTree_'.
+  cudf::ast::expression const* subfieldFilterExpr_{nullptr};
 
   dwio::common::RuntimeStatistics runtimeStats_;
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
@@ -181,7 +184,7 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
   // Create callback data for total scan timing calculation
   struct TotalScanTimeCallbackData {
     uint64_t startTimeUs;
-    std::shared_ptr<io::IoStatistics> ioStats;
+    std::shared_ptr<io::IoStatistics> ioStatistics;
   };
 
   // Host callback function to calculate total scan time
