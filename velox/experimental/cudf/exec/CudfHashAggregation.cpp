@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/DecimalAggregationKernels.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
@@ -698,7 +699,7 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     return std::make_unique<MeanAggregator>(
         step, inputIndex, constant, isGlobal, resultType);
   } else {
-    VELOX_NYI("Aggregation not yet supported");
+    VELOX_NYI("Aggregation not yet supported, kind: {}", kind);
   }
 }
 
@@ -1492,6 +1493,10 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
           .integerVariable("s")
           .returnType("decimal(p,s)")
           .argumentType("decimal(p,s)")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("varchar")
+          .argumentType("varchar")
           .build()};
 
   registerAggregationFunctionForStep(

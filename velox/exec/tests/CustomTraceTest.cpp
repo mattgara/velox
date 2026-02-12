@@ -19,7 +19,6 @@
 #include <utility>
 #include <vector>
 
-#include "velox/exec/TaskDebuggerCursor.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -139,15 +138,19 @@ TEST_F(CustomTraceTest, customTrace) {
 }
 
 void assertCursorOutput(
-    const core::PlanFragment& plan,
-    const std::vector<core::PlanNodeId>& traceIds,
+    const core::PlanNodePtr& plan,
+    const std::vector<core::PlanNodeId>& breakpoints,
     const std::vector<RowVectorPtr>& expectation) {
-  TaskDebuggerCursor cursor(plan, traceIds);
+  auto cursor = TaskCursor::create({
+      .planNode = plan,
+      .serialExecution = true,
+      .breakpoints = breakpoints,
+  });
   size_t i = 0;
 
-  while (auto vectorOutput = cursor.step()) {
+  while (cursor->moveStep()) {
     if (i < expectation.size()) {
-      assertEqualVectors(vectorOutput, expectation[i++]);
+      assertEqualVectors(cursor->current(), expectation[i++]);
     } else {
       ADD_FAILURE() << "Cursor output is longer than expectation: " << i;
     }
@@ -190,7 +193,7 @@ TEST_F(CustomTraceTest, taskDebuggerCursor) {
                   .capturePlanNodeId(project3)
                   .project({"a * 10 as a"})
                   .capturePlanNodeId(project4)
-                  .planFragment();
+                  .planNode();
 
   // Test a series of combinations.
   assertCursorOutput(plan, {}, {output1, output2});
@@ -233,6 +236,82 @@ TEST_F(CustomTraceTest, taskDebuggerCursor) {
           input2Project4,
           output2,
       });
+}
+
+TEST_F(CustomTraceTest, cursorAt) {
+  const size_t size = 10;
+  auto input1 = makeRowVector(
+      {"a"}, {makeFlatVector<int64_t>(size, [](auto row) { return row; })});
+  auto input2 = makeRowVector(
+      {"a"},
+      {makeFlatVector<int64_t>(size, [](auto row) { return row + 10; })});
+
+  core::PlanNodeId project1, project2, project3, project4;
+  auto plan = PlanBuilder()
+                  .values({input1, input2})
+                  .project({"a * 10 as a"})
+                  .capturePlanNodeId(project1)
+                  .project({"a * 10 as a"})
+                  .capturePlanNodeId(project2)
+                  .project({"a * 10 as a"})
+                  .capturePlanNodeId(project3)
+                  .project({"a * 10 as a"})
+                  .capturePlanNodeId(project4)
+                  .planNode();
+
+  auto cursor = TaskCursor::create({
+      .planNode = plan,
+      .serialExecution = true,
+      .breakpoints = {project1, project3},
+  });
+
+  // Before any step, at() should return empty string.
+  EXPECT_EQ(cursor->at(), "");
+
+  // First step stops at project1 (first breakpoint).
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), project1);
+
+  // Second step stops at project3 (second breakpoint).
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), project3);
+
+  // Third step produces final output (no breakpoint, empty at()).
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), "");
+
+  // Fourth step stops at project1 for second input batch.
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), project1);
+
+  // Fifth step stops at project3 for second input batch.
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), project3);
+
+  // Sixth step produces final output for second batch.
+  EXPECT_TRUE(cursor->moveStep());
+  EXPECT_EQ(cursor->at(), "");
+
+  // No more data.
+  EXPECT_FALSE(cursor->moveStep());
+
+  // Test that moveNext() skips breakpoints and at() returns empty.
+  auto cursor2 = TaskCursor::create({
+      .planNode = plan,
+      .serialExecution = true,
+      .breakpoints = {project1, project3},
+  });
+
+  EXPECT_EQ(cursor2->at(), "");
+
+  // moveNext() should skip to final output.
+  EXPECT_TRUE(cursor2->moveNext());
+  EXPECT_EQ(cursor2->at(), "");
+
+  EXPECT_TRUE(cursor2->moveNext());
+  EXPECT_EQ(cursor2->at(), "");
+
+  EXPECT_FALSE(cursor2->moveNext());
 }
 
 } // namespace
