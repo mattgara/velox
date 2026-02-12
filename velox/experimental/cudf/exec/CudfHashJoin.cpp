@@ -65,6 +65,21 @@ bool containsDecimalType(const std::shared_ptr<velox::exec::Expr>& expr) {
   }
   return false;
 }
+
+bool containsDoubleType(const std::shared_ptr<velox::exec::Expr>& expr) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->type() && expr->type()->kind() == TypeKind::DOUBLE) {
+    return true;
+  }
+  for (const auto& input : expr->inputs()) {
+    if (containsDoubleType(input)) {
+      return true;
+    }
+  }
+  return false;
+}
 } // namespace
 
 void CudfHashJoinBridge::setHashTable(
@@ -399,8 +414,14 @@ CudfHashJoinProbe::CudfHashJoinProbe(
     // simplify expression
     exec::ExprSet exprs({joinNode_->filter()}, operatorCtx_->execCtx());
     VELOX_CHECK_EQ(exprs.exprs().size(), 1);
+    auto const hasDecimal = containsDecimalType(exprs.exprs()[0]);
+    auto const hasDouble = containsDoubleType(exprs.exprs()[0]);
     useAstFilter_ = CudfConfig::getInstance().astExpressionEnabled &&
-        !containsDecimalType(exprs.exprs()[0]);
+        !hasDecimal && !hasDouble;
+    if (hasDouble) {
+      LOG(WARNING) << "DEBUG forcing DOUBLE join filter to non-AST path: "
+                   << exprs.exprs()[0]->toString();
+    }
 
     // We don't need to get tables that contain conditional comparison columns
     // We'll pass the entire table. The ast will handle finding the required
