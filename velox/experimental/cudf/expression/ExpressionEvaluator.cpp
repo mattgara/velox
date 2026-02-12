@@ -53,6 +53,10 @@
 #include <cudf/unary.hpp>
 #include <cudf/types.hpp>
 
+#include <chrono>
+#include <cstdio>
+#include <string_view>
+
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -113,6 +117,44 @@ bool hasDecimalZero(
   auto const& boolScalar =
       static_cast<cudf::numeric_scalar<bool> const&>(*anyScalar);
   return boolScalar.is_valid(stream) && boolScalar.value(stream);
+}
+
+bool isHotQ9ArithmeticName(std::string_view name) {
+  return name.ends_with("minus") || name.ends_with("subtract") ||
+      name.ends_with("multiply");
+}
+
+int64_t elapsedMicros(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+      .count();
+}
+
+const char* debugTypeName(cudf::type_id typeId) {
+  switch (typeId) {
+    case cudf::type_id::DECIMAL64:
+      return "DECIMAL64";
+    case cudf::type_id::DECIMAL128:
+      return "DECIMAL128";
+    case cudf::type_id::FLOAT64:
+      return "FLOAT64";
+    case cudf::type_id::INT64:
+      return "INT64";
+    case cudf::type_id::INT32:
+      return "INT32";
+    case cudf::type_id::BOOL8:
+      return "BOOL8";
+    default:
+      return "OTHER";
+  }
+}
+
+const char* debugTypeNameFromId(int typeId) {
+  if (typeId < 0) {
+    return "N/A";
+  }
+  return debugTypeName(static_cast<cudf::type_id>(typeId));
 }
 
 struct CudfExpressionEvaluatorEntry {
@@ -368,7 +410,8 @@ class BinaryFunction : public CudfFunction {
   BinaryFunction(
       const std::shared_ptr<velox::exec::Expr>& expr,
       cudf::binary_operator op)
-      : op_(op),
+      : exprName_(expr->name()),
+        op_(op),
         type_(cudf_velox::veloxToCudfDataType(expr->type())) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "Binary function expects exactly 2 inputs");
@@ -394,6 +437,92 @@ class BinaryFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    struct ScopedBinaryEvalLog final {
+      bool enabled;
+      const std::string& exprName;
+      cudf::binary_operator op;
+      cudf::data_type outputType;
+      bool hasLeftScalar;
+      bool hasRightScalar;
+      int lhsTypeId;
+      int lhsScale;
+      int rhsTypeId;
+      int rhsScale;
+      long rows;
+      std::chrono::steady_clock::time_point start;
+
+      ~ScopedBinaryEvalLog() {
+        if (!enabled) {
+          return;
+        }
+        std::fprintf(
+            stderr,
+            "**** DEBUG BinaryFunction eval expr_name=%s op=%d out_type_id=%d "
+            "out_type_name=%s out_scale=%d lhs_scalar=%d rhs_scalar=%d "
+            "lhs_type_id=%d lhs_type_name=%s lhs_scale=%d rhs_type_id=%d "
+            "rhs_type_name=%s rhs_scale=%d rows=%ld elapsed_us=%lld\n",
+            exprName.c_str(),
+            static_cast<int>(op),
+            static_cast<int>(outputType.id()),
+            debugTypeName(outputType.id()),
+            static_cast<int>(outputType.scale()),
+            hasLeftScalar ? 1 : 0,
+            hasRightScalar ? 1 : 0,
+            lhsTypeId,
+            debugTypeNameFromId(lhsTypeId),
+            lhsScale,
+            rhsTypeId,
+            debugTypeNameFromId(rhsTypeId),
+            rhsScale,
+            rows,
+            static_cast<long long>(
+                elapsedMicros(start, std::chrono::steady_clock::now())));
+      }
+    };
+
+    auto lhsTypeId = -1;
+    auto lhsScale = 0;
+    auto rhsTypeId = -1;
+    auto rhsScale = 0;
+    long rowCount = 0;
+    if (left_ == nullptr && !inputColumns.empty()) {
+      auto lhsView = asView(inputColumns[0]);
+      lhsTypeId = static_cast<int>(lhsView.type().id());
+      lhsScale = static_cast<int>(lhsView.type().scale());
+      rowCount = static_cast<long>(lhsView.size());
+    } else if (left_ != nullptr) {
+      lhsTypeId = static_cast<int>(left_->type().id());
+      lhsScale = static_cast<int>(left_->type().scale());
+    }
+    if (right_ == nullptr) {
+      auto rhsIdx = left_ == nullptr ? 1 : 0;
+      if (inputColumns.size() > rhsIdx) {
+        auto rhsView = asView(inputColumns[rhsIdx]);
+        rhsTypeId = static_cast<int>(rhsView.type().id());
+        rhsScale = static_cast<int>(rhsView.type().scale());
+        if (rowCount == 0) {
+          rowCount = static_cast<long>(rhsView.size());
+        }
+      }
+    } else {
+      rhsTypeId = static_cast<int>(right_->type().id());
+      rhsScale = static_cast<int>(right_->type().scale());
+    }
+
+    ScopedBinaryEvalLog debugLog{
+        isHotQ9ArithmeticName(exprName_),
+        exprName_,
+        op_,
+        type_,
+        left_ != nullptr,
+        right_ != nullptr,
+        lhsTypeId,
+        lhsScale,
+        rhsTypeId,
+        rhsScale,
+        rowCount,
+        std::chrono::steady_clock::now()};
+
     auto isComparisonOp = [](cudf::binary_operator op) {
       switch (op) {
         case cudf::binary_operator::EQUAL:
@@ -762,6 +891,7 @@ class BinaryFunction : public CudfFunction {
   }
 
  private:
+  const std::string exprName_;
   const cudf::binary_operator op_;
   const cudf::data_type type_;
   std::unique_ptr<cudf::scalar> left_;
@@ -1957,21 +2087,96 @@ ColumnOrView FunctionExpression::eval(
   }
 
   if (function_) {
+    const bool traceHotExpr = isHotQ9ArithmeticName(expr_->name());
+    const std::string exprDebugString = traceHotExpr ? expr_->toString() : "";
+    const auto totalStart = std::chrono::steady_clock::now();
+
     std::vector<ColumnOrView> inputColumns;
     inputColumns.reserve(subexpressions_.size());
 
-    for (const auto& subexpr : subexpressions_) {
+    int64_t childEvalMicros = 0;
+    for (size_t i = 0; i < subexpressions_.size(); ++i) {
+      const auto childStart = std::chrono::steady_clock::now();
+      const auto& subexpr = subexpressions_[i];
       inputColumns.push_back(subexpr->eval(inputTableColumns, stream, mr));
+      if (traceHotExpr) {
+        auto childView = asView(inputColumns.back());
+        auto childUs =
+            elapsedMicros(childStart, std::chrono::steady_clock::now());
+        childEvalMicros += childUs;
+        std::fprintf(
+            stderr,
+            "**** DEBUG FunctionExpression child-eval expr=%s child_idx=%zu "
+            "rows=%ld type_id=%d type_name=%s scale=%d elapsed_us=%lld\n",
+            exprDebugString.c_str(),
+            i,
+            static_cast<long>(childView.size()),
+            static_cast<int>(childView.type().id()),
+            debugTypeName(childView.type().id()),
+            static_cast<int>(childView.type().scale()),
+            static_cast<long long>(childUs));
+      }
     }
 
+    const auto functionStart = std::chrono::steady_clock::now();
     auto result = function_->eval(inputColumns, stream, mr);
+    const auto functionEvalMicros =
+        elapsedMicros(functionStart, std::chrono::steady_clock::now());
+    int64_t finalizeCastMicros = 0;
+    bool didFinalizeCast = false;
+
     if (finalize) {
       const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
       if (resultView.type() != requestedType) {
-        return cudf::cast(resultView, requestedType, stream, mr);
+        const auto castStart = std::chrono::steady_clock::now();
+        result = cudf::cast(resultView, requestedType, stream, mr);
+        finalizeCastMicros =
+            elapsedMicros(castStart, std::chrono::steady_clock::now());
+        didFinalizeCast = true;
       }
     }
+
+    if (traceHotExpr) {
+      auto resultView = asView(result);
+      std::fprintf(
+          stderr,
+          "**** DEBUG FunctionExpression eval expr=%s rows=%ld out_type_id=%d "
+          "out_type_name=%s out_scale=%d input_count=%zu child_us=%lld function_us=%lld "
+          "finalize_cast_us=%lld finalize_casted=%d total_us=%lld\n",
+          exprDebugString.c_str(),
+          static_cast<long>(resultView.size()),
+          static_cast<int>(resultView.type().id()),
+          debugTypeName(resultView.type().id()),
+          static_cast<int>(resultView.type().scale()),
+          inputColumns.size(),
+          static_cast<long long>(childEvalMicros),
+          static_cast<long long>(functionEvalMicros),
+          static_cast<long long>(finalizeCastMicros),
+          didFinalizeCast ? 1 : 0,
+          static_cast<long long>(
+              elapsedMicros(totalStart, std::chrono::steady_clock::now())));
+
+      if (!inputColumns.empty()) {
+        std::fprintf(
+            stderr,
+            "**** DEBUG FunctionExpression inputs expr=%s",
+            exprDebugString.c_str());
+        for (size_t i = 0; i < inputColumns.size(); ++i) {
+          auto inputView = asView(inputColumns[i]);
+          std::fprintf(
+              stderr,
+              " [i=%zu type_id=%d type_name=%s scale=%d rows=%ld]",
+              i,
+              static_cast<int>(inputView.type().id()),
+              debugTypeName(inputView.type().id()),
+              static_cast<int>(inputView.type().scale()),
+              static_cast<long>(inputView.size()));
+        }
+        std::fprintf(stderr, "\n");
+      }
+    }
+
     return result;
   }
 
@@ -2047,22 +2252,49 @@ std::shared_ptr<CudfExpression> createCudfExpression(
   ensureBuiltinExpressionEvaluatorsRegistered();
   const auto& registry = getCudfExpressionEvaluatorRegistry();
 
+  const bool traceHotExpr = isHotQ9ArithmeticName(expr->name());
+  const std::string exprDebugString = traceHotExpr ? expr->toString() : "";
   const CudfExpressionEvaluatorEntry* best = nullptr;
+  std::string bestName;
   for (const auto& [name, entry] : registry) {
     if (except && name == *except) {
       continue;
     }
     if (entry.canEvaluate && entry.canEvaluate(expr)) {
+      if (traceHotExpr) {
+        std::fprintf(
+            stderr,
+            "**** DEBUG createCudfExpression candidate evaluator=%s "
+            "priority=%d expr=%s\n",
+            name.c_str(),
+            entry.priority,
+            exprDebugString.c_str());
+      }
       if (best == nullptr || entry.priority > best->priority) {
         best = &entry;
+        bestName = name;
       }
     }
   }
 
   if (best != nullptr) {
+    if (traceHotExpr) {
+      std::fprintf(
+          stderr,
+          "**** DEBUG createCudfExpression selected evaluator=%s expr=%s\n",
+          bestName.c_str(),
+          exprDebugString.c_str());
+    }
     return best->create(expr, inputRowSchema);
   }
 
+  if (traceHotExpr) {
+    std::fprintf(
+        stderr,
+        "**** DEBUG createCudfExpression selected evaluator=function-default "
+        "expr=%s\n",
+        exprDebugString.c_str());
+  }
   return FunctionExpression::create(expr, inputRowSchema);
 }
 
