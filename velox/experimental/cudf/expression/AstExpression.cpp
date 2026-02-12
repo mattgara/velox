@@ -247,6 +247,16 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
       stripPrefix(expr->name(), CudfConfig::getInstance().functionNamePrefix);
   const auto len = expr->inputs().size();
 
+  // Debug-only parity experiment: force hot floating-point arithmetic nodes to
+  // use FunctionExpression instead of AST so DOUBLE can follow a path closer
+  // to DECIMAL in TPC-H Q9.
+  if (expr->type()->kind() == TypeKind::DOUBLE &&
+      (name == "minus" || name == "subtract" || name == "multiply")) {
+    std::cout << "**** DEBUG forcing DOUBLE op to FunctionExpression path: "
+              << expr->toString() << std::endl;
+    return false;
+  }
+
   // Literals and field references are always supported
   auto isSupportedLiteral = [&](const TypePtr& type) {
     try {
