@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/cudf/CudfQueryConfig.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
@@ -23,62 +24,27 @@
 #include <cudf/merge.hpp>
 #include <cudf/sorting.hpp>
 
-#include <cuda_runtime_api.h>
-
-#include <cstdio>
-#include <cstdlib>
-
 namespace facebook::velox::cudf_velox {
 namespace {
 
-bool getDebugFlag(char const* name) {
-  auto* value = std::getenv(name);
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
+inline bool topNDebugEnabled() {
+  return CudfConfig::getInstance().debugEnabled;
 }
 
-void topNDebugLog(
-    char const* nodeId,
-    char const* stage,
+void logTopNDebug(
+    const core::PlanNodeId& nodeId,
+    const char* stage,
     rmm::cuda_stream_view stream,
     int64_t rows,
     int64_t aux) {
-  static const bool kDebugEnabled = getDebugFlag("VELOX_CUDF_TOPN_DEBUG");
-  if (!kDebugEnabled) {
+  if (!topNDebugEnabled()) {
     return;
   }
-  std::fprintf(
-      stderr,
-      "[CudfTopNDebug] node=%s stage=%s stream=%p rows=%lld aux=%lld\n",
-      nodeId,
-      stage,
-      reinterpret_cast<const void*>(stream.value()),
-      static_cast<long long>(rows),
-      static_cast<long long>(aux));
-  static const bool kDebugCudaCheckEnabled =
-      getDebugFlag("VELOX_CUDF_DEBUG_CHECK_CUDA");
-  if (kDebugCudaCheckEnabled) {
-    auto const peek = cudaPeekAtLastError();
-    std::fprintf(
-        stderr,
-        "[CudfTopNDebug] node=%s stage=%s peek=%d(%s)\n",
-        nodeId,
-        stage,
-        static_cast<int>(peek),
-        cudaGetErrorString(peek));
-  }
-  static const bool kDebugSyncEnabled =
-      getDebugFlag("VELOX_CUDF_TOPN_DEBUG_SYNC");
-  if (kDebugSyncEnabled) {
-    auto const syncStatus = cudaStreamSynchronize(stream.value());
-    std::fprintf(
-        stderr,
-        "[CudfTopNDebug] node=%s stage=%s syncStatus=%d(%s)\n",
-        nodeId,
-        stage,
-        static_cast<int>(syncStatus),
-        cudaGetErrorString(syncStatus));
-  }
+  LOG(INFO) << "[CudfTopNDebug] node=" << nodeId << " stage=" << stage
+            << " stream=" << reinterpret_cast<const void*>(stream.value())
+            << " rows=" << rows << " aux=" << aux;
 }
+
 } // namespace
 
 CudfTopN::CudfTopN(
@@ -123,6 +89,12 @@ CudfTopN::CudfTopN(
             ? cudf::null_order::BEFORE
             : cudf::null_order::AFTER);
   }
+  if (topNDebugEnabled()) {
+    LOG(INFO) << "[CudfTopNDebug] node=" << topNNode_->id()
+              << " stage=ctor count=" << count_ << " batchSize=" << kBatchSize_
+              << " numSortingKeys=" << numSortingKeys
+              << " numOutputCols=" << numColumns;
+  }
 }
 
 CudfVectorPtr CudfTopN::mergeTopK(
@@ -130,36 +102,49 @@ CudfVectorPtr CudfTopN::mergeTopK(
     int32_t k,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  topNDebugLog(topNNode_->id().c_str(), "mergeTopK.begin", stream, k, 0);
+  logTopNDebug(topNNode_->id(), "mergeTopK.begin", stream, k, topNBatches.size());
   std::vector<cudf::table_view> tableViews;
   std::vector<rmm::cuda_stream_view> inputStreams;
   tableViews.reserve(topNBatches.size());
   inputStreams.reserve(topNBatches.size());
+  int64_t batchIndex = 0;
   for (const auto& batch : topNBatches) {
     if (!batch) {
+      if (topNDebugEnabled()) {
+        LOG(INFO) << "[CudfTopNDebug] node=" << topNNode_->id()
+                  << " stage=mergeTopK.skipNullBatch index=" << batchIndex;
+      }
+      ++batchIndex;
       continue;
+    }
+    if (topNDebugEnabled()) {
+      LOG(INFO) << "[CudfTopNDebug] node=" << topNNode_->id()
+                << " stage=mergeTopK.inputBatch index=" << batchIndex
+                << " rows=" << batch->size() << " stream="
+                << reinterpret_cast<const void*>(batch->stream().value());
     }
     tableViews.push_back(batch->getTableView());
     inputStreams.push_back(batch->stream());
+    ++batchIndex;
   }
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "mergeTopK.beforeJoinStreams",
       stream,
       tableViews.size(),
       inputStreams.size());
   // Ensure all upstream batch-producing streams are visible on the merge stream.
   cudf::detail::join_streams(inputStreams, stream);
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "mergeTopK.afterJoinStreams",
       stream,
       tableViews.size(),
       inputStreams.size());
   auto mergedTable =
       cudf::merge(tableViews, sortKeys_, columnOrder_, nullOrder_, stream, mr);
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "mergeTopK.afterMerge",
       stream,
       mergedTable ? mergedTable->num_rows() : 0,
@@ -170,7 +155,7 @@ CudfVectorPtr CudfTopN::mergeTopK(
           mergedTable->view(), {std::min(k, mergedTable->num_rows())}, stream)
           .front();
   auto const size = topk.num_rows();
-  topNDebugLog(topNNode_->id().c_str(), "mergeTopK.afterSplit", stream, size, k);
+  logTopNDebug(topNNode_->id(), "mergeTopK.afterSplit", stream, size, k);
   return std::make_shared<CudfVector>(
       topNBatches[0]->pool(),
       outputType_,
@@ -184,12 +169,12 @@ std::unique_ptr<cudf::table> CudfTopN::getTopK(
     int32_t k,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  topNDebugLog(topNNode_->id().c_str(), "getTopK.begin", stream, values.num_rows(), k);
+  logTopNDebug(topNNode_->id(), "getTopK.begin", stream, values.num_rows(), k);
   auto keys = values.select(sortKeys_);
   auto const indices =
       cudf::stable_sorted_order(keys, columnOrder_, nullOrder_, stream, mr);
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "getTopK.afterStableSortedOrder",
       stream,
       indices ? indices->size() : 0,
@@ -204,8 +189,8 @@ std::unique_ptr<cudf::table> CudfTopN::getTopK(
       cudf::detail::negative_index_policy::NOT_ALLOWED,
       stream,
       mr);
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "getTopK.afterGather",
       stream,
       gathered ? gathered->num_rows() : 0,
@@ -219,10 +204,12 @@ CudfVectorPtr CudfTopN::getTopKBatch(CudfVectorPtr cudfInput, int32_t k) {
     return nullptr;
   }
   auto stream = cudfInput->stream();
+  logTopNDebug(topNNode_->id(), "getTopKBatch.begin", stream, cudfInput->size(), k);
   auto mr = cudf::get_current_device_resource_ref();
   auto values = cudfInput->getTableView();
   auto result = getTopK(values, k, stream, mr);
   auto const size = result->num_rows();
+  logTopNDebug(topNNode_->id(), "getTopKBatch.end", stream, size, k);
   return std::make_shared<CudfVector>(
       cudfInput->pool(), cudfInput->type(), size, std::move(result), stream);
 }
@@ -234,8 +221,8 @@ void CudfTopN::addInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "addInput.begin",
       cudfInput->stream(),
       input->size(),
@@ -252,9 +239,9 @@ void CudfTopN::addInput(RowVectorPtr input) {
       [](int32_t sum, const auto& batch) {
         return sum + (batch ? batch->size() : 0);
       });
-  topNDebugLog(
-      topNNode_->id().c_str(),
-      "addInput.afterGetTopKBatch",
+  logTopNDebug(
+      topNNode_->id(),
+      "addInput.afterBatchTopK",
       cudfInput->stream(),
       totalSize,
       topNBatches_.size());
@@ -262,8 +249,8 @@ void CudfTopN::addInput(RowVectorPtr input) {
     auto stream = cudfGlobalStreamPool().get_stream();
     auto mr = cudf::get_current_device_resource_ref();
 
-    topNDebugLog(
-        topNNode_->id().c_str(),
+    logTopNDebug(
+        topNNode_->id(),
         "addInput.beforeMergeTopK",
         stream,
         totalSize,
@@ -271,8 +258,8 @@ void CudfTopN::addInput(RowVectorPtr input) {
     auto result = mergeTopK(topNBatches_, count_, stream, mr);
     topNBatches_.clear();
     topNBatches_.push_back(std::move(result));
-    topNDebugLog(
-        topNNode_->id().c_str(),
+    logTopNDebug(
+        topNNode_->id(),
         "addInput.afterMergeTopK",
         stream,
         topNBatches_.front() ? topNBatches_.front()->size() : 0,
@@ -291,8 +278,8 @@ RowVectorPtr CudfTopN::getOutput() {
 
   auto stream = topNBatches_[0]->stream();
   auto mr = cudf::get_current_device_resource_ref();
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "getOutput.beforeMergeTopK",
       stream,
       topNBatches_.size(),
@@ -300,8 +287,8 @@ RowVectorPtr CudfTopN::getOutput() {
   auto result = mergeTopK(topNBatches_, count_, stream, mr);
   topNBatches_.clear();
   finished_ = noMoreInput_ && topNBatches_.empty();
-  topNDebugLog(
-      topNNode_->id().c_str(),
+  logTopNDebug(
+      topNNode_->id(),
       "getOutput.afterMergeTopK",
       stream,
       result ? result->size() : 0,
@@ -311,6 +298,10 @@ RowVectorPtr CudfTopN::getOutput() {
 
 void CudfTopN::noMoreInput() {
   Operator::noMoreInput();
+  if (topNDebugEnabled()) {
+    LOG(INFO) << "[CudfTopNDebug] node=" << topNNode_->id()
+              << " stage=noMoreInput topNBatches=" << topNBatches_.size();
+  }
   if (topNBatches_.empty()) {
     finished_ = true;
     return;

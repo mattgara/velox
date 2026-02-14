@@ -37,18 +37,12 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <cuda_runtime_api.h>
-
-#include <cstdio>
-#include <cstdlib>
-
 namespace {
 
 using namespace facebook::velox;
 
-bool getDebugFlag(char const* name) {
-  auto* value = std::getenv(name);
-  return value != nullptr && value[0] != '\0' && value[0] != '0';
+inline bool hashAggDebugEnabled() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance().debugEnabled;
 }
 
 const char* stepName(core::AggregationNode::Step step) {
@@ -65,50 +59,19 @@ const char* stepName(core::AggregationNode::Step step) {
   return "unknown";
 }
 
-void aggDebugLog(
-    char const* stage,
+void logHashAggDebug(
+    const char* stage,
     core::AggregationNode::Step step,
     rmm::cuda_stream_view stream,
     int64_t rows,
     int64_t cols,
     int64_t aux) {
-  static const bool kDebugEnabled = getDebugFlag("VELOX_CUDF_AGG_DEBUG");
-  if (!kDebugEnabled) {
+  if (!hashAggDebugEnabled()) {
     return;
   }
-  std::fprintf(
-      stderr,
-      "[CudfAggDebug] stage=%s step=%s stream=%p rows=%lld cols=%lld aux=%lld\n",
-      stage,
-      stepName(step),
-      reinterpret_cast<const void*>(stream.value()),
-      static_cast<long long>(rows),
-      static_cast<long long>(cols),
-      static_cast<long long>(aux));
-  static const bool kDebugCudaCheckEnabled =
-      getDebugFlag("VELOX_CUDF_DEBUG_CHECK_CUDA");
-  if (kDebugCudaCheckEnabled) {
-    auto const peek = cudaPeekAtLastError();
-    std::fprintf(
-        stderr,
-        "[CudfAggDebug] stage=%s step=%s peek=%d(%s)\n",
-        stage,
-        stepName(step),
-        static_cast<int>(peek),
-        cudaGetErrorString(peek));
-  }
-  static const bool kDebugSyncEnabled =
-      getDebugFlag("VELOX_CUDF_AGG_DEBUG_SYNC");
-  if (kDebugSyncEnabled) {
-    auto const syncStatus = cudaStreamSynchronize(stream.value());
-    std::fprintf(
-        stderr,
-        "[CudfAggDebug] stage=%s step=%s syncStatus=%d(%s)\n",
-        stage,
-        stepName(step),
-        static_cast<int>(syncStatus),
-        cudaGetErrorString(syncStatus));
-  }
+  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << " step=" << stepName(step)
+            << " stream=" << reinterpret_cast<const void*>(stream.value())
+            << " rows=" << rows << " cols=" << cols << " aux=" << aux;
 }
 
 
@@ -200,7 +163,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
       rmm::cuda_stream_view stream) override {
-    aggDebugLog(
+    logHashAggDebug(
         "Decimal.addGroupbyRequest.begin",
         step,
         stream,
@@ -212,8 +175,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       auto scale = resultType->isDecimal()
           ? getDecimalPrecisionScale(*resultType).second
           : 0;
-      aggDebugLog(
-          "Decimal.addGroupbyRequest.intermediate.beforeDeserialize",
+      logHashAggDebug(
+          "Decimal.addGroupbyRequest.intermediate.deserialize",
           step,
           stream,
           tbl.num_rows(),
@@ -223,13 +186,6 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           tbl.column(inputIndex), scale, stream);
       decodedSum_ = std::move(decoded.sum);
       decodedCount_ = std::move(decoded.count);
-      aggDebugLog(
-          "Decimal.addGroupbyRequest.intermediate.afterDeserialize",
-          step,
-          stream,
-          decodedSum_ ? decodedSum_->size() : 0,
-          requests.size(),
-          0);
 
       sumIdx_ = requests.size();
       auto& sumRequest = requests.emplace_back();
@@ -249,8 +205,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         tbl.column(inputIndex).type().id() == cudf::type_id::STRING) {
       auto scale = getDecimalPrecisionScale(*resultType).second;
       if (isAvg_) {
-        aggDebugLog(
-            "Decimal.addGroupbyRequest.finalAvg.beforeDeserialize",
+        logHashAggDebug(
+            "Decimal.addGroupbyRequest.finalAvg.deserialize",
             step,
             stream,
             tbl.num_rows(),
@@ -260,13 +216,6 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             tbl.column(inputIndex), scale, stream);
         decodedSum_ = std::move(decoded.sum);
         decodedCount_ = std::move(decoded.count);
-        aggDebugLog(
-            "Decimal.addGroupbyRequest.finalAvg.afterDeserialize",
-            step,
-            stream,
-            decodedSum_ ? decodedSum_->size() : 0,
-            requests.size(),
-            0);
 
         sumIdx_ = requests.size();
         auto& sumRequest = requests.emplace_back();
@@ -283,8 +232,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       } else {
         auto& request = requests.emplace_back();
         sumIdx_ = requests.size() - 1;
-        aggDebugLog(
-            "Decimal.addGroupbyRequest.finalSum.beforeDeserialize",
+        logHashAggDebug(
+            "Decimal.addGroupbyRequest.finalSum.deserialize",
             step,
             stream,
             tbl.num_rows(),
@@ -295,13 +244,6 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         request.values = decodedSum_->view();
         request.aggregations.push_back(
             cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-        aggDebugLog(
-            "Decimal.addGroupbyRequest.finalSum.afterDeserialize",
-            step,
-            stream,
-            decodedSum_ ? decodedSum_->size() : 0,
-            requests.size(),
-            0);
         return;
       }
     } else {
@@ -316,7 +258,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             cudf::make_count_aggregation<cudf::groupby_aggregation>(
                 cudf::null_policy::EXCLUDE));
       }
-      aggDebugLog(
+      logHashAggDebug(
           "Decimal.addGroupbyRequest.rawInput",
           step,
           stream,
@@ -330,7 +272,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream) override {
-    aggDebugLog(
+    logHashAggDebug(
         "Decimal.makeOutputColumn.begin",
         step,
         stream,
@@ -373,7 +315,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       cudf::table_view const& input,
       TypePtr const& outputType,
       rmm::cuda_stream_view stream) override {
-    aggDebugLog(
+    logHashAggDebug(
         "Decimal.doReduce.begin",
         step,
         stream,
@@ -394,7 +336,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           stream);
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream);
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream);
-      aggDebugLog("Decimal.doReduce.singleAvg.beforeComputeAvg", step, stream, 1, 2, 0);
+      logHashAggDebug("Decimal.doReduce.singleAvg.compute", step, stream, 1, 2, 0);
       return computeAvgColumn(std::move(sumCol), std::move(countCol), stream);
     }
     auto const aggRequest =
@@ -412,7 +354,13 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           stream);
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream);
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream);
-      aggDebugLog("Decimal.doReduce.partial.beforeSerialize", step, stream, 1, 2, 0);
+      logHashAggDebug(
+          "Decimal.doReduce.partial.serialize",
+          step,
+          stream,
+          1,
+          2,
+          0);
       return cudf_velox::serializeDecimalSumState(
           sumCol->view(), countCol->view(), stream);
     }
@@ -423,8 +371,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           : 0;
       auto decoded =
           cudf_velox::deserializeDecimalSumStateWithCount(inputCol, scale, stream);
-      aggDebugLog(
-          "Decimal.doReduce.intermediate.afterDeserialize",
+      logHashAggDebug(
+          "Decimal.doReduce.intermediate.deserialize",
           step,
           stream,
           decoded.sum ? decoded.sum->size() : 0,
@@ -442,8 +390,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
           stream);
       auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream);
       auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream);
-      aggDebugLog(
-          "Decimal.doReduce.intermediate.beforeSerialize",
+      logHashAggDebug(
+          "Decimal.doReduce.intermediate.serialize",
           step,
           stream,
           1,
@@ -459,8 +407,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         // AVG
         // deserialize the results (sum and count)
         auto sumAndCount = cudf_velox::deserializeDecimalSumStateWithCount(inputCol, scale, stream);
-        aggDebugLog(
-            "Decimal.doReduce.finalAvg.afterDeserialize",
+        logHashAggDebug(
+            "Decimal.doReduce.finalAvg.deserialize",
             step,
             stream,
             sumAndCount.sum ? sumAndCount.sum->size() : 0,
@@ -472,14 +420,20 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         // convert to columns in order to perform division, as we cannot divide scalars directly
         auto sumCol = cudf::make_column_from_scalar(*sumScalar, 1, stream);
         auto countCol = cudf::make_column_from_scalar(*countScalar, 1, stream);
-        aggDebugLog("Decimal.doReduce.finalAvg.beforeComputeAvg", step, stream, 1, 2, scale);
+        logHashAggDebug(
+            "Decimal.doReduce.finalAvg.compute",
+            step,
+            stream,
+            1,
+            2,
+            scale);
         return computeAvgColumn(std::move(sumCol), std::move(countCol), stream);
       } else {
         // SUM
         decodedSum_ = cudf_velox::deserializeDecimalSumState(
             inputCol, scale, stream);
-        aggDebugLog(
-            "Decimal.doReduce.finalSum.afterDeserialize",
+        logHashAggDebug(
+            "Decimal.doReduce.finalSum.deserialize",
             step,
             stream,
             decodedSum_ ? decodedSum_->size() : 0,
@@ -509,6 +463,14 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       std::unique_ptr<cudf::column> sum,
       std::unique_ptr<cudf::column> count,
       rmm::cuda_stream_view stream) const {
+    if (hashAggDebugEnabled()) {
+      LOG(INFO) << "[CudfHashAggDebug] stage=Decimal.computeAvgColumn.begin step="
+                << stepName(step) << " stream="
+                << reinterpret_cast<const void*>(stream.value()) << " sumType="
+                << static_cast<int>(sum->type().id()) << " countType="
+                << static_cast<int>(count->type().id()) << " sumRows="
+                << sum->size() << " countRows=" << count->size();
+    }
     if (count->type().id() != cudf::type_id::INT64) {
       count = cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream);
     }
@@ -517,6 +479,13 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
     auto const cudfOutType = cudf_velox::veloxToCudfDataType(resultType);
     if (avgCol->type() != cudfOutType) {
       avgCol = cudf::cast(avgCol->view(), cudfOutType, stream);
+    }
+    if (hashAggDebugEnabled()) {
+      LOG(INFO) << "[CudfHashAggDebug] stage=Decimal.computeAvgColumn.end step="
+                << stepName(step) << " stream="
+                << reinterpret_cast<const void*>(stream.value()) << " outType="
+                << static_cast<int>(avgCol->type().id()) << " outRows="
+                << avgCol->size();
     }
     return avgCol;
   }
@@ -1218,6 +1187,12 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   if (input->size() == 0) {
     return;
   }
+  if (hashAggDebugEnabled()) {
+    LOG(INFO) << "[CudfHashAggDebug] stage=addInput.begin step="
+              << stepName(aggregationNode_->step()) << " rows=" << input->size()
+              << " isPartialOutput=" << isPartialOutput_
+              << " isGlobal=" << isGlobal_ << " isDistinct=" << isDistinct_;
+  }
   numInputRows_ += input->size();
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
@@ -1231,11 +1206,24 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
       // Handle partial groupby aggregation.
       computeIntermediateGroupbyPartial(cudfInput);
     }
+    if (hashAggDebugEnabled()) {
+      LOG(INFO) << "[CudfHashAggDebug] stage=addInput.partialProcessed step="
+                << stepName(aggregationNode_->step())
+                << " partialOutputRows="
+                << (partialOutput_ ? partialOutput_->size() : 0)
+                << " numInputRows=" << numInputRows_;
+    }
     return;
   }
 
   // Handle final aggregation or global cases.
   inputs_.push_back(std::move(cudfInput));
+  if (hashAggDebugEnabled()) {
+    LOG(INFO) << "[CudfHashAggDebug] stage=addInput.buffered step="
+              << stepName(aggregationNode_->step())
+              << " bufferedInputs=" << inputs_.size() << " numInputRows="
+              << numInputRows_;
+  }
 }
 
 CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
@@ -1243,7 +1231,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
     rmm::cuda_stream_view stream) {
-  aggDebugLog(
+  logHashAggDebug(
       "HashAgg.doGroupByAggregation.begin",
       aggregationNode_->step(),
       stream,
@@ -1266,7 +1254,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   for (auto& aggregator : aggregators) {
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
-  aggDebugLog(
+  logHashAggDebug(
       "HashAgg.doGroupByAggregation.beforeAggregate",
       aggregationNode_->step(),
       stream,
@@ -1275,7 +1263,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
       numGroupingKeys);
 
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
-  aggDebugLog(
+  logHashAggDebug(
       "HashAgg.doGroupByAggregation.afterAggregate",
       aggregationNode_->step(),
       stream,
@@ -1314,7 +1302,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     cudf::table_view tableView,
     rmm::cuda_stream_view stream) {
-  aggDebugLog(
+  logHashAggDebug(
       "HashAgg.doGlobalAggregation.begin",
       aggregationNode_->step(),
       stream,
@@ -1324,7 +1312,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   for (auto i = 0; i < aggregators_.size(); i++) {
-    aggDebugLog(
+    logHashAggDebug(
         "HashAgg.doGlobalAggregation.beforeDoReduce",
         aggregationNode_->step(),
         stream,
@@ -1334,6 +1322,13 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     resultColumns.push_back(
         aggregators_[i]->doReduce(tableView, outputType_->childAt(i), stream));
   }
+  logHashAggDebug(
+      "HashAgg.doGlobalAggregation.end",
+      aggregationNode_->step(),
+      stream,
+      1,
+      resultColumns.size(),
+      0);
 
   return std::make_shared<cudf_velox::CudfVector>(
       pool(),
@@ -1387,6 +1382,13 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  if (hashAggDebugEnabled()) {
+    LOG(INFO) << "[CudfHashAggDebug] stage=getOutput.begin step="
+              << stepName(aggregationNode_->step()) << " finished=" << finished_
+              << " noMoreInput=" << noMoreInput_ << " bufferedInputs="
+              << inputs_.size() << " hasPartialOutput="
+              << static_cast<bool>(partialOutput_);
+  }
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {
@@ -1422,6 +1424,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   }
 
   auto stream = cudfGlobalStreamPool().get_stream();
+  logHashAggDebug(
+      "HashAgg.getOutput.beforeConcat",
+      aggregationNode_->step(),
+      stream,
+      inputs_.size(),
+      0,
+      0);
 
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
 
@@ -1434,6 +1443,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   }
 
   VELOX_CHECK_NOT_NULL(tbl);
+  logHashAggDebug(
+      "HashAgg.getOutput.afterConcat",
+      aggregationNode_->step(),
+      stream,
+      tbl->num_rows(),
+      tbl->num_columns(),
+      0);
 
   // Use tbl->view() instead of moving the table.
   // tbl stays alive until the end of this function, keeping the view valid.
