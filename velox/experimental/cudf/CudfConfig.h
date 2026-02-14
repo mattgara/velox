@@ -74,8 +74,12 @@ struct CudfConfig {
 
   /// Optional: inject full device sync probes in cuDF operator flow:
   ///   0  => disabled
-  ///  -1  => enable all probe points
-  ///  >0  => enable only the matching numbered probe point
+  ///  -1  => enable all probe groups
+  ///   1  => groupby-core probes
+  ///   2  => decimal request/deserialize probes
+  ///   3  => decimal reduce/avg probes
+  ///   4  => global aggregation probes
+  ///   5  => operator-boundary probes
   /// Intended for speculative stream-race triage.
   int32_t debugOperatorFlowDeviceSyncPoint{0};
 

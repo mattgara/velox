@@ -41,9 +41,13 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <exception>
+#include <mutex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -63,6 +67,12 @@ inline int32_t hashAggDebugDeviceSyncPoint() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
       .debugOperatorFlowDeviceSyncPoint;
 }
+
+constexpr int32_t kDeviceSyncGroupGroupByCore{1};
+constexpr int32_t kDeviceSyncGroupDecimalRequest{2};
+constexpr int32_t kDeviceSyncGroupDecimalCompute{3};
+constexpr int32_t kDeviceSyncGroupGlobalAgg{4};
+constexpr int32_t kDeviceSyncGroupOperatorBoundary{5};
 
 const char* stepName(core::AggregationNode::Step step) {
   switch (step) {
@@ -92,6 +102,170 @@ const char* cudaErrorStringSafe(cudaError_t err) {
   return text != nullptr ? text : "<unknown-cuda-error-string>";
 }
 
+const char* deviceSyncGroupName(int32_t groupId) {
+  switch (groupId) {
+    case kDeviceSyncGroupGroupByCore:
+      return "groupby-core";
+    case kDeviceSyncGroupDecimalRequest:
+      return "decimal-request";
+    case kDeviceSyncGroupDecimalCompute:
+      return "decimal-compute";
+    case kDeviceSyncGroupGlobalAgg:
+      return "global-agg";
+    case kDeviceSyncGroupOperatorBoundary:
+      return "operator-boundary";
+    default:
+      return "unknown-group";
+  }
+}
+
+bool isDeviceSyncGroupEnabled(int32_t selectedGroup, int32_t groupId) {
+  if (selectedGroup == 0) {
+    return false;
+  }
+  if (selectedGroup == -1) {
+    return true;
+  }
+  return selectedGroup == groupId;
+}
+
+int32_t checkpointGroupFromStage(const char* stage) {
+  std::string_view const stageView = stage != nullptr ? stage : "";
+  auto const startsWith = [&](std::string_view prefix) {
+    return stageView.rfind(prefix, 0) == 0;
+  };
+  if (startsWith("HashAgg.doGroupByAggregation")) {
+    return kDeviceSyncGroupGroupByCore;
+  }
+  if (startsWith("Decimal.addGroupbyRequest")) {
+    return kDeviceSyncGroupDecimalRequest;
+  }
+  if (startsWith("Decimal.doReduce") || startsWith("Decimal.computeAvgColumn")) {
+    return kDeviceSyncGroupDecimalCompute;
+  }
+  if (startsWith("HashAgg.doGlobalAggregation")) {
+    return kDeviceSyncGroupGlobalAgg;
+  }
+  return kDeviceSyncGroupOperatorBoundary;
+}
+
+std::mutex& knownStreamsMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::vector<cudaStream_t>& knownStreams() {
+  static std::vector<cudaStream_t> streams;
+  return streams;
+}
+
+void registerKnownStream(cudaStream_t stream) {
+  if (stream == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(knownStreamsMutex());
+  auto& streams = knownStreams();
+  if (std::find(streams.begin(), streams.end(), stream) == streams.end()) {
+    streams.push_back(stream);
+  }
+}
+
+void registerKnownStreams(rmm::cuda_stream_view stream) {
+  registerKnownStream(stream.value());
+  registerKnownStream(cudf::get_default_stream().value());
+}
+
+std::vector<cudaStream_t> getKnownStreamsSnapshot(cudaStream_t focusStream) {
+  std::vector<cudaStream_t> snapshot;
+  {
+    std::lock_guard<std::mutex> lock(knownStreamsMutex());
+    snapshot = knownStreams();
+  }
+  if (focusStream != nullptr &&
+      std::find(snapshot.begin(), snapshot.end(), focusStream) ==
+          snapshot.end()) {
+    snapshot.push_back(focusStream);
+  }
+  return snapshot;
+}
+
+void logDeviceSyncModeOnce(int32_t selectedGroup) {
+  static std::atomic<bool> logged{false};
+  if (selectedGroup == 0 || logged.exchange(true)) {
+    return;
+  }
+  LOG(INFO)
+      << "[CudfHashAggDebug] deviceSyncMode selectedGroup=" << selectedGroup
+      << " semantics=0:none,-1:all,1:groupby-core,2:decimal-request,"
+      << "3:decimal-compute,4:global-agg,5:operator-boundary";
+}
+
+void logKnownStreamsState(
+    const char* stage,
+    const char* phase,
+    core::AggregationNode::Step step,
+    cudaStream_t focusStream,
+    int32_t groupId,
+    int32_t selectedGroup) {
+  auto const streams = getKnownStreamsSnapshot(focusStream);
+  auto const defaultStream = cudf::get_default_stream().value();
+  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << ".knownStreams." << phase
+            << " step=" << stepName(step)
+            << " selectedGroup=" << selectedGroup << " group=" << groupId
+            << "(" << deviceSyncGroupName(groupId) << ")"
+            << " focusStream=" << reinterpret_cast<const void*>(focusStream)
+            << " defaultStream="
+            << reinterpret_cast<const void*>(defaultStream)
+            << " knownStreamCount=" << streams.size();
+  for (size_t idx = 0; idx < streams.size(); ++idx) {
+    auto const stream = streams[idx];
+    auto const queryErr = cudaStreamQuery(stream);
+    LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << ".knownStreams."
+              << phase << " step=" << stepName(step)
+              << " selectedGroup=" << selectedGroup << " group=" << groupId
+              << "(" << deviceSyncGroupName(groupId) << ")"
+              << " streamIdx=" << idx
+              << " stream=" << reinterpret_cast<const void*>(stream)
+              << " isFocus=" << (stream == focusStream ? 1 : 0)
+              << " isDefault=" << (stream == defaultStream ? 1 : 0)
+              << " cudaStreamQuery=" << cudaErrorNameSafe(queryErr)
+              << "(" << static_cast<int>(queryErr) << ")"
+              << " cudaStreamQueryMsg=" << cudaErrorStringSafe(queryErr);
+  }
+}
+
+void maybeDeviceSyncProbe(
+    int32_t groupId,
+    int32_t probeId,
+    const char* stage,
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    int64_t rows,
+    int64_t cols,
+    int64_t aux) {
+  auto const selectedGroup = hashAggDebugDeviceSyncPoint();
+  if (!isDeviceSyncGroupEnabled(selectedGroup, groupId)) {
+    return;
+  }
+  logDeviceSyncModeOnce(selectedGroup);
+  registerKnownStreams(stream);
+  logKnownStreamsState(
+      stage, "preDeviceSync", step, stream.value(), groupId, selectedGroup);
+  auto const syncErr = cudaDeviceSynchronize();
+  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage
+            << ".deviceSyncProbe group=" << groupId
+            << "(" << deviceSyncGroupName(groupId) << ")"
+            << " probeId=" << probeId << " step=" << stepName(step)
+            << " stream=" << reinterpret_cast<const void*>(stream.value())
+            << " rows=" << rows << " cols=" << cols << " aux=" << aux
+            << " selectedGroup=" << selectedGroup
+            << " cudaDeviceSync=" << cudaErrorNameSafe(syncErr)
+            << "(" << static_cast<int>(syncErr) << ")"
+            << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(syncErr);
+  logKnownStreamsState(
+      stage, "postDeviceSync", step, stream.value(), groupId, selectedGroup);
+}
+
 void logCudaCheckpoint(
     const char* stage,
     core::AggregationNode::Step step,
@@ -99,61 +273,40 @@ void logCudaCheckpoint(
     int64_t rows,
     int64_t cols,
     int64_t aux) {
-  if (!hashAggDebugEnabled()) {
+  auto const selectedGroup = hashAggDebugDeviceSyncPoint();
+  if (!hashAggDebugEnabled() && selectedGroup == 0) {
     return;
   }
-  auto const peekErr = cudaPeekAtLastError();
-  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << " step=" << stepName(step)
-            << " stream=" << reinterpret_cast<const void*>(stream.value())
-            << " rows=" << rows << " cols=" << cols << " aux=" << aux
-            << " cudaPeek=" << cudaErrorNameSafe(peekErr)
-            << "(" << static_cast<int>(peekErr) << ")"
-            << " cudaPeekMsg=" << cudaErrorStringSafe(peekErr);
-  if (hashAggDebugSyncEnabled()) {
-    auto const syncErr = cudaStreamSynchronize(stream.value());
-    LOG(INFO) << "[CudfHashAggDebug] stage=" << stage
-              << ".streamSync step=" << stepName(step) << " stream="
-              << reinterpret_cast<const void*>(stream.value()) << " rows="
-              << rows << " cols=" << cols << " aux=" << aux
-              << " cudaSync=" << cudaErrorNameSafe(syncErr)
-              << "(" << static_cast<int>(syncErr) << ")"
-              << " cudaSyncMsg=" << cudaErrorStringSafe(syncErr);
+  registerKnownStreams(stream);
+  if (hashAggDebugEnabled()) {
+    auto const peekErr = cudaPeekAtLastError();
+    LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << " step="
+              << stepName(step)
+              << " stream=" << reinterpret_cast<const void*>(stream.value())
+              << " rows=" << rows << " cols=" << cols << " aux=" << aux
+              << " cudaPeek=" << cudaErrorNameSafe(peekErr)
+              << "(" << static_cast<int>(peekErr) << ")"
+              << " cudaPeekMsg=" << cudaErrorStringSafe(peekErr);
+    if (hashAggDebugSyncEnabled()) {
+      auto const syncErr = cudaStreamSynchronize(stream.value());
+      LOG(INFO) << "[CudfHashAggDebug] stage=" << stage
+                << ".streamSync step=" << stepName(step) << " stream="
+                << reinterpret_cast<const void*>(stream.value()) << " rows="
+                << rows << " cols=" << cols << " aux=" << aux
+                << " cudaSync=" << cudaErrorNameSafe(syncErr)
+                << "(" << static_cast<int>(syncErr) << ")"
+                << " cudaSyncMsg=" << cudaErrorStringSafe(syncErr);
+    }
   }
-}
-
-void maybeDeviceSyncProbe(
-    int32_t pointId,
-    const char* stage,
-    core::AggregationNode::Step step,
-    rmm::cuda_stream_view stream,
-    int64_t rows,
-    int64_t cols,
-    int64_t aux) {
-  auto const selectedPoint = hashAggDebugDeviceSyncPoint();
-  // Probe point IDs:
-  // 1 = getOutput.afterConcat
-  // 2 = doGroupByAggregation.preAggregate
-  // 3 = doGroupByAggregation.postAggregate
-  // 4 = doGroupByAggregation.preMakeOutputColumns
-  // 5 = doGroupByAggregation.postMakeOutputColumns
-  // Selector semantics:
-  //  0 => disabled
-  // -1 => all probe points
-  // >0 => only the selected point
-  if (selectedPoint == 0 ||
-      (selectedPoint != -1 && selectedPoint != pointId)) {
-    return;
-  }
-  auto const syncErr = cudaDeviceSynchronize();
-  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage
-            << ".deviceSyncProbe point=" << pointId << " step="
-            << stepName(step) << " stream="
-            << reinterpret_cast<const void*>(stream.value()) << " rows="
-            << rows << " cols=" << cols << " aux=" << aux
-            << " selectedPoint=" << selectedPoint
-            << " cudaDeviceSync=" << cudaErrorNameSafe(syncErr)
-            << "(" << static_cast<int>(syncErr) << ")"
-            << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(syncErr);
+  maybeDeviceSyncProbe(
+      checkpointGroupFromStage(stage),
+      0,
+      stage,
+      step,
+      stream,
+      rows,
+      cols,
+      aux);
 }
 
 void logColumnViewDebug(
@@ -1598,6 +1751,15 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
 
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
+  maybeDeviceSyncProbe(
+      kDeviceSyncGroupOperatorBoundary,
+      2,
+      "HashAgg.addInput.begin",
+      step_,
+      cudfInput->stream(),
+      input->size(),
+      input->type()->size(),
+      numInputRows_);
 
   if (isPartialOutput_ && !isGlobal_) {
     if (isDistinct_) {
@@ -1614,6 +1776,15 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
                 << (partialOutput_ ? partialOutput_->size() : 0)
                 << " numInputRows=" << numInputRows_;
     }
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupOperatorBoundary,
+        3,
+        "HashAgg.addInput.partialProcessed",
+        step_,
+        cudfInput->stream(),
+        partialOutput_ ? partialOutput_->size() : 0,
+        isDistinct_ ? 1 : 0,
+        numInputRows_);
     return;
   }
 
@@ -1625,6 +1796,15 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
               << " bufferedInputs=" << inputs_.size() << " numInputRows="
               << numInputRows_;
   }
+  maybeDeviceSyncProbe(
+      kDeviceSyncGroupOperatorBoundary,
+      4,
+      "HashAgg.addInput.buffered",
+      step_,
+      inputs_.back()->stream(),
+      inputs_.back()->size(),
+      inputs_.size(),
+      numInputRows_);
 }
 
 CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
@@ -1687,7 +1867,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
   maybeDeviceSyncProbe(
-      2,
+      kDeviceSyncGroupGroupByCore,
+      1,
       "HashAgg.doGroupByAggregation.preAggregate",
       step_,
       stream,
@@ -1732,7 +1913,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     throw;
   }
   maybeDeviceSyncProbe(
-      3,
+      kDeviceSyncGroupGroupByCore,
+      2,
       "HashAgg.doGroupByAggregation.postAggregate",
       step_,
       stream,
@@ -1766,7 +1948,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   // then fill the aggregation results
   maybeDeviceSyncProbe(
-      4,
+      kDeviceSyncGroupGroupByCore,
+      3,
       "HashAgg.doGroupByAggregation.preMakeOutputColumns",
       step_,
       stream,
@@ -1800,7 +1983,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         i);
   }
   maybeDeviceSyncProbe(
-      5,
+      kDeviceSyncGroupGroupByCore,
+      4,
       "HashAgg.doGroupByAggregation.postMakeOutputColumns",
       step_,
       stream,
@@ -1984,6 +2168,15 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       inputs_.size(),
       0,
       0);
+  maybeDeviceSyncProbe(
+      kDeviceSyncGroupOperatorBoundary,
+      5,
+      "HashAgg.getOutput.beforeConcat",
+      step_,
+      stream,
+      inputs_.size(),
+      0,
+      noMoreInput_ ? 1 : 0);
 
   auto tbl = getConcatenatedTable(inputs_, inputType_, stream);
 
@@ -1994,6 +2187,15 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   if (noMoreInput_) {
     finished_ = true;
   }
+  maybeDeviceSyncProbe(
+      kDeviceSyncGroupOperatorBoundary,
+      6,
+      "HashAgg.getOutput.afterInputRelease",
+      step_,
+      stream,
+      tbl ? tbl->num_rows() : 0,
+      tbl ? tbl->num_columns() : 0,
+      static_cast<int64_t>(finished_));
 
   VELOX_CHECK_NOT_NULL(tbl);
   logHashAggDebug(
@@ -2004,6 +2206,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       tbl->num_columns(),
       0);
   maybeDeviceSyncProbe(
+      kDeviceSyncGroupOperatorBoundary,
       1,
       "HashAgg.getOutput.afterConcat",
       step_,
