@@ -141,6 +141,8 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   // Distinct means it's a count distinct on the groupby keys, without any
   // aggregations
   const bool isDistinct_;
+  // Cache step eagerly; aggregationNode_ is reset after initialize().
+  const core::AggregationNode::Step step_;
 
   // Maximum memory usage for partial aggregation.
   const int64_t maxPartialAggregationMemoryUsage_;

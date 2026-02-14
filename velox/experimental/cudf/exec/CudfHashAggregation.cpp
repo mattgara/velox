@@ -1032,6 +1032,7 @@ CudfHashAggregation::CudfHashAggregation(
           !hasFinalAggs(aggregationNode->aggregates())),
       isGlobal_(aggregationNode->groupingKeys().empty()),
       isDistinct_(!isGlobal_ && aggregationNode->aggregates().empty()),
+      step_(aggregationNode->step()),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
@@ -1190,7 +1191,7 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   }
   if (hashAggDebugEnabled()) {
     LOG(INFO) << "[CudfHashAggDebug] stage=addInput.begin step="
-              << stepName(aggregationNode_->step()) << " rows=" << input->size()
+              << stepName(step_) << " rows=" << input->size()
               << " isPartialOutput=" << isPartialOutput_
               << " isGlobal=" << isGlobal_ << " isDistinct=" << isDistinct_;
   }
@@ -1209,7 +1210,7 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
     }
     if (hashAggDebugEnabled()) {
       LOG(INFO) << "[CudfHashAggDebug] stage=addInput.partialProcessed step="
-                << stepName(aggregationNode_->step())
+                << stepName(step_)
                 << " partialOutputRows="
                 << (partialOutput_ ? partialOutput_->size() : 0)
                 << " numInputRows=" << numInputRows_;
@@ -1221,7 +1222,7 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   inputs_.push_back(std::move(cudfInput));
   if (hashAggDebugEnabled()) {
     LOG(INFO) << "[CudfHashAggDebug] stage=addInput.buffered step="
-              << stepName(aggregationNode_->step())
+              << stepName(step_)
               << " bufferedInputs=" << inputs_.size() << " numInputRows="
               << numInputRows_;
   }
@@ -1234,7 +1235,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     rmm::cuda_stream_view stream) {
   logHashAggDebug(
       "HashAgg.doGroupByAggregation.begin",
-      aggregationNode_->step(),
+      step_,
       stream,
       tableView.num_rows(),
       tableView.num_columns(),
@@ -1257,7 +1258,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
   logHashAggDebug(
       "HashAgg.doGroupByAggregation.beforeAggregate",
-      aggregationNode_->step(),
+      step_,
       stream,
       tableView.num_rows(),
       requests.size(),
@@ -1266,7 +1267,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
   logHashAggDebug(
       "HashAgg.doGroupByAggregation.afterAggregate",
-      aggregationNode_->step(),
+      step_,
       stream,
       groupKeys ? groupKeys->num_rows() : 0,
       results.size(),
@@ -1305,7 +1306,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
     rmm::cuda_stream_view stream) {
   logHashAggDebug(
       "HashAgg.doGlobalAggregation.begin",
-      aggregationNode_->step(),
+      step_,
       stream,
       tableView.num_rows(),
       tableView.num_columns(),
@@ -1315,7 +1316,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
   for (auto i = 0; i < aggregators_.size(); i++) {
     logHashAggDebug(
         "HashAgg.doGlobalAggregation.beforeDoReduce",
-        aggregationNode_->step(),
+        step_,
         stream,
         tableView.num_rows(),
         tableView.num_columns(),
@@ -1325,7 +1326,7 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
   }
   logHashAggDebug(
       "HashAgg.doGlobalAggregation.end",
-      aggregationNode_->step(),
+      step_,
       stream,
       1,
       resultColumns.size(),
@@ -1385,7 +1386,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (hashAggDebugEnabled()) {
     LOG(INFO) << "[CudfHashAggDebug] stage=getOutput.begin step="
-              << stepName(aggregationNode_->step()) << " finished=" << finished_
+              << stepName(step_) << " finished=" << finished_
               << " noMoreInput=" << noMoreInput_ << " bufferedInputs="
               << inputs_.size() << " hasPartialOutput="
               << static_cast<bool>(partialOutput_);
@@ -1427,7 +1428,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   auto stream = cudfGlobalStreamPool().get_stream();
   logHashAggDebug(
       "HashAgg.getOutput.beforeConcat",
-      aggregationNode_->step(),
+      step_,
       stream,
       inputs_.size(),
       0,
@@ -1446,7 +1447,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_CHECK_NOT_NULL(tbl);
   logHashAggDebug(
       "HashAgg.getOutput.afterConcat",
-      aggregationNode_->step(),
+      step_,
       stream,
       tbl->num_rows(),
       tbl->num_columns(),
