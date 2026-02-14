@@ -206,9 +206,15 @@ void CudfHashJoinBuild::noMoreInput() {
 
   if (CudfConfig::getInstance().debugEnabled) {
     LOG(INFO) << "CudfHashJoinBuild: build batches" << std::endl;
-    LOG(INFO) << "Build batches number of columns: "
-              << inputs_[0]->getTableView().num_columns() << std::endl;
-    for (auto i = 0; i < inputs_.size(); i++) {
+    LOG(INFO) << "Build batches count: " << inputs_.size() << std::endl;
+    if (!inputs_.empty()) {
+      LOG(INFO) << "Build batches number of columns: "
+                << inputs_.front()->getTableView().num_columns() << std::endl;
+    } else {
+      LOG(INFO) << "Build batches are empty; using empty build table."
+                << std::endl;
+    }
+    for (size_t i = 0; i < inputs_.size(); i++) {
       LOG(INFO) << "Build batch " << i
                 << ": number of rows: " << inputs_[i]->getTableView().num_rows()
                 << std::endl;
@@ -227,9 +233,12 @@ void CudfHashJoinBuild::noMoreInput() {
     VELOX_CHECK_NOT_NULL(tbl);
   }
   if (CudfConfig::getInstance().debugEnabled) {
-    LOG(INFO) << "Build table number of columns: " << tbls[0]->num_columns()
-              << std::endl;
-    for (auto i = 0; i < tbls.size(); i++) {
+    LOG(INFO) << "Build table batches count: " << tbls.size() << std::endl;
+    if (!tbls.empty()) {
+      LOG(INFO) << "Build table number of columns: "
+                << tbls.front()->num_columns() << std::endl;
+    }
+    for (size_t i = 0; i < tbls.size(); i++) {
       LOG(INFO) << "Build table " << i
                 << ": number of rows: " << tbls[i]->num_rows() << std::endl;
     }
