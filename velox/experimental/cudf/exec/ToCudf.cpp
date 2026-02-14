@@ -557,6 +557,10 @@ void CudfConfig::initialize(
     debugOperatorFlowDeviceSyncPoint =
         folly::to<int32_t>(config[kCudfDebugOperatorFlowDeviceSyncPoint]);
   }
+  if (config.find(kCudfDebugHashAggFakeGroupbyMode) != config.end()) {
+    debugHashAggFakeGroupbyMode =
+        folly::to<int32_t>(config[kCudfDebugHashAggFakeGroupbyMode]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }
@@ -580,7 +584,8 @@ void CudfConfig::initialize(
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }
   if (debugEnabled || debugExprTree || debugOperatorFlow ||
-      debugOperatorFlowSync || debugOperatorFlowDeviceSyncPoint != 0) {
+      debugOperatorFlowSync || debugOperatorFlowDeviceSyncPoint != 0 ||
+      debugHashAggFakeGroupbyMode != 0) {
     LOG(INFO) << "[CudfConfig] enabled=" << enabled
               << " debugEnabled=" << debugEnabled
               << " debugExprTree=" << debugExprTree
@@ -588,6 +593,8 @@ void CudfConfig::initialize(
               << " debugOperatorFlowSync=" << debugOperatorFlowSync
               << " debugOperatorFlowDeviceSyncPoint="
               << debugOperatorFlowDeviceSyncPoint
+              << " debugHashAggFakeGroupbyMode="
+              << debugHashAggFakeGroupbyMode
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }

@@ -34,6 +34,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -67,6 +68,11 @@ inline bool hashAggDebugSyncEnabled() {
 inline int32_t hashAggDebugDeviceSyncPoint() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
       .debugOperatorFlowDeviceSyncPoint;
+}
+
+inline int32_t hashAggDebugFakeGroupbyMode() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggFakeGroupbyMode;
 }
 
 constexpr int32_t kDeviceSyncGroupGroupByCore{1};
@@ -683,6 +689,54 @@ std::string formatAggregateProbeFailure(
     failure += " exception=" + status.aggregateException;
   }
   return failure;
+}
+
+const char* fakeGroupbyModeName(int32_t mode) {
+  switch (mode) {
+    case 1:
+      return "zero";
+    case 2:
+      return "one";
+    default:
+      return "disabled";
+  }
+}
+
+std::unique_ptr<cudf::scalar> makeFakeConstantScalar(
+    cudf::data_type type,
+    int32_t mode,
+    rmm::cuda_stream_view stream) {
+  if (mode == 2) {
+    switch (type.id()) {
+      case cudf::type_id::INT8:
+        return cudf::make_fixed_width_scalar<int8_t>(1, stream);
+      case cudf::type_id::INT16:
+        return cudf::make_fixed_width_scalar<int16_t>(1, stream);
+      case cudf::type_id::INT32:
+        return cudf::make_fixed_width_scalar<int32_t>(1, stream);
+      case cudf::type_id::INT64:
+        return cudf::make_fixed_width_scalar<int64_t>(1, stream);
+      case cudf::type_id::UINT8:
+        return cudf::make_fixed_width_scalar<uint8_t>(1, stream);
+      case cudf::type_id::UINT16:
+        return cudf::make_fixed_width_scalar<uint16_t>(1, stream);
+      case cudf::type_id::UINT32:
+        return cudf::make_fixed_width_scalar<uint32_t>(1, stream);
+      case cudf::type_id::UINT64:
+        return cudf::make_fixed_width_scalar<uint64_t>(1, stream);
+      case cudf::type_id::FLOAT32:
+        return cudf::make_fixed_width_scalar<float>(1.0f, stream);
+      case cudf::type_id::FLOAT64:
+        return cudf::make_fixed_width_scalar<double>(1.0, stream);
+      case cudf::type_id::BOOL8:
+        return cudf::make_fixed_width_scalar<bool>(true, stream);
+      default:
+        break;
+    }
+  }
+  auto scalar = cudf::make_default_constructed_scalar(type, stream);
+  scalar->set_valid_async(true, stream);
+  return scalar;
 }
 
 std::string runGroupByAggregateRequestIsolationProbes(
@@ -2271,6 +2325,58 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     }
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
+  auto const fakeGroupbyMode = hashAggDebugFakeGroupbyMode();
+  if (fakeGroupbyMode != 0) {
+    auto const fakeNumRows = tableView.num_rows() > 0 ? 1 : 0;
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "fakeAggregate.begin step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << requests.size() << " groupingKeys="
+                 << numGroupingKeys << " fakeMode=" << fakeGroupbyMode << "("
+                 << fakeGroupbyModeName(fakeGroupbyMode) << ")"
+                 << " fakeRows=" << fakeNumRows;
+    if (fakeNumRows == 0) {
+      return nullptr;
+    }
+    std::vector<std::unique_ptr<cudf::column>> fakeColumns;
+    fakeColumns.reserve(outputType_->size());
+    for (int i = 0; i < outputType_->size(); ++i) {
+      auto const cudfOutputType =
+          cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
+      auto fakeScalar =
+          makeFakeConstantScalar(cudfOutputType, fakeGroupbyMode, stream);
+      auto fakeColumn =
+          cudf::make_column_from_scalar(*fakeScalar, fakeNumRows, stream);
+      if (fakeColumn) {
+        logColumnViewDebug(
+            "HashAgg.doGroupByAggregation.fakeAggregate.outputColumn",
+            step_,
+            stream,
+            fakeColumn->view(),
+            i);
+      }
+      fakeColumns.push_back(std::move(fakeColumn));
+    }
+    auto fakeTable = std::make_unique<cudf::table>(std::move(fakeColumns));
+    logCudaCheckpoint(
+        "HashAgg.doGroupByAggregation.fakeAggregate.cudaCheckpoint",
+        step_,
+        stream,
+        fakeNumRows,
+        fakeTable->num_columns(),
+        fakeGroupbyMode);
+    logHashAggDebug(
+        "HashAgg.doGroupByAggregation.fakeAggregate.end",
+        step_,
+        stream,
+        fakeNumRows,
+        fakeTable->num_columns(),
+        fakeGroupbyMode);
+    return std::make_shared<cudf_velox::CudfVector>(
+        pool(), outputType_, fakeNumRows, std::move(fakeTable), stream);
+  }
   maybeDeviceSyncProbe(
       kDeviceSyncGroupGroupByCore,
       1,

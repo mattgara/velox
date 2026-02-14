@@ -27,6 +27,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugOperatorFlow, "true"},
       {CudfConfig::kCudfDebugOperatorFlowSync, "true"},
       {CudfConfig::kCudfDebugOperatorFlowDeviceSyncPoint, "3"},
+      {CudfConfig::kCudfDebugHashAggFakeGroupbyMode, "2"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -39,6 +40,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugOperatorFlow, true);
   ASSERT_EQ(config.debugOperatorFlowSync, true);
   ASSERT_EQ(config.debugOperatorFlowDeviceSyncPoint, 3);
+  ASSERT_EQ(config.debugHashAggFakeGroupbyMode, 2);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");

@@ -33,6 +33,8 @@ struct CudfConfig {
       "cudf.debug_operator_flow_sync"};
   static constexpr const char* kCudfDebugOperatorFlowDeviceSyncPoint{
       "cudf.debug_operator_flow_device_sync_point"};
+  static constexpr const char* kCudfDebugHashAggFakeGroupbyMode{
+      "cudf.debug_hashagg_fake_groupby_mode"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -83,6 +85,12 @@ struct CudfConfig {
   ///   6  => groupby request-isolation probes
   /// Intended for speculative stream-race triage.
   int32_t debugOperatorFlowDeviceSyncPoint{0};
+
+  /// Optional: bypass hash-aggregate groupby with fake constant output:
+  ///   0 => disabled
+  ///   1 => output constant zero/default values
+  ///   2 => output constant one for primitive numerics where supported
+  int32_t debugHashAggFakeGroupbyMode{0};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};
