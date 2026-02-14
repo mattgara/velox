@@ -1081,6 +1081,12 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     aggregator->addGroupbyRequest(tableView, requests);
   }
 
+  // Some decimal aggregation paths deserialize intermediate states on the
+  // default stream while this operator executes groupby on 'stream'. Ensure
+  // those writes are visible before launching groupby aggregate kernels.
+  cudf::detail::join_streams(
+      std::vector<rmm::cuda_stream_view>{cudf::get_default_stream()}, stream);
+
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
   // flatten the results
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
