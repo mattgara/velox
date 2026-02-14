@@ -25,6 +25,7 @@ struct CudfConfig {
   /// Keys used by the initialize() method.
   static constexpr const char* kCudfEnabled{"cudf.enabled"};
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
+  static constexpr const char* kCudfDebugExprTree{"cudf.debug_expr_tree"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -49,6 +50,11 @@ struct CudfConfig {
 
   /// Enable debug printing.
   bool debugEnabled{false};
+
+  /// Enable verbose Expr DAG tree logging in CudfFilterProject.
+  /// Keep disabled by default because deep recursive traversal can be noisy
+  /// and expensive.
+  bool debugExprTree{false};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

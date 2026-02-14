@@ -211,8 +211,10 @@ void CudfFilterProject::initialize() {
     int i = 0;
     for (const auto& compiledExpr : exprSet->exprs()) {
       LOG(INFO) << "expr[" << i << "] " << compiledExpr->toString();
-      std::unordered_set<const velox::exec::Expr*> visited;
-      debugPrintTree(compiledExpr, visited);
+      if (CudfConfig::getInstance().debugExprTree) {
+        std::unordered_set<const velox::exec::Expr*> visited;
+        debugPrintTree(compiledExpr, visited);
+      }
       ++i;
     }
   }
