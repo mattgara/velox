@@ -73,6 +73,7 @@ constexpr int32_t kDeviceSyncGroupDecimalRequest{2};
 constexpr int32_t kDeviceSyncGroupDecimalCompute{3};
 constexpr int32_t kDeviceSyncGroupGlobalAgg{4};
 constexpr int32_t kDeviceSyncGroupOperatorBoundary{5};
+constexpr int32_t kDeviceSyncGroupGroupByRequestIsolation{6};
 
 const char* stepName(core::AggregationNode::Step step) {
   switch (step) {
@@ -114,6 +115,8 @@ const char* deviceSyncGroupName(int32_t groupId) {
       return "global-agg";
     case kDeviceSyncGroupOperatorBoundary:
       return "operator-boundary";
+    case kDeviceSyncGroupGroupByRequestIsolation:
+      return "groupby-request-isolation";
     default:
       return "unknown-group";
   }
@@ -134,6 +137,9 @@ int32_t checkpointGroupFromStage(const char* stage) {
   auto const startsWith = [&](std::string_view prefix) {
     return stageView.rfind(prefix, 0) == 0;
   };
+  if (startsWith("HashAgg.doGroupByAggregation.aggregateProbe")) {
+    return kDeviceSyncGroupGroupByRequestIsolation;
+  }
   if (startsWith("HashAgg.doGroupByAggregation")) {
     return kDeviceSyncGroupGroupByCore;
   }
@@ -197,7 +203,8 @@ void logDeviceSyncModeOnce(int32_t selectedGroup) {
   LOG(INFO)
       << "[CudfHashAggDebug] deviceSyncMode selectedGroup=" << selectedGroup
       << " semantics=0:none,-1:all,1:groupby-core,2:decimal-request,"
-      << "3:decimal-compute,4:global-agg,5:operator-boundary";
+      << "3:decimal-compute,4:global-agg,5:operator-boundary,"
+      << "6:groupby-request-isolation";
 }
 
 void logKnownStreamsState(
@@ -448,6 +455,277 @@ void logHashAggDebug(
   LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << " step=" << stepName(step)
             << " stream=" << reinterpret_cast<const void*>(stream.value())
             << " rows=" << rows << " cols=" << cols << " aux=" << aux;
+}
+
+std::string formatRequestSubset(std::vector<size_t> const& subset) {
+  std::string text{"["};
+  for (size_t i = 0; i < subset.size(); ++i) {
+    if (i > 0) {
+      text += ",";
+    }
+    text += std::to_string(subset[i]);
+  }
+  text += "]";
+  return text;
+}
+
+size_t bitCountU64(uint64_t value) {
+  size_t count = 0;
+  while (value != 0) {
+    count += static_cast<size_t>(value & 1ULL);
+    value >>= 1;
+  }
+  return count;
+}
+
+std::vector<std::vector<size_t>> buildRequestProbeSubsets(
+    size_t requestCount,
+    bool& exhaustive) {
+  std::vector<std::vector<size_t>> subsets;
+  if (requestCount == 0) {
+    exhaustive = true;
+    return subsets;
+  }
+  constexpr size_t kExhaustiveRequestCountLimit = 8;
+  exhaustive = requestCount <= kExhaustiveRequestCountLimit;
+  if (exhaustive) {
+    auto const totalMasks = static_cast<uint64_t>(1ULL << requestCount);
+    for (size_t subsetSize = 1; subsetSize <= requestCount; ++subsetSize) {
+      for (uint64_t mask = 1; mask < totalMasks; ++mask) {
+        if (bitCountU64(mask) != subsetSize) {
+          continue;
+        }
+        std::vector<size_t> subset;
+        subset.reserve(subsetSize);
+        for (size_t bit = 0; bit < requestCount; ++bit) {
+          if ((mask & (1ULL << bit)) != 0) {
+            subset.push_back(bit);
+          }
+        }
+        subsets.push_back(std::move(subset));
+      }
+    }
+    return subsets;
+  }
+
+  // Large request counts can explode combinatorially; use a deterministic,
+  // bounded subset list that still catches many interaction patterns.
+  for (size_t i = 0; i < requestCount; ++i) {
+    subsets.push_back({i});
+  }
+  constexpr size_t kPairProbeLimit = 32;
+  size_t pairProbeCount = 0;
+  for (size_t i = 0; i < requestCount && pairProbeCount < kPairProbeLimit; ++i) {
+    for (size_t j = i + 1; j < requestCount && pairProbeCount < kPairProbeLimit;
+         ++j) {
+      subsets.push_back({i, j});
+      ++pairProbeCount;
+    }
+  }
+  for (size_t prefix = 3; prefix <= std::min<size_t>(requestCount, 8); ++prefix) {
+    std::vector<size_t> subset;
+    subset.reserve(prefix);
+    for (size_t i = 0; i < prefix; ++i) {
+      subset.push_back(i);
+    }
+    subsets.push_back(std::move(subset));
+  }
+  std::vector<size_t> allSubset;
+  allSubset.reserve(requestCount);
+  for (size_t i = 0; i < requestCount; ++i) {
+    allSubset.push_back(i);
+  }
+  subsets.push_back(std::move(allSubset));
+  return subsets;
+}
+
+cudf::groupby::aggregation_request cloneGroupbyRequest(
+    cudf::groupby::aggregation_request const& source) {
+  cudf::groupby::aggregation_request clone;
+  clone.values = source.values;
+  clone.aggregations.reserve(source.aggregations.size());
+  for (auto const& aggregation : source.aggregations) {
+    VELOX_CHECK_NOT_NULL(aggregation);
+    auto aggregationClone = aggregation->clone();
+    auto* groupbyAggregationClone =
+        dynamic_cast<cudf::groupby_aggregation*>(aggregationClone.get());
+    VELOX_CHECK_NOT_NULL(groupbyAggregationClone);
+    aggregationClone.release();
+    clone.aggregations.emplace_back(groupbyAggregationClone);
+  }
+  return clone;
+}
+
+std::vector<cudf::groupby::aggregation_request> cloneGroupbyRequestSubset(
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    std::vector<size_t> const& subset) {
+  std::vector<cudf::groupby::aggregation_request> subsetRequests;
+  subsetRequests.reserve(subset.size());
+  for (auto const requestIdx : subset) {
+    VELOX_CHECK_LT(requestIdx, requests.size());
+    subsetRequests.emplace_back(cloneGroupbyRequest(requests[requestIdx]));
+  }
+  return subsetRequests;
+}
+
+std::string runGroupByAggregateRequestIsolationProbes(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& tableView,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    int64_t numGroupingKeys) {
+  auto const selectedGroup = hashAggDebugDeviceSyncPoint();
+  if (!isDeviceSyncGroupEnabled(
+          selectedGroup, kDeviceSyncGroupGroupByRequestIsolation)) {
+    return "";
+  }
+
+  bool exhaustive = false;
+  auto const requestSubsets = buildRequestProbeSubsets(requests.size(), exhaustive);
+  LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+               "aggregateProbe.begin step="
+            << stepName(step) << " stream="
+            << reinterpret_cast<const void*>(stream.value()) << " rows="
+            << tableView.num_rows() << " cols=" << tableView.num_columns()
+            << " requestCount=" << requests.size()
+            << " subsetCount=" << requestSubsets.size()
+            << " exhaustive=" << (exhaustive ? 1 : 0)
+            << " selectedGroup=" << selectedGroup;
+
+  for (size_t probeOrdinal = 0; probeOrdinal < requestSubsets.size();
+       ++probeOrdinal) {
+    auto const& requestSubset = requestSubsets[probeOrdinal];
+    auto const subsetLabel = formatRequestSubset(requestSubset);
+    auto const probeIdBase = static_cast<int32_t>(1000 + probeOrdinal * 10);
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupGroupByRequestIsolation,
+        probeIdBase + 1,
+        "HashAgg.doGroupByAggregation.aggregateProbe.beforeSubset",
+        step,
+        stream,
+        tableView.num_rows(),
+        static_cast<int64_t>(requestSubset.size()),
+        numGroupingKeys);
+    auto const preProbePeekErr = cudaPeekAtLastError();
+    auto const preProbeStreamSyncErr = cudaStreamSynchronize(stream.value());
+    auto const preProbeDeviceSyncErr = cudaDeviceSynchronize();
+    LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                 "aggregateProbe.preState step="
+              << stepName(step) << " stream="
+              << reinterpret_cast<const void*>(stream.value())
+              << " probeOrdinal=" << probeOrdinal << " subset=" << subsetLabel
+              << " cudaPeek=" << cudaErrorNameSafe(preProbePeekErr) << "("
+              << static_cast<int>(preProbePeekErr) << ")"
+              << " cudaPeekMsg=" << cudaErrorStringSafe(preProbePeekErr)
+              << " cudaStreamSync="
+              << cudaErrorNameSafe(preProbeStreamSyncErr) << "("
+              << static_cast<int>(preProbeStreamSyncErr) << ")"
+              << " cudaStreamSyncMsg="
+              << cudaErrorStringSafe(preProbeStreamSyncErr)
+              << " cudaDeviceSync="
+              << cudaErrorNameSafe(preProbeDeviceSyncErr) << "("
+              << static_cast<int>(preProbeDeviceSyncErr) << ")"
+              << " cudaDeviceSyncMsg="
+              << cudaErrorStringSafe(preProbeDeviceSyncErr);
+    if (preProbePeekErr != cudaSuccess ||
+        preProbeStreamSyncErr != cudaSuccess ||
+        preProbeDeviceSyncErr != cudaSuccess) {
+      return "probeOrdinal=" + std::to_string(probeOrdinal) + " subset=" +
+          subsetLabel + " preState cudaPeek=" +
+          std::string(cudaErrorNameSafe(preProbePeekErr)) + "(" +
+          std::to_string(static_cast<int>(preProbePeekErr)) + ")" +
+          " cudaStreamSync=" +
+          std::string(cudaErrorNameSafe(preProbeStreamSyncErr)) + "(" +
+          std::to_string(static_cast<int>(preProbeStreamSyncErr)) + ")" +
+          " cudaDeviceSync=" +
+          std::string(cudaErrorNameSafe(preProbeDeviceSyncErr)) + "(" +
+          std::to_string(static_cast<int>(preProbeDeviceSyncErr)) + ")";
+    }
+
+    std::vector<cudf::groupby::aggregation_request> probeRequests;
+    try {
+      probeRequests = cloneGroupbyRequestSubset(requests, requestSubset);
+    } catch (const std::exception& e) {
+      return "probeOrdinal=" + std::to_string(probeOrdinal) + " subset=" +
+          subsetLabel + " cloneException=" + e.what();
+    }
+    logGroupbyRequestsDebug(step, stream, tableView, probeRequests);
+
+    bool aggregateThrew = false;
+    std::string aggregateException;
+    int64_t outputRows = -1;
+    int64_t outputCount = -1;
+
+    try {
+      cudf::groupby::groupby probeGroupBy(groupbyKeyView, nullPolicy);
+      auto probeOutput = probeGroupBy.aggregate(probeRequests, stream);
+      outputRows = probeOutput.first ? probeOutput.first->num_rows() : 0;
+      outputCount = probeOutput.second.size();
+    } catch (const std::exception& e) {
+      aggregateThrew = true;
+      aggregateException = e.what();
+    }
+
+    auto const peekErr = cudaPeekAtLastError();
+    auto const streamSyncErr = cudaStreamSynchronize(stream.value());
+    auto const deviceSyncErr = cudaDeviceSynchronize();
+    LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                 "aggregateProbe.result step="
+              << stepName(step) << " stream="
+              << reinterpret_cast<const void*>(stream.value())
+              << " probeOrdinal=" << probeOrdinal << " subset=" << subsetLabel
+              << " subsetSize=" << requestSubset.size()
+              << " aggregateThrew=" << (aggregateThrew ? 1 : 0)
+              << " outputRows=" << outputRows << " outputCount=" << outputCount
+              << " cudaPeek=" << cudaErrorNameSafe(peekErr) << "("
+              << static_cast<int>(peekErr) << ")"
+              << " cudaPeekMsg=" << cudaErrorStringSafe(peekErr)
+              << " cudaStreamSync=" << cudaErrorNameSafe(streamSyncErr) << "("
+              << static_cast<int>(streamSyncErr) << ")"
+              << " cudaStreamSyncMsg=" << cudaErrorStringSafe(streamSyncErr)
+              << " cudaDeviceSync=" << cudaErrorNameSafe(deviceSyncErr) << "("
+              << static_cast<int>(deviceSyncErr) << ")"
+              << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(deviceSyncErr)
+              << (aggregateThrew ? " exception=" + aggregateException : "");
+
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupGroupByRequestIsolation,
+        probeIdBase + 2,
+        "HashAgg.doGroupByAggregation.aggregateProbe.afterSubset",
+        step,
+        stream,
+        outputRows >= 0 ? outputRows : tableView.num_rows(),
+        static_cast<int64_t>(requestSubset.size()),
+        outputCount >= 0 ? outputCount : -1);
+
+    if (aggregateThrew || peekErr != cudaSuccess ||
+        streamSyncErr != cudaSuccess || deviceSyncErr != cudaSuccess) {
+      std::string failure = "probeOrdinal=" + std::to_string(probeOrdinal) +
+          " subset=" + subsetLabel + " aggregateThrew=" +
+          (aggregateThrew ? "1" : "0") + " cudaPeek=" +
+          std::string(cudaErrorNameSafe(peekErr)) + "(" +
+          std::to_string(static_cast<int>(peekErr)) + ")" +
+          " cudaStreamSync=" + std::string(cudaErrorNameSafe(streamSyncErr)) +
+          "(" + std::to_string(static_cast<int>(streamSyncErr)) + ")" +
+          " cudaDeviceSync=" + std::string(cudaErrorNameSafe(deviceSyncErr)) +
+          "(" + std::to_string(static_cast<int>(deviceSyncErr)) + ")";
+      if (aggregateThrew) {
+        failure += " exception=" + aggregateException;
+      }
+      return failure;
+    }
+  }
+
+  LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+               "aggregateProbe.end step="
+            << stepName(step) << " stream="
+            << reinterpret_cast<const void*>(stream.value()) << " requestCount="
+            << requests.size() << " subsetCount=" << requestSubsets.size()
+            << " exhaustive=" << (exhaustive ? 1 : 0)
+            << " status=all-pass";
+  return "";
 }
 
 
@@ -1832,12 +2110,11 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   size_t const numGroupingKeys = groupbyKeyView.num_columns();
 
+  auto const nullPolicy =
+      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE : cudf::null_policy::INCLUDE;
   // TODO: All other args to groupby are related to sort groupby. We don't
   // support optimizations related to it yet.
-  cudf::groupby::groupby groupByOwner(
-      groupbyKeyView,
-      ignoreNullKeys_ ? cudf::null_policy::EXCLUDE
-                      : cudf::null_policy::INCLUDE);
+  cudf::groupby::groupby groupByOwner(groupbyKeyView, nullPolicy);
 
   std::vector<cudf::groupby::aggregation_request> requests;
   for (size_t aggregatorIdx = 0; aggregatorIdx < aggregators.size();
@@ -1889,6 +2166,27 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
       tableView.num_rows(),
       requests.size(),
       numGroupingKeys);
+  auto const probeFailure = runGroupByAggregateRequestIsolationProbes(
+      step_,
+      stream,
+      tableView,
+      groupbyKeyView,
+      nullPolicy,
+      requests,
+      numGroupingKeys);
+  if (!probeFailure.empty()) {
+    LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                  "aggregateProbe.firstFailure step="
+               << stepName(step_) << " stream="
+               << reinterpret_cast<const void*>(stream.value()) << " rows="
+               << tableView.num_rows() << " cols=" << tableView.num_columns()
+               << " requestCount=" << requests.size() << " groupingKeys="
+               << numGroupingKeys << " detail=" << probeFailure;
+    VELOX_FAIL(
+        "HashAgg aggregate request-isolation probe failed before main "
+        "aggregate: {}",
+        probeFailure);
+  }
   std::unique_ptr<cudf::table> groupKeys;
   std::vector<cudf::groupby::aggregation_result> results;
   try {

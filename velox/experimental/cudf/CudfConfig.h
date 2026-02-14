@@ -80,6 +80,7 @@ struct CudfConfig {
   ///   3  => decimal reduce/avg probes
   ///   4  => global aggregation probes
   ///   5  => operator-boundary probes
+  ///   6  => groupby request-isolation probes
   /// Intended for speculative stream-race triage.
   int32_t debugOperatorFlowDeviceSyncPoint{0};
 
