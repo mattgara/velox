@@ -1593,8 +1593,12 @@ bool runDecimalCpuAggregateDetour(
     return false;
   }
 
-  auto keyRow = cudf_velox::with_arrow::toVeloxColumn(
-      groupbyKeyView, pool, "cpu_detour_key_", stream);
+  auto const hasGroupingKeys = groupbyKeyView.num_columns() > 0;
+  RowVectorPtr keyRow;
+  if (hasGroupingKeys) {
+    keyRow = cudf_velox::with_arrow::toVeloxColumn(
+        groupbyKeyView, pool, "cpu_detour_key_", stream);
+  }
   std::vector<cudf::column_view> requestValues;
   requestValues.reserve(requests.size());
   for (auto const& request : requests) {
@@ -1604,10 +1608,11 @@ bool runDecimalCpuAggregateDetour(
   auto valueRow = cudf_velox::with_arrow::toVeloxColumn(
       valueTable, pool, "cpu_detour_val_", stream);
 
-  if (keyRow->size() != valueRow->size()) {
+  auto const inputRows = valueRow->size();
+  if (hasGroupingKeys && keyRow->size() != inputRows) {
     error = "CPU detour input size mismatch: keyRows=" +
-        std::to_string(keyRow->size()) +
-        " valueRows=" + std::to_string(valueRow->size());
+        std::to_string(keyRow->size()) + " valueRows=" +
+        std::to_string(inputRows);
     return false;
   }
 
@@ -1633,7 +1638,7 @@ bool runDecimalCpuAggregateDetour(
       }
     }
   }
-  SelectivityVector allRows(valueRow->size(), true);
+  SelectivityVector allRows(inputRows, true);
   std::vector<std::unique_ptr<DecodedVector>> decodedValues;
   decodedValues.reserve(requests.size());
   for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
@@ -1643,18 +1648,24 @@ bool runDecimalCpuAggregateDetour(
 
   std::unordered_map<std::string, vector_size_t> keyToGroup;
   std::vector<vector_size_t> representativeRows;
-  representativeRows.reserve(std::min<vector_size_t>(keyRow->size(), 1024));
+  representativeRows.reserve(std::min<vector_size_t>(inputRows, 1024));
   std::vector<std::vector<std::vector<CpuDetourAggState>>> states(
       requests.size());
   for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
     states[requestIdx].resize(requests[requestIdx].aggregations.size());
   }
 
-  for (vector_size_t row = 0; row < keyRow->size(); ++row) {
+  for (vector_size_t row = 0; row < inputRows; ++row) {
     bool includeRow = true;
-    auto const key = buildGroupKeySignature(keyRow, row, nullPolicy, includeRow);
-    if (!includeRow) {
-      continue;
+    std::string key;
+    if (hasGroupingKeys) {
+      key = buildGroupKeySignature(keyRow, row, nullPolicy, includeRow);
+      if (!includeRow) {
+        continue;
+      }
+    } else {
+      // Global aggregation: all rows map to one synthetic key.
+      key = "__global__";
     }
 
     auto [it, inserted] = keyToGroup.emplace(key, representativeRows.size());
@@ -1704,25 +1715,31 @@ bool runDecimalCpuAggregateDetour(
   }
 
   auto const numGroups = representativeRows.size();
-  auto groupingIndices = allocateIndices(numGroups, pool);
-  auto rawGroupingIndices = groupingIndices->asMutable<vector_size_t>();
-  for (auto i = 0; i < numGroups; ++i) {
-    rawGroupingIndices[i] = representativeRows[i];
-  }
+  if (hasGroupingKeys) {
+    auto groupingIndices = allocateIndices(numGroups, pool);
+    auto rawGroupingIndices = groupingIndices->asMutable<vector_size_t>();
+    for (auto i = 0; i < numGroups; ++i) {
+      rawGroupingIndices[i] = representativeRows[i];
+    }
 
-  std::vector<VectorPtr> keyColumns;
-  keyColumns.reserve(keyRow->childrenSize());
-  for (auto const& child : keyRow->children()) {
-    keyColumns.push_back(
-        BaseVector::wrapInDictionary(nullptr, groupingIndices, numGroups, child));
+    std::vector<VectorPtr> keyColumns;
+    keyColumns.reserve(keyRow->childrenSize());
+    for (auto const& child : keyRow->children()) {
+      keyColumns.push_back(BaseVector::wrapInDictionary(
+          nullptr, groupingIndices, numGroups, child));
+    }
+    auto keyOutput = std::make_shared<RowVector>(
+        pool,
+        std::dynamic_pointer_cast<const RowType>(keyRow->type()),
+        nullptr,
+        numGroups,
+        std::move(keyColumns));
+    groupKeysOut = cudf_velox::with_arrow::toCudfTable(keyOutput, pool, stream);
+  } else {
+    // No grouping keys: group-keys table has zero columns.
+    std::vector<std::unique_ptr<cudf::column>> emptyColumns;
+    groupKeysOut = std::make_unique<cudf::table>(std::move(emptyColumns));
   }
-  auto keyOutput = std::make_shared<RowVector>(
-      pool,
-      std::dynamic_pointer_cast<const RowType>(keyRow->type()),
-      nullptr,
-      numGroups,
-      std::move(keyColumns));
-  groupKeysOut = cudf_velox::with_arrow::toCudfTable(keyOutput, pool, stream);
 
   std::vector<VectorPtr> hostAggVectors;
   std::vector<std::string> hostAggNames;
@@ -1791,7 +1808,7 @@ bool runDecimalCpuAggregateDetour(
                     "cpuDecimalDetour.success step="
                  << stepName(step) << " stream="
                  << reinterpret_cast<const void*>(stream.value()) << " inRows="
-                 << keyRow->size() << " outRows=" << numGroups
+                 << inputRows << " outRows=" << numGroups
                  << " requestCount=" << requests.size();
   }
   return true;
