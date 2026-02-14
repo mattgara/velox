@@ -33,22 +33,30 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/type_checks.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -75,6 +83,16 @@ inline int32_t hashAggDebugFakeGroupbyMode() {
       .debugHashAggFakeGroupbyMode;
 }
 
+inline std::string const& hashAggDebugProbeDumpDir() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggProbeDumpDir;
+}
+
+inline int32_t hashAggDebugProbeDumpMaxRows() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggProbeDumpMaxRows;
+}
+
 constexpr int32_t kDeviceSyncGroupGroupByCore{1};
 constexpr int32_t kDeviceSyncGroupDecimalRequest{2};
 constexpr int32_t kDeviceSyncGroupDecimalCompute{3};
@@ -98,6 +116,26 @@ const char* stepName(core::AggregationNode::Step step) {
 
 std::string cudfTypeName(cudf::type_id id) {
   return "type_id_" + std::to_string(static_cast<int>(id));
+}
+
+const char* aggregationKindName(cudf::aggregation::Kind kind) {
+  using Kind = cudf::aggregation::Kind;
+  switch (kind) {
+    case Kind::SUM:
+      return "SUM";
+    case Kind::MIN:
+      return "MIN";
+    case Kind::MAX:
+      return "MAX";
+    case Kind::COUNT_VALID:
+      return "COUNT_VALID";
+    case Kind::COUNT_ALL:
+      return "COUNT_ALL";
+    case Kind::MEAN:
+      return "MEAN";
+    default:
+      return "OTHER";
+  }
 }
 
 const char* cudaErrorNameSafe(cudaError_t err) {
@@ -691,6 +729,369 @@ std::string formatAggregateProbeFailure(
   return failure;
 }
 
+struct FixedWidthColumnHostSnapshot {
+  cudf::type_id typeId{cudf::type_id::EMPTY};
+  int32_t scale{0};
+  int64_t size{0};
+  int64_t elementSize{0};
+  int64_t nullCount{0};
+  std::vector<uint8_t> data;
+  std::vector<uint8_t> nullMask;
+};
+
+struct RequestHostSnapshot {
+  size_t sourceRequestIdx{0};
+  FixedWidthColumnHostSnapshot values;
+  std::vector<cudf::aggregation::Kind> aggregationKinds;
+};
+
+struct AggregateProbeHostSnapshot {
+  bool captured{false};
+  std::string skipReason;
+  std::vector<FixedWidthColumnHostSnapshot> keys;
+  std::vector<RequestHostSnapshot> requests;
+};
+
+std::string sanitizeManifestValue(std::string text) {
+  for (auto& ch : text) {
+    if (ch == '\n' || ch == '\r') {
+      ch = ' ';
+    }
+  }
+  return text;
+}
+
+bool writeBinaryFile(
+    std::filesystem::path const& path,
+    std::vector<uint8_t> const& data,
+    std::string& error) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out.is_open()) {
+    error = "failed to open " + path.string();
+    return false;
+  }
+  if (!data.empty()) {
+    out.write(reinterpret_cast<char const*>(data.data()), data.size());
+    if (!out.good()) {
+      error = "failed to write " + path.string();
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string captureFixedWidthColumnHost(
+    cudf::column_view const& column,
+    FixedWidthColumnHostSnapshot& snapshot) {
+  if (!cudf::is_fixed_width(column.type())) {
+    return "unsupported non-fixed-width type " +
+        std::to_string(static_cast<int>(column.type().id()));
+  }
+  if (column.offset() != 0) {
+    return "unsupported non-zero column offset " +
+        std::to_string(column.offset());
+  }
+  auto const elementSize = cudf::size_of(column.type());
+  if (elementSize <= 0) {
+    return "invalid element size " + std::to_string(elementSize);
+  }
+  snapshot.typeId = column.type().id();
+  snapshot.scale = column.type().scale();
+  snapshot.size = column.size();
+  snapshot.elementSize = elementSize;
+  snapshot.nullCount = column.null_count();
+
+  auto const dataBytes =
+      static_cast<size_t>(snapshot.size) * static_cast<size_t>(elementSize);
+  snapshot.data.assign(dataBytes, 0);
+  if (dataBytes > 0) {
+    auto const* dataPtr = column.data<uint8_t>();
+    if (dataPtr == nullptr) {
+      return "null fixed-width data pointer";
+    }
+    auto const copyStatus = cudaMemcpy(
+        snapshot.data.data(),
+        dataPtr,
+        dataBytes,
+        cudaMemcpyDeviceToHost);
+    if (copyStatus != cudaSuccess) {
+      return "cudaMemcpy data failed: " +
+          std::string(cudaErrorNameSafe(copyStatus)) + "(" +
+          std::to_string(static_cast<int>(copyStatus)) + ")";
+    }
+  }
+
+  if (column.nullable()) {
+    auto const maskBytes =
+        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(column.size()));
+    snapshot.nullMask.assign(maskBytes, 0);
+    if (maskBytes > 0) {
+      auto const* maskPtr = column.null_mask();
+      if (maskPtr == nullptr) {
+        return "nullable column has null null-mask pointer";
+      }
+      auto const copyStatus = cudaMemcpy(
+          snapshot.nullMask.data(),
+          maskPtr,
+          maskBytes,
+          cudaMemcpyDeviceToHost);
+      if (copyStatus != cudaSuccess) {
+        return "cudaMemcpy null-mask failed: " +
+            std::string(cudaErrorNameSafe(copyStatus)) + "(" +
+            std::to_string(static_cast<int>(copyStatus)) + ")";
+      }
+    }
+  }
+  return "";
+}
+
+AggregateProbeHostSnapshot captureAggregateProbeHostSnapshot(
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    std::vector<cudf::groupby::aggregation_request> const& probeRequests,
+    std::vector<size_t> const& requestSubset) {
+  AggregateProbeHostSnapshot snapshot;
+  if (hashAggDebugProbeDumpDir().empty()) {
+    snapshot.skipReason = "probe dump directory is empty";
+    return snapshot;
+  }
+  auto const maxRows = hashAggDebugProbeDumpMaxRows();
+  if (maxRows > 0 && groupbyKeyView.num_rows() > maxRows) {
+    snapshot.skipReason = "row count " +
+        std::to_string(groupbyKeyView.num_rows()) +
+        " exceeds dump max rows " + std::to_string(maxRows);
+    return snapshot;
+  }
+  if (probeRequests.size() != requestSubset.size()) {
+    snapshot.skipReason = "probe request count mismatch";
+    return snapshot;
+  }
+  auto const syncStatus = cudaStreamSynchronize(stream.value());
+  if (syncStatus != cudaSuccess) {
+    snapshot.skipReason = "stream sync before host capture failed: " +
+        std::string(cudaErrorNameSafe(syncStatus)) + "(" +
+        std::to_string(static_cast<int>(syncStatus)) + ")";
+    return snapshot;
+  }
+
+  snapshot.keys.reserve(groupbyKeyView.num_columns());
+  for (int i = 0; i < groupbyKeyView.num_columns(); ++i) {
+    FixedWidthColumnHostSnapshot keySnapshot;
+    auto const captureError =
+        captureFixedWidthColumnHost(groupbyKeyView.column(i), keySnapshot);
+    if (!captureError.empty()) {
+      snapshot.skipReason =
+          "failed to capture grouping key column " + std::to_string(i) + ": " +
+          captureError;
+      snapshot.keys.clear();
+      snapshot.requests.clear();
+      return snapshot;
+    }
+    snapshot.keys.push_back(std::move(keySnapshot));
+  }
+
+  snapshot.requests.reserve(probeRequests.size());
+  for (size_t i = 0; i < probeRequests.size(); ++i) {
+    RequestHostSnapshot requestSnapshot;
+    requestSnapshot.sourceRequestIdx = requestSubset[i];
+    auto const captureError = captureFixedWidthColumnHost(
+        probeRequests[i].values, requestSnapshot.values);
+    if (!captureError.empty()) {
+      snapshot.skipReason = "failed to capture request values " +
+          std::to_string(i) + ": " + captureError;
+      snapshot.keys.clear();
+      snapshot.requests.clear();
+      return snapshot;
+    }
+    requestSnapshot.aggregationKinds.reserve(probeRequests[i].aggregations.size());
+    for (auto const& aggregation : probeRequests[i].aggregations) {
+      if (!aggregation) {
+        snapshot.skipReason =
+            "request " + std::to_string(i) + " has null aggregation pointer";
+        snapshot.keys.clear();
+        snapshot.requests.clear();
+        return snapshot;
+      }
+      requestSnapshot.aggregationKinds.push_back(aggregation->kind);
+    }
+    snapshot.requests.push_back(std::move(requestSnapshot));
+  }
+
+  snapshot.captured = true;
+  return snapshot;
+}
+
+std::string maybeWriteAggregateProbeDump(
+    core::AggregationNode::Step step,
+    size_t probeOrdinal,
+    std::vector<size_t> const& requestSubset,
+    const char* mode,
+    cudf::null_policy nullPolicy,
+    AggregateProbeCallStatus const& status,
+    AggregateProbeHostSnapshot const& snapshot) {
+  if (hashAggDebugProbeDumpDir().empty()) {
+    return "";
+  }
+  if (!snapshot.captured) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "aggregateProbe.dumpSkipped step="
+                 << stepName(step) << " probeOrdinal=" << probeOrdinal
+                 << " subset=" << formatRequestSubset(requestSubset)
+                 << " mode=" << mode
+                 << " reason=" << sanitizeManifestValue(snapshot.skipReason);
+    return "";
+  }
+
+  static std::atomic<uint64_t> dumpCounter{0};
+  auto const tsMicros =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  auto const dumpId = dumpCounter.fetch_add(1);
+  auto const dumpDir =
+      std::filesystem::path(hashAggDebugProbeDumpDir()) /
+      ("hashagg_probe_" + std::to_string(tsMicros) + "_" +
+       std::to_string(dumpId));
+
+  std::error_code ec;
+  std::filesystem::create_directories(dumpDir, ec);
+  if (ec) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "aggregateProbe.dumpFailed step="
+                 << stepName(step) << " probeOrdinal=" << probeOrdinal
+                 << " subset=" << formatRequestSubset(requestSubset)
+                 << " mode=" << mode
+                 << " reason=create_directories failed: " << ec.message()
+                 << " path=" << dumpDir.string();
+    return "";
+  }
+
+  std::string fileError;
+  for (size_t i = 0; i < snapshot.keys.size(); ++i) {
+    auto const dataName = "key_" + std::to_string(i) + ".data.bin";
+    if (!writeBinaryFile(dumpDir / dataName, snapshot.keys[i].data, fileError)) {
+      LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                      "aggregateProbe.dumpFailed step="
+                   << stepName(step) << " reason=" << fileError;
+      return "";
+    }
+    if (!snapshot.keys[i].nullMask.empty()) {
+      auto const maskName = "key_" + std::to_string(i) + ".nullmask.bin";
+      if (!writeBinaryFile(
+              dumpDir / maskName, snapshot.keys[i].nullMask, fileError)) {
+        LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                        "aggregateProbe.dumpFailed step="
+                     << stepName(step) << " reason=" << fileError;
+        return "";
+      }
+    }
+  }
+  for (size_t i = 0; i < snapshot.requests.size(); ++i) {
+    auto const dataName = "request_" + std::to_string(i) + ".data.bin";
+    if (!writeBinaryFile(
+            dumpDir / dataName, snapshot.requests[i].values.data, fileError)) {
+      LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                      "aggregateProbe.dumpFailed step="
+                   << stepName(step) << " reason=" << fileError;
+      return "";
+    }
+    if (!snapshot.requests[i].values.nullMask.empty()) {
+      auto const maskName = "request_" + std::to_string(i) + ".nullmask.bin";
+      if (!writeBinaryFile(
+              dumpDir / maskName,
+              snapshot.requests[i].values.nullMask,
+              fileError)) {
+        LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                        "aggregateProbe.dumpFailed step="
+                     << stepName(step) << " reason=" << fileError;
+        return "";
+      }
+    }
+  }
+
+  auto const manifestPath = dumpDir / "manifest.txt";
+  std::ofstream manifest(manifestPath);
+  if (!manifest.is_open()) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "aggregateProbe.dumpFailed step="
+                 << stepName(step) << " reason=failed to open manifest "
+                 << manifestPath.string();
+    return "";
+  }
+
+  auto const subsetLabel = formatRequestSubset(requestSubset);
+  manifest << "format_version=1\n";
+  manifest << "step=" << stepName(step) << "\n";
+  manifest << "probe_ordinal=" << probeOrdinal << "\n";
+  manifest << "mode=" << mode << "\n";
+  manifest << "subset=" << subsetLabel << "\n";
+  manifest << "null_policy=" << static_cast<int32_t>(nullPolicy) << "\n";
+  manifest << "aggregate_threw=" << (status.aggregateThrew ? 1 : 0) << "\n";
+  manifest << "aggregate_exception="
+           << sanitizeManifestValue(status.aggregateException) << "\n";
+  manifest << "cuda_peek=" << static_cast<int32_t>(status.peekErr) << "\n";
+  manifest << "cuda_stream_sync=" << static_cast<int32_t>(status.streamSyncErr)
+           << "\n";
+  manifest << "cuda_device_sync=" << static_cast<int32_t>(status.deviceSyncErr)
+           << "\n";
+  manifest << "key_count=" << snapshot.keys.size() << "\n";
+  manifest << "request_count=" << snapshot.requests.size() << "\n";
+  for (size_t i = 0; i < snapshot.keys.size(); ++i) {
+    auto const& key = snapshot.keys[i];
+    manifest << "key." << i << ".type_id=" << static_cast<int32_t>(key.typeId)
+             << "\n";
+    manifest << "key." << i << ".scale=" << key.scale << "\n";
+    manifest << "key." << i << ".size=" << key.size << "\n";
+    manifest << "key." << i << ".element_size=" << key.elementSize << "\n";
+    manifest << "key." << i << ".null_count=" << key.nullCount << "\n";
+    manifest << "key." << i << ".data_file=key_" << i << ".data.bin\n";
+    manifest << "key." << i << ".null_mask_file="
+             << (key.nullMask.empty()
+                     ? std::string()
+                     : "key_" + std::to_string(i) + ".nullmask.bin")
+             << "\n";
+  }
+  for (size_t i = 0; i < snapshot.requests.size(); ++i) {
+    auto const& request = snapshot.requests[i];
+    auto const& values = request.values;
+    manifest << "request." << i << ".source_request_idx="
+             << request.sourceRequestIdx << "\n";
+    manifest << "request." << i << ".type_id="
+             << static_cast<int32_t>(values.typeId) << "\n";
+    manifest << "request." << i << ".scale=" << values.scale << "\n";
+    manifest << "request." << i << ".size=" << values.size << "\n";
+    manifest << "request." << i << ".element_size=" << values.elementSize
+             << "\n";
+    manifest << "request." << i << ".null_count=" << values.nullCount << "\n";
+    manifest << "request." << i << ".data_file=request_" << i << ".data.bin\n";
+    manifest << "request." << i << ".null_mask_file="
+             << (values.nullMask.empty()
+                     ? std::string()
+                     : "request_" + std::to_string(i) + ".nullmask.bin")
+             << "\n";
+    manifest << "request." << i
+             << ".aggregation_count=" << request.aggregationKinds.size() << "\n";
+    for (size_t aggIdx = 0; aggIdx < request.aggregationKinds.size(); ++aggIdx) {
+      auto const aggKind = request.aggregationKinds[aggIdx];
+      manifest << "request." << i << ".aggregation_kind." << aggIdx << "="
+               << static_cast<int32_t>(aggKind) << "\n";
+      manifest << "request." << i << ".aggregation_kind_name." << aggIdx << "="
+               << aggregationKindName(aggKind) << "\n";
+    }
+  }
+  manifest << "replay_command=velox_cudf_hashagg_replay --manifest "
+           << manifestPath.string() << "\n";
+  manifest.close();
+  LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+               "aggregateProbe.dumpWritten step="
+            << stepName(step) << " probeOrdinal=" << probeOrdinal
+            << " subset=" << subsetLabel << " mode=" << mode
+            << " dumpDir=" << dumpDir.string()
+            << " replayCommand='velox_cudf_hashagg_replay --manifest "
+            << manifestPath.string() << "'";
+  return dumpDir.string();
+}
+
 const char* fakeGroupbyModeName(int32_t mode) {
   switch (mode) {
     case 1:
@@ -842,6 +1243,11 @@ std::string runGroupByAggregateRequestIsolationProbes(
         tableView.num_rows(),
         static_cast<int64_t>(requestSubset.size()),
         numGroupingKeys);
+    std::optional<AggregateProbeHostSnapshot> copyProbeSnapshot;
+    if (!hashAggDebugProbeDumpDir().empty()) {
+      copyProbeSnapshot = captureAggregateProbeHostSnapshot(
+          stream, groupbyKeyView, copiedProbeRequests.requests, requestSubset);
+    }
     logGroupbyRequestsDebug(step, stream, tableView, copiedProbeRequests.requests);
     auto const copyStatus = runAggregateProbeCall(
         step,
@@ -862,8 +1268,22 @@ std::string runGroupByAggregateRequestIsolationProbes(
         static_cast<int64_t>(requestSubset.size()),
         copyStatus.outputCount >= 0 ? copyStatus.outputCount : -1);
     if (aggregateProbeFailed(copyStatus)) {
-      return formatAggregateProbeFailure(
+      auto failure = formatAggregateProbeFailure(
           probeOrdinal, subsetLabel, "copy", copyStatus);
+      if (copyProbeSnapshot.has_value()) {
+        auto const dumpDir = maybeWriteAggregateProbeDump(
+            step,
+            probeOrdinal,
+            requestSubset,
+            "copy",
+            nullPolicy,
+            copyStatus,
+            *copyProbeSnapshot);
+        if (!dumpDir.empty()) {
+          failure += " dumpDir=" + dumpDir;
+        }
+      }
+      return failure;
     }
 
     maybeDeviceSyncProbe(
@@ -875,6 +1295,11 @@ std::string runGroupByAggregateRequestIsolationProbes(
         tableView.num_rows(),
         static_cast<int64_t>(requestSubset.size()),
         numGroupingKeys);
+    std::optional<AggregateProbeHostSnapshot> viewProbeSnapshot;
+    if (!hashAggDebugProbeDumpDir().empty()) {
+      viewProbeSnapshot = captureAggregateProbeHostSnapshot(
+          stream, groupbyKeyView, viewProbeRequests, requestSubset);
+    }
     logGroupbyRequestsDebug(step, stream, tableView, viewProbeRequests);
     auto const viewStatus = runAggregateProbeCall(
         step,
@@ -895,8 +1320,22 @@ std::string runGroupByAggregateRequestIsolationProbes(
         static_cast<int64_t>(requestSubset.size()),
         viewStatus.outputCount >= 0 ? viewStatus.outputCount : -1);
     if (aggregateProbeFailed(viewStatus)) {
-      return formatAggregateProbeFailure(
+      auto failure = formatAggregateProbeFailure(
           probeOrdinal, subsetLabel, "view", viewStatus);
+      if (viewProbeSnapshot.has_value()) {
+        auto const dumpDir = maybeWriteAggregateProbeDump(
+            step,
+            probeOrdinal,
+            requestSubset,
+            "view",
+            nullPolicy,
+            viewStatus,
+            *viewProbeSnapshot);
+        if (!dumpDir.empty()) {
+          failure += " dumpDir=" + dumpDir;
+        }
+      }
+      return failure;
     }
   }
 

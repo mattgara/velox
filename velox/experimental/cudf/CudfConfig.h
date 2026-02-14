@@ -35,6 +35,10 @@ struct CudfConfig {
       "cudf.debug_operator_flow_device_sync_point"};
   static constexpr const char* kCudfDebugHashAggFakeGroupbyMode{
       "cudf.debug_hashagg_fake_groupby_mode"};
+  static constexpr const char* kCudfDebugHashAggProbeDumpDir{
+      "cudf.debug_hashagg_probe_dump_dir"};
+  static constexpr const char* kCudfDebugHashAggProbeDumpMaxRows{
+      "cudf.debug_hashagg_probe_dump_max_rows"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -93,6 +97,15 @@ struct CudfConfig {
   /// Applied only to final/single groupby steps (partial/intermediate keep
   /// real aggregation to preserve valid intermediate decimal state encoding).
   int32_t debugHashAggFakeGroupbyMode{0};
+
+  /// Optional: when non-empty, request-isolation probe failures dump a
+  /// standalone replay bundle under this directory.
+  std::string debugHashAggProbeDumpDir;
+
+  /// Optional max input rows allowed for probe bundle dumps:
+  ///   0 => no row limit
+  ///  >0 => skip dump when row count exceeds this threshold
+  int32_t debugHashAggProbeDumpMaxRows{50000};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

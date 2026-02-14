@@ -561,6 +561,13 @@ void CudfConfig::initialize(
     debugHashAggFakeGroupbyMode =
         folly::to<int32_t>(config[kCudfDebugHashAggFakeGroupbyMode]);
   }
+  if (config.find(kCudfDebugHashAggProbeDumpDir) != config.end()) {
+    debugHashAggProbeDumpDir = config[kCudfDebugHashAggProbeDumpDir];
+  }
+  if (config.find(kCudfDebugHashAggProbeDumpMaxRows) != config.end()) {
+    debugHashAggProbeDumpMaxRows =
+        folly::to<int32_t>(config[kCudfDebugHashAggProbeDumpMaxRows]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }
@@ -585,7 +592,7 @@ void CudfConfig::initialize(
   }
   if (debugEnabled || debugExprTree || debugOperatorFlow ||
       debugOperatorFlowSync || debugOperatorFlowDeviceSyncPoint != 0 ||
-      debugHashAggFakeGroupbyMode != 0) {
+      debugHashAggFakeGroupbyMode != 0 || !debugHashAggProbeDumpDir.empty()) {
     LOG(INFO) << "[CudfConfig] enabled=" << enabled
               << " debugEnabled=" << debugEnabled
               << " debugExprTree=" << debugExprTree
@@ -595,6 +602,9 @@ void CudfConfig::initialize(
               << debugOperatorFlowDeviceSyncPoint
               << " debugHashAggFakeGroupbyMode="
               << debugHashAggFakeGroupbyMode
+              << " debugHashAggProbeDumpDir=" << debugHashAggProbeDumpDir
+              << " debugHashAggProbeDumpMaxRows="
+              << debugHashAggProbeDumpMaxRows
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }
