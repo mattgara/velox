@@ -34,12 +34,14 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/types.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <exception>
 #include <string>
 
@@ -125,13 +127,39 @@ void logColumnViewDebug(
   if (!hashAggDebugEnabled()) {
     return;
   }
+  auto const* headPtr = column.head<void>();
+  auto const* nullMaskPtr = column.null_mask();
+  auto const headAddr = reinterpret_cast<std::uintptr_t>(headPtr);
+  auto const nullMaskAddr = reinterpret_cast<std::uintptr_t>(nullMaskPtr);
+  int64_t elementSize = -1;
+  std::uintptr_t dataAddr = 0;
+  if (cudf::is_fixed_width(column.type())) {
+    elementSize = static_cast<int64_t>(cudf::size_of(column.type()));
+    if (headPtr != nullptr) {
+      dataAddr = headAddr +
+          static_cast<std::uintptr_t>(column.offset()) *
+              static_cast<std::uintptr_t>(elementSize);
+    }
+  }
   LOG(INFO) << "[CudfHashAggDebug] stage=" << stage << " step=" << stepName(step)
             << " stream=" << reinterpret_cast<const void*>(stream.value())
             << " requestIdx=" << requestIdx << " depth=" << depth
             << " childIdx=" << childIdx << " size=" << column.size()
             << " nullCount=" << column.null_count() << " offset="
             << column.offset() << " numChildren=" << column.num_children()
-            << " typeId=" << cudfTypeName(column.type().id());
+            << " typeId=" << cudfTypeName(column.type().id())
+            << " headPtr=" << headPtr
+            << " dataPtr="
+            << (dataAddr == 0 ? nullptr : reinterpret_cast<void const*>(dataAddr))
+            << " nullMaskPtr=" << nullMaskPtr << " elementSize=" << elementSize
+            << " headMod16="
+            << (headPtr == nullptr ? -1 : static_cast<int64_t>(headAddr % 16))
+            << " dataMod16="
+            << (dataAddr == 0 ? -1 : static_cast<int64_t>(dataAddr % 16))
+            << " nullMaskMod16="
+            << (nullMaskPtr == nullptr
+                    ? -1
+                    : static_cast<int64_t>(nullMaskAddr % 16));
   constexpr int kMaxDepth = 5;
   if (depth >= kMaxDepth) {
     return;
@@ -1592,8 +1620,30 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                       : cudf::null_policy::INCLUDE);
 
   std::vector<cudf::groupby::aggregation_request> requests;
-  for (auto& aggregator : aggregators) {
+  for (size_t aggregatorIdx = 0; aggregatorIdx < aggregators.size();
+       ++aggregatorIdx) {
+    auto& aggregator = aggregators[aggregatorIdx];
+    VELOX_CHECK_NOT_NULL(aggregator);
+    auto const requestsBefore = requests.size();
+    if (hashAggDebugEnabled()) {
+      LOG(INFO)
+          << "[CudfHashAggDebug] stage=HashAgg.addGroupbyRequest.dispatch step="
+          << stepName(step_) << " stream="
+          << reinterpret_cast<const void*>(stream.value()) << " aggregatorIdx="
+          << aggregatorIdx
+          << " aggregatorKind=" << static_cast<int>(aggregator->kind)
+          << " aggregatorInputIndex=" << aggregator->inputIndex
+          << " requestsBefore=" << requestsBefore;
+    }
     aggregator->addGroupbyRequest(tableView, requests, stream);
+    if (hashAggDebugEnabled()) {
+      LOG(INFO)
+          << "[CudfHashAggDebug] stage=HashAgg.addGroupbyRequest.added step="
+          << stepName(step_) << " stream="
+          << reinterpret_cast<const void*>(stream.value()) << " aggregatorIdx="
+          << aggregatorIdx << " requestsAfter=" << requests.size()
+          << " requestDelta=" << (requests.size() - requestsBefore);
+    }
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
   logHashAggDebug(
