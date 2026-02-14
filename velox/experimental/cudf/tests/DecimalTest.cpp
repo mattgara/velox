@@ -51,6 +51,15 @@ int64_t computeAvgRaw(const std::vector<int64_t>& values) {
   return static_cast<int64_t>(avg);
 }
 
+void synchronizeCudaDeviceChecked() {
+  auto const status = cudaDeviceSynchronize();
+  VELOX_CHECK(
+      status == cudaSuccess,
+      "cudaDeviceSynchronize failed: {} ({})",
+      cudaGetErrorString(status),
+      static_cast<int>(status));
+}
+
 constexpr int kBitsPerWord = 8 * sizeof(cudf::bitmask_type);
 
 std::pair<rmm::device_buffer, cudf::size_type> makeNullMask(
@@ -322,6 +331,206 @@ TEST_F(CudfDecimalTest, decimalQ3ShapeAggregationTopN) {
           "GROUP BY c0, c3, c4 "
           "ORDER BY revenue DESC, c3 "
           "LIMIT 100");
+}
+
+// Local stress reproducer for grouped decimal AVG using partial/final state
+// transitions. Run manually with:
+//   velox_cudf_decimal_test
+//   --gtest_filter=CudfDecimalTest.DISABLED_decimalAvgGroupedPartialFinalStress
+//   --gtest_also_run_disabled_tests
+TEST_F(CudfDecimalTest, DISABLED_decimalAvgGroupedPartialFinalStress) {
+  constexpr int32_t numBatches = 12;
+  constexpr vector_size_t batchSize = 8'192;
+  constexpr int32_t numGroups = 20'031;
+
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(numBatches);
+  for (int32_t batch = 0; batch < numBatches; ++batch) {
+    auto partkey = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int64_t>((batch * batchSize + row) % numGroups) + 1;
+    });
+    auto quantity = makeFlatVector<int64_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          // 1.00 to 50.99 at scale 2.
+          return static_cast<int64_t>((row * 37 + batch * 101) % 5000) + 100;
+        },
+        nullptr,
+        DECIMAL(15, 2));
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{partkey, quantity}));
+  }
+
+  auto makePlan = [&]() {
+    return exec::test::PlanBuilder()
+        .values(vectors)
+        .partialAggregation({"c0"}, {"avg(c1) AS avg_q"})
+        .finalAggregation()
+        .project(
+            {"c0",
+             "avg_q",
+             "CAST(CAST('0.2' AS DECIMAL(2, 1)) * avg_q AS DECIMAL(18, 3)) "
+             "AS threshold"})
+        .orderBy({"c0"}, false)
+        .planNode();
+  };
+
+  unregisterCudf();
+  auto expected = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                      .copyResults(pool());
+  registerCudf();
+
+  // Repeat to increase chances of surfacing stream/state races.
+  for (int32_t iter = 0; iter < 10; ++iter) {
+    {
+      auto actual = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                        .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+    // Drain asynchronous work so stream-ordered frees can be reclaimed before
+    // the next iteration. This avoids stress OOM masking correctness bugs.
+    synchronizeCudaDeviceChecked();
+  }
+}
+
+// DECIMAL128 variant of the grouped AVG stress reproducer.
+TEST_F(CudfDecimalTest, DISABLED_decimal128AvgGroupedPartialFinalStress) {
+  constexpr int32_t numBatches = 12;
+  constexpr vector_size_t batchSize = 8'192;
+  constexpr int32_t numGroups = 20'031;
+  constexpr int64_t kScaleFactor = 100'000'000; // 1e8, keeps values in 1.00-50.99
+
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(numBatches);
+  for (int32_t batch = 0; batch < numBatches; ++batch) {
+    auto partkey = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int64_t>((batch * batchSize + row) % numGroups) + 1;
+    });
+    auto quantity = makeFlatVector<int128_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          auto cents = static_cast<int64_t>((row * 37 + batch * 101) % 5000) + 100;
+          // Scale-10 DECIMAL(38,10) raw value.
+          return static_cast<int128_t>(cents) * static_cast<int128_t>(kScaleFactor);
+        },
+        nullptr,
+        DECIMAL(38, 10));
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{partkey, quantity}));
+  }
+
+  auto makePlan = [&]() {
+    return exec::test::PlanBuilder()
+        .values(vectors)
+        .partialAggregation({"c0"}, {"avg(c1) AS avg_q"})
+        .finalAggregation()
+        .orderBy({"c0"}, false)
+        .planNode();
+  };
+
+  unregisterCudf();
+  auto expected = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                      .copyResults(pool());
+  registerCudf();
+
+  for (int32_t iter = 0; iter < 10; ++iter) {
+    {
+      auto actual = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                        .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+    synchronizeCudaDeviceChecked();
+  }
+}
+
+// Grouped AVG in single-step aggregation (no partial/final split).
+TEST_F(CudfDecimalTest, DISABLED_decimal128AvgGroupedSingleStepStress) {
+  constexpr int32_t numBatches = 12;
+  constexpr vector_size_t batchSize = 8'192;
+  constexpr int32_t numGroups = 20'031;
+  constexpr int64_t kScaleFactor = 100'000'000; // scale-10 raw multiplier
+
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(numBatches);
+  for (int32_t batch = 0; batch < numBatches; ++batch) {
+    auto partkey = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int64_t>((batch * batchSize + row) % numGroups) + 1;
+    });
+    auto quantity = makeFlatVector<int128_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          auto cents = static_cast<int64_t>((row * 37 + batch * 101) % 5000) + 100;
+          return static_cast<int128_t>(cents) * static_cast<int128_t>(kScaleFactor);
+        },
+        nullptr,
+        DECIMAL(38, 10));
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{partkey, quantity}));
+  }
+
+  auto makePlan = [&]() {
+    return exec::test::PlanBuilder()
+        .values(vectors)
+        .singleAggregation({"c0"}, {"avg(c1) AS avg_q"})
+        .orderBy({"c0"}, false)
+        .planNode();
+  };
+
+  unregisterCudf();
+  auto expected = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                      .copyResults(pool());
+  registerCudf();
+
+  for (int32_t iter = 0; iter < 10; ++iter) {
+    {
+      auto actual = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                        .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+    synchronizeCudaDeviceChecked();
+  }
+}
+
+// Global AVG in single-step aggregation (reduce path, no group-by keys).
+TEST_F(CudfDecimalTest, DISABLED_decimal128AvgGlobalSingleStepStress) {
+  constexpr int32_t numBatches = 16;
+  constexpr vector_size_t batchSize = 16'384;
+  constexpr int64_t kScaleFactor = 100'000'000; // scale-10 raw multiplier
+
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(numBatches);
+  for (int32_t batch = 0; batch < numBatches; ++batch) {
+    auto quantity = makeFlatVector<int128_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          auto cents = static_cast<int64_t>((row * 53 + batch * 97) % 5000) + 100;
+          return static_cast<int128_t>(cents) * static_cast<int128_t>(kScaleFactor);
+        },
+        [&](vector_size_t row) {
+          // Include nulls to exercise count-valid behavior in avg.
+          return ((row + batch) % 29) == 0;
+        },
+        DECIMAL(38, 10));
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{quantity}));
+  }
+
+  auto makePlan = [&]() {
+    return exec::test::PlanBuilder()
+        .values(vectors)
+        .singleAggregation({}, {"avg(c0) AS avg_q"})
+        .planNode();
+  };
+
+  unregisterCudf();
+  auto expected = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                      .copyResults(pool());
+  registerCudf();
+
+  for (int32_t iter = 0; iter < 20; ++iter) {
+    {
+      auto actual = facebook::velox::exec::test::AssertQueryBuilder(makePlan())
+                        .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+    synchronizeCudaDeviceChecked();
+  }
 }
 
 TEST_F(CudfDecimalTest, decimal64And128ArithmeticAndComparison) {

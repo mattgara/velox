@@ -122,7 +122,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests) override {
-    addGroupbyRequest(tbl, requests, cudf::get_default_stream());
+    VELOX_FAIL(
+        "DecimalSumOrAvgAggregator requires stream-aware addGroupbyRequest");
   }
 
   void addGroupbyRequest(
@@ -1087,12 +1088,6 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   for (auto& aggregator : aggregators) {
     aggregator->addGroupbyRequest(tableView, requests, stream);
   }
-
-  // Some decimal aggregation paths deserialize intermediate states on the
-  // default stream while this operator executes groupby on 'stream'. Ensure
-  // those writes are visible before launching groupby aggregate kernels.
-  cudf::detail::join_streams(
-      std::vector<rmm::cuda_stream_view>{cudf::get_default_stream()}, stream);
 
   auto [groupKeys, results] = groupByOwner.aggregate(requests, stream);
   // flatten the results
