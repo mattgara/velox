@@ -43,6 +43,13 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
     virtual void addGroupbyRequest(
         cudf::table_view const& tbl,
         std::vector<cudf::groupby::aggregation_request>& requests) = 0;
+    // Stream-aware overload. Default behavior delegates to the legacy API.
+    virtual void addGroupbyRequest(
+        cudf::table_view const& tbl,
+        std::vector<cudf::groupby::aggregation_request>& requests,
+        rmm::cuda_stream_view /*stream*/) {
+      addGroupbyRequest(tbl, requests);
+    }
 
     virtual std::unique_ptr<cudf::column> doReduce(
         cudf::table_view const& input,

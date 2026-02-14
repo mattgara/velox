@@ -122,13 +122,20 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests) override {
+    addGroupbyRequest(tbl, requests, cudf::get_default_stream());
+  }
+
+  void addGroupbyRequest(
+      cudf::table_view const& tbl,
+      std::vector<cudf::groupby::aggregation_request>& requests,
+      rmm::cuda_stream_view stream) override {
     if (step == core::AggregationNode::Step::kIntermediate &&
         tbl.column(inputIndex).type().id() == cudf::type_id::STRING) {
       auto scale = resultType->isDecimal()
           ? getDecimalPrecisionScale(*resultType).second
           : 0;
       auto decoded = cudf_velox::deserializeDecimalSumStateWithCount(
-          tbl.column(inputIndex), scale, cudf::get_default_stream());
+          tbl.column(inputIndex), scale, stream);
       decodedSum_ = std::move(decoded.sum);
       decodedCount_ = std::move(decoded.count);
 
@@ -151,7 +158,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       auto scale = getDecimalPrecisionScale(*resultType).second;
       if (isAvg_) {
         auto decoded = cudf_velox::deserializeDecimalSumStateWithCount(
-            tbl.column(inputIndex), scale, cudf::get_default_stream());
+            tbl.column(inputIndex), scale, stream);
         decodedSum_ = std::move(decoded.sum);
         decodedCount_ = std::move(decoded.count);
 
@@ -171,7 +178,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         auto& request = requests.emplace_back();
         sumIdx_ = requests.size() - 1;
         decodedSum_ = cudf_velox::deserializeDecimalSumState(
-            tbl.column(inputIndex), scale, cudf::get_default_stream());
+            tbl.column(inputIndex), scale, stream);
         request.values = decodedSum_->view();
         request.aggregations.push_back(
             cudf::make_sum_aggregation<cudf::groupby_aggregation>());
@@ -1078,7 +1085,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   std::vector<cudf::groupby::aggregation_request> requests;
   for (auto& aggregator : aggregators) {
-    aggregator->addGroupbyRequest(tableView, requests);
+    aggregator->addGroupbyRequest(tableView, requests, stream);
   }
 
   // Some decimal aggregation paths deserialize intermediate states on the
