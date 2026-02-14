@@ -17,7 +17,6 @@ add_executable(velox_cudf_assign_unique_id_test Main.cpp AssignUniqueIdTest.cpp)
 add_executable(velox_cudf_config_test Main.cpp ConfigTest.cpp)
 add_executable(velox_cudf_expression_selection_test Main.cpp ExpressionEvaluatorSelectionTest.cpp)
 add_executable(velox_cudf_decimal_test Main.cpp DecimalTest.cpp)
-add_executable(velox_cudf_hashagg_replay HashAggReplay.cpp)
 add_executable(velox_cudf_filter_project_test Main.cpp FilterProjectTest.cpp)
 add_executable(velox_cudf_hash_join_test HashJoinTest.cpp Main.cpp)
 add_executable(velox_cudf_limit_test Main.cpp LimitTest.cpp)
@@ -227,8 +226,6 @@ target_link_libraries(
   gtest
   gtest_main
 )
-
-target_link_libraries(velox_cudf_hashagg_replay velox_cudf_exec)
 
 target_link_libraries(
   velox_cudf_filter_project_test
