@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 #include <thrust/iterator/counting_iterator.h>
 
 namespace facebook::velox::cudf_velox {
@@ -42,6 +43,7 @@ struct DecimalSumStateDevice {
 };
 
 static_assert(sizeof(DecimalSumStateDevice) == kStateSize);
+static_assert(std::is_trivially_copyable_v<DecimalSumStateDevice>);
 
 __device__ __forceinline__ void splitToWords(
     int64_t value,
@@ -78,15 +80,20 @@ __global__ void packStateKernel(
     return;
   }
   int32_t offset = offsets[idx];
-  auto* state =
-      reinterpret_cast<DecimalSumStateDevice*>(chars + offset);
+  DecimalSumStateDevice state{};
   int64_t upper;
   uint64_t lower;
   splitToWords(sums[idx], upper, lower);
-  state->count = counts[idx];
-  state->overflow = 0;
-  state->lower = lower;
-  state->upper = upper;
+  state.count = counts[idx];
+  state.overflow = 0;
+  state.lower = lower;
+  state.upper = upper;
+  auto const* src = reinterpret_cast<uint8_t const*>(&state);
+  auto* dst = chars + offset;
+#pragma unroll
+  for (int32_t i = 0; i < kStateSize; ++i) {
+    dst[i] = src[i];
+  }
 }
 
 __global__ void unpackStateKernel(
@@ -100,10 +107,15 @@ __global__ void unpackStateKernel(
     return;
   }
   int32_t offset = offsets[idx];
-  auto* state =
-      reinterpret_cast<const DecimalSumStateDevice*>(chars + offset);
-  counts[idx] = state->count;
-  sums[idx] = (static_cast<__int128_t>(state->upper) << 64) | state->lower;
+  DecimalSumStateDevice state{};
+  auto const* src = chars + offset;
+  auto* dst = reinterpret_cast<uint8_t*>(&state);
+#pragma unroll
+  for (int32_t i = 0; i < kStateSize; ++i) {
+    dst[i] = src[i];
+  }
+  counts[idx] = state.count;
+  sums[idx] = (static_cast<__int128_t>(state.upper) << 64) | state.lower;
 }
 
 template <typename SumT>
