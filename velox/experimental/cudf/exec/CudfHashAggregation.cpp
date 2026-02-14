@@ -2326,7 +2326,19 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
   auto const fakeGroupbyMode = hashAggDebugFakeGroupbyMode();
-  if (fakeGroupbyMode != 0) {
+  auto const fakeModeSupportedStep = (step_ == core::AggregationNode::Step::kFinal ||
+                                      step_ == core::AggregationNode::Step::kSingle);
+  if (fakeGroupbyMode != 0 && !fakeModeSupportedStep) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "fakeAggregate.skipUnsupportedStep step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << requests.size() << " groupingKeys="
+                 << numGroupingKeys << " fakeMode=" << fakeGroupbyMode << "("
+                 << fakeGroupbyModeName(fakeGroupbyMode) << ")";
+  }
+  if (fakeGroupbyMode != 0 && fakeModeSupportedStep) {
     auto const fakeNumRows = tableView.num_rows() > 0 ? 1 : 0;
     LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
                     "fakeAggregate.begin step="

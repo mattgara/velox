@@ -90,6 +90,8 @@ struct CudfConfig {
   ///   0 => disabled
   ///   1 => output constant zero/default values
   ///   2 => output constant one for primitive numerics where supported
+  /// Applied only to final/single groupby steps (partial/intermediate keep
+  /// real aggregation to preserve valid intermediate decimal state encoding).
   int32_t debugHashAggFakeGroupbyMode{0};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
