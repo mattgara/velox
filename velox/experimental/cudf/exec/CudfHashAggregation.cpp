@@ -28,6 +28,10 @@
 #include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 #include "velox/type/Type.h"
+#include "velox/vector/BaseVector.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/FlatVector.h"
+#include "velox/vector/SimpleVector.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -91,6 +95,11 @@ inline std::string const& hashAggDebugProbeDumpDir() {
 inline int32_t hashAggDebugProbeDumpMaxRows() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
       .debugHashAggProbeDumpMaxRows;
+}
+
+inline int32_t hashAggDebugDecimalCpuAggregateMode() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggDecimalCpuAggregateMode;
 }
 
 constexpr int32_t kDeviceSyncGroupGroupByCore{1};
@@ -1347,6 +1356,357 @@ std::string runGroupByAggregateRequestIsolationProbes(
             << " exhaustive=" << (exhaustive ? 1 : 0)
             << " status=all-pass";
   return "";
+}
+
+bool hasDecimalGroupbyRequest(
+    std::vector<cudf::groupby::aggregation_request> const& requests) {
+  return std::any_of(requests.begin(), requests.end(), [](auto const& request) {
+    auto const typeId = request.values.type().id();
+    return typeId == cudf::type_id::DECIMAL64 ||
+        typeId == cudf::type_id::DECIMAL128;
+  });
+}
+
+bool isCpuDetourSupportedAggKind(cudf::aggregation::Kind kind) {
+  return kind == cudf::aggregation::SUM || kind == cudf::aggregation::COUNT_VALID ||
+      kind == cudf::aggregation::COUNT_ALL;
+}
+
+std::string cpuDetourAggKindName(cudf::aggregation::Kind kind) {
+  switch (kind) {
+    case cudf::aggregation::SUM:
+      return "SUM";
+    case cudf::aggregation::COUNT_VALID:
+      return "COUNT_VALID";
+    case cudf::aggregation::COUNT_ALL:
+      return "COUNT_ALL";
+    default:
+      return "kind_" + std::to_string(static_cast<int>(kind));
+  }
+}
+
+std::string buildGroupKeySignature(
+    RowVectorPtr const& keys,
+    vector_size_t row,
+    cudf::null_policy nullPolicy,
+    bool& includeRow) {
+  includeRow = true;
+  std::string key;
+  key.reserve(keys->childrenSize() * 16);
+  for (auto i = 0; i < keys->childrenSize(); ++i) {
+    auto const& child = keys->childAt(i);
+    if (child->isNullAt(row)) {
+      if (nullPolicy == cudf::null_policy::EXCLUDE) {
+        includeRow = false;
+        return "";
+      }
+      key += "N;";
+      continue;
+    }
+    auto const value = child->toString(row);
+    key += "V";
+    key += std::to_string(value.size());
+    key += ":";
+    key += value;
+    key += ";";
+  }
+  return key;
+}
+
+bool readIntegralLikeValue(
+    DecodedVector const& vector,
+    TypeKind kind,
+    vector_size_t row,
+    int128_t& out,
+    std::string& error) {
+  switch (kind) {
+    case TypeKind::TINYINT:
+      out = vector.valueAt<int8_t>(row);
+      return true;
+    case TypeKind::SMALLINT:
+      out = vector.valueAt<int16_t>(row);
+      return true;
+    case TypeKind::INTEGER:
+      out = vector.valueAt<int32_t>(row);
+      return true;
+    case TypeKind::BIGINT:
+      out = vector.valueAt<int64_t>(row);
+      return true;
+    case TypeKind::HUGEINT:
+      out = vector.valueAt<int128_t>(row);
+      return true;
+    default:
+      error = "unsupported request value type for CPU detour: " +
+          std::string(TypeKindName::toName(kind));
+      return false;
+  }
+}
+
+struct CpuDetourAggState {
+  int128_t sum{0};
+  int64_t count{0};
+  bool sumSeen{false};
+};
+
+VectorPtr makeCpuDetourSumVector(
+    TypePtr const& type,
+    std::vector<CpuDetourAggState> const& states,
+    memory::MemoryPool* pool,
+    std::string& error) {
+  auto out = BaseVector::create(type, states.size(), pool);
+  switch (type->kind()) {
+    case TypeKind::BIGINT: {
+      auto flat = out->asFlatVector<int64_t>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<int64_t>(states[i].sum));
+        }
+      }
+      return out;
+    }
+    case TypeKind::HUGEINT: {
+      auto flat = out->asFlatVector<int128_t>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, states[i].sum);
+        }
+      }
+      return out;
+    }
+    default:
+      error =
+          "unsupported SUM output type for CPU detour: " + type->toString();
+      return nullptr;
+  }
+}
+
+VectorPtr makeCpuDetourCountVector(
+    std::vector<CpuDetourAggState> const& states,
+    memory::MemoryPool* pool) {
+  auto out = BaseVector::create(BIGINT(), states.size(), pool);
+  auto flat = out->asFlatVector<int64_t>();
+  for (auto i = 0; i < states.size(); ++i) {
+    flat->set(i, states[i].count);
+  }
+  return out;
+}
+
+bool runDecimalCpuAggregateDetour(
+    memory::MemoryPool* pool,
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    std::unique_ptr<cudf::table>& groupKeysOut,
+    std::vector<cudf::groupby::aggregation_result>& resultsOut,
+    std::string& error) {
+  if (requests.empty()) {
+    error = "CPU detour requires at least one aggregation request";
+    return false;
+  }
+
+  auto keyRow = cudf_velox::with_arrow::toVeloxColumn(
+      groupbyKeyView, pool, "cpu_detour_key_", stream);
+  std::vector<cudf::column_view> requestValues;
+  requestValues.reserve(requests.size());
+  for (auto const& request : requests) {
+    requestValues.push_back(request.values);
+  }
+  cudf::table_view valueTable(requestValues);
+  auto valueRow = cudf_velox::with_arrow::toVeloxColumn(
+      valueTable, pool, "cpu_detour_val_", stream);
+
+  if (keyRow->size() != valueRow->size()) {
+    error = "CPU detour input size mismatch: keyRows=" +
+        std::to_string(keyRow->size()) +
+        " valueRows=" + std::to_string(valueRow->size());
+    return false;
+  }
+
+  for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+    auto const valueType = valueRow->childAt(requestIdx)->type()->kind();
+    if (valueType != TypeKind::BIGINT && valueType != TypeKind::HUGEINT &&
+        valueType != TypeKind::INTEGER && valueType != TypeKind::SMALLINT &&
+        valueType != TypeKind::TINYINT) {
+      error = "CPU detour unsupported request value type at request[" +
+          std::to_string(requestIdx) +
+          "]: " + valueRow->childAt(requestIdx)->type()->toString();
+      return false;
+    }
+    for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
+         ++aggIdx) {
+      auto const kind = requests[requestIdx].aggregations[aggIdx]->kind;
+      if (!isCpuDetourSupportedAggKind(kind)) {
+        error = "CPU detour unsupported aggregation kind at request[" +
+            std::to_string(requestIdx) + "] agg[" + std::to_string(aggIdx) +
+            "]: " + cpuDetourAggKindName(kind);
+        return false;
+      }
+    }
+  }
+  SelectivityVector allRows(valueRow->size(), true);
+  std::vector<std::unique_ptr<DecodedVector>> decodedValues;
+  decodedValues.reserve(requests.size());
+  for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+    decodedValues.push_back(std::make_unique<DecodedVector>(
+        *valueRow->childAt(requestIdx), allRows));
+  }
+
+  std::unordered_map<std::string, vector_size_t> keyToGroup;
+  std::vector<vector_size_t> representativeRows;
+  representativeRows.reserve(std::min<vector_size_t>(keyRow->size(), 1024));
+  std::vector<std::vector<std::vector<CpuDetourAggState>>> states(
+      requests.size());
+  for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+    states[requestIdx].resize(requests[requestIdx].aggregations.size());
+  }
+
+  for (vector_size_t row = 0; row < keyRow->size(); ++row) {
+    bool includeRow = true;
+    auto const key = buildGroupKeySignature(keyRow, row, nullPolicy, includeRow);
+    if (!includeRow) {
+      continue;
+    }
+
+    auto [it, inserted] = keyToGroup.emplace(key, representativeRows.size());
+    auto const groupIdx = inserted ? representativeRows.size() : it->second;
+    if (inserted) {
+      representativeRows.push_back(row);
+      for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+        for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
+             ++aggIdx) {
+          states[requestIdx][aggIdx].emplace_back();
+        }
+      }
+    }
+
+    for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+      auto const valueKind = valueRow->childAt(requestIdx)->type()->kind();
+      auto const& decoded = *decodedValues[requestIdx];
+      auto const isNull = decoded.isNullAt(row);
+      int128_t value = 0;
+      if (!isNull &&
+          !readIntegralLikeValue(decoded, valueKind, row, value, error)) {
+        return false;
+      }
+      for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
+           ++aggIdx) {
+        auto const kind = requests[requestIdx].aggregations[aggIdx]->kind;
+        auto& state = states[requestIdx][aggIdx][groupIdx];
+        if (kind == cudf::aggregation::SUM) {
+          if (!isNull) {
+            state.sum += value;
+            state.sumSeen = true;
+          }
+        } else if (kind == cudf::aggregation::COUNT_ALL) {
+          ++state.count;
+        } else {
+          // COUNT_VALID
+          if (!isNull) {
+            ++state.count;
+          }
+        }
+      }
+    }
+  }
+
+  auto const numGroups = representativeRows.size();
+  auto groupingIndices = allocateIndices(numGroups, pool);
+  auto rawGroupingIndices = groupingIndices->asMutable<vector_size_t>();
+  for (auto i = 0; i < numGroups; ++i) {
+    rawGroupingIndices[i] = representativeRows[i];
+  }
+
+  std::vector<VectorPtr> keyColumns;
+  keyColumns.reserve(keyRow->childrenSize());
+  for (auto const& child : keyRow->children()) {
+    keyColumns.push_back(
+        BaseVector::wrapInDictionary(nullptr, groupingIndices, numGroups, child));
+  }
+  auto keyOutput = std::make_shared<RowVector>(
+      pool,
+      std::dynamic_pointer_cast<const RowType>(keyRow->type()),
+      nullptr,
+      numGroups,
+      std::move(keyColumns));
+  groupKeysOut = cudf_velox::with_arrow::toCudfTable(keyOutput, pool, stream);
+
+  std::vector<VectorPtr> hostAggVectors;
+  std::vector<std::string> hostAggNames;
+  std::vector<TypePtr> hostAggTypes;
+  hostAggVectors.reserve(requests.size());
+  hostAggNames.reserve(requests.size());
+  hostAggTypes.reserve(requests.size());
+  for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+    for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
+         ++aggIdx) {
+      auto const kind = requests[requestIdx].aggregations[aggIdx]->kind;
+      VectorPtr out;
+      if (kind == cudf::aggregation::SUM) {
+        out = makeCpuDetourSumVector(
+            valueRow->childAt(requestIdx)->type(),
+            states[requestIdx][aggIdx],
+            pool,
+            error);
+        if (!out) {
+          return false;
+        }
+      } else {
+        out = makeCpuDetourCountVector(states[requestIdx][aggIdx], pool);
+      }
+      hostAggTypes.push_back(out->type());
+      hostAggNames.push_back(
+          "req" + std::to_string(requestIdx) + "_agg" + std::to_string(aggIdx));
+      hostAggVectors.push_back(std::move(out));
+    }
+  }
+
+  auto hostAggRow = std::make_shared<RowVector>(
+      pool,
+      ROW(hostAggNames, hostAggTypes),
+      nullptr,
+      numGroups,
+      std::move(hostAggVectors));
+  auto hostAggTable = cudf_velox::with_arrow::toCudfTable(hostAggRow, pool, stream);
+  auto hostAggColumns = hostAggTable->release();
+
+  resultsOut.clear();
+  resultsOut.resize(requests.size());
+  auto nextColumn = 0;
+  for (auto requestIdx = 0; requestIdx < requests.size(); ++requestIdx) {
+    resultsOut[requestIdx].results.reserve(
+        requests[requestIdx].aggregations.size());
+    for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
+         ++aggIdx) {
+      if (nextColumn >= hostAggColumns.size()) {
+        error = "CPU detour result column underflow";
+        return false;
+      }
+      resultsOut[requestIdx].results.push_back(
+          std::move(hostAggColumns[nextColumn++]));
+    }
+  }
+  if (nextColumn != hostAggColumns.size()) {
+    error = "CPU detour result column overflow: used=" +
+        std::to_string(nextColumn) +
+        " total=" + std::to_string(hostAggColumns.size());
+    return false;
+  }
+
+  if (hashAggDebugEnabled()) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "cpuDecimalDetour.success step="
+                 << stepName(step) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " inRows="
+                 << keyRow->size() << " outRows=" << numGroups
+                 << " requestCount=" << requests.size();
+  }
+  return true;
 }
 
 
@@ -2764,6 +3124,9 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     }
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
+  auto const decimalCpuDetourEnabled = hashAggDebugDecimalCpuAggregateMode() != 0;
+  auto const useDecimalCpuDetour =
+      decimalCpuDetourEnabled && hasDecimalGroupbyRequest(requests);
   auto const fakeGroupbyMode = hashAggDebugFakeGroupbyMode();
   auto const fakeModeSupportedStep = (step_ == core::AggregationNode::Step::kFinal ||
                                       step_ == core::AggregationNode::Step::kSingle);
@@ -2851,49 +3214,74 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
       tableView.num_rows(),
       requests.size(),
       numGroupingKeys);
-  auto const probeFailure = runGroupByAggregateRequestIsolationProbes(
-      step_,
-      stream,
-      tableView,
-      groupbyKeyView,
-      nullPolicy,
-      requests,
-      numGroupingKeys);
-  if (!probeFailure.empty()) {
-    LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
-                  "aggregateProbe.firstFailure step="
-               << stepName(step_) << " stream="
-               << reinterpret_cast<const void*>(stream.value()) << " rows="
-               << tableView.num_rows() << " cols=" << tableView.num_columns()
-               << " requestCount=" << requests.size() << " groupingKeys="
-               << numGroupingKeys << " detail=" << probeFailure;
-    VELOX_FAIL(
-        "HashAgg aggregate request-isolation probe failed before main "
-        "aggregate: {}",
-        probeFailure);
+  if (!useDecimalCpuDetour) {
+    auto const probeFailure = runGroupByAggregateRequestIsolationProbes(
+        step_,
+        stream,
+        tableView,
+        groupbyKeyView,
+        nullPolicy,
+        requests,
+        numGroupingKeys);
+    if (!probeFailure.empty()) {
+      LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "aggregateProbe.firstFailure step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << requests.size() << " groupingKeys="
+                 << numGroupingKeys << " detail=" << probeFailure;
+      VELOX_FAIL(
+          "HashAgg aggregate request-isolation probe failed before main "
+          "aggregate: {}",
+          probeFailure);
+    }
   }
   std::unique_ptr<cudf::table> groupKeys;
   std::vector<cudf::groupby::aggregation_result> results;
-  try {
-    auto aggregateOutput = groupByOwner.aggregate(requests, stream);
-    groupKeys = std::move(aggregateOutput.first);
-    results = std::move(aggregateOutput.second);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
-                  "aggregateException step="
-               << stepName(step_) << " stream="
-               << reinterpret_cast<const void*>(stream.value()) << " rows="
-               << tableView.num_rows() << " cols=" << tableView.num_columns()
-               << " requestCount=" << requests.size() << " groupingKeys="
-               << numGroupingKeys << " error=" << e.what();
-    logCudaCheckpoint(
-        "HashAgg.doGroupByAggregation.aggregateException.cudaCheckpoint",
-        step_,
-        stream,
-        tableView.num_rows(),
-        tableView.num_columns(),
-        requests.size());
-    throw;
+  if (useDecimalCpuDetour) {
+    std::string detourError;
+    if (!runDecimalCpuAggregateDetour(
+            pool(),
+            step_,
+            stream,
+            groupbyKeyView,
+            nullPolicy,
+            requests,
+            groupKeys,
+            results,
+            detourError)) {
+      LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "cpuDecimalDetour.failure step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << requests.size() << " groupingKeys="
+                 << numGroupingKeys << " error=" << detourError;
+      VELOX_FAIL("HashAgg decimal CPU detour failed: {}", detourError);
+    }
+  } else {
+    try {
+      auto aggregateOutput = groupByOwner.aggregate(requests, stream);
+      groupKeys = std::move(aggregateOutput.first);
+      results = std::move(aggregateOutput.second);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+                    "aggregateException step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << requests.size() << " groupingKeys="
+                 << numGroupingKeys << " error=" << e.what();
+      logCudaCheckpoint(
+          "HashAgg.doGroupByAggregation.aggregateException.cudaCheckpoint",
+          step_,
+          stream,
+          tableView.num_rows(),
+          tableView.num_columns(),
+          requests.size());
+      throw;
+    }
   }
   maybeDeviceSyncProbe(
       kDeviceSyncGroupGroupByCore,

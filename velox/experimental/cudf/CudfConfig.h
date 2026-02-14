@@ -39,6 +39,8 @@ struct CudfConfig {
       "cudf.debug_hashagg_probe_dump_dir"};
   static constexpr const char* kCudfDebugHashAggProbeDumpMaxRows{
       "cudf.debug_hashagg_probe_dump_max_rows"};
+  static constexpr const char* kCudfDebugHashAggDecimalCpuAggregateMode{
+      "cudf.debug_hashagg_decimal_cpu_aggregate_mode"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -106,6 +108,12 @@ struct CudfConfig {
   ///   0 => no row limit
   ///  >0 => skip dump when row count exceeds this threshold
   int32_t debugHashAggProbeDumpMaxRows{50000};
+
+  /// Optional: replace decimal hash groupby aggregate kernel calls with a
+  /// host-side emulation path (debug only).
+  ///   0 => disabled
+  ///   1 => enabled (fails fast if an unsupported aggregate shape is seen)
+  int32_t debugHashAggDecimalCpuAggregateMode{0};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

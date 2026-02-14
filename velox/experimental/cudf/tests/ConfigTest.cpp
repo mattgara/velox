@@ -30,6 +30,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugHashAggFakeGroupbyMode, "2"},
       {CudfConfig::kCudfDebugHashAggProbeDumpDir, "/tmp/hashagg_dumps"},
       {CudfConfig::kCudfDebugHashAggProbeDumpMaxRows, "1234"},
+      {CudfConfig::kCudfDebugHashAggDecimalCpuAggregateMode, "1"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -45,6 +46,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugHashAggFakeGroupbyMode, 2);
   ASSERT_EQ(config.debugHashAggProbeDumpDir, "/tmp/hashagg_dumps");
   ASSERT_EQ(config.debugHashAggProbeDumpMaxRows, 1234);
+  ASSERT_EQ(config.debugHashAggDecimalCpuAggregateMode, 1);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
