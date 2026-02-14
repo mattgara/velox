@@ -30,6 +30,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/reduction.hpp>
@@ -568,6 +569,122 @@ std::vector<cudf::groupby::aggregation_request> cloneGroupbyRequestSubset(
   return subsetRequests;
 }
 
+struct CopiedProbeRequests {
+  std::vector<std::unique_ptr<cudf::column>> copiedValues;
+  std::vector<cudf::groupby::aggregation_request> requests;
+};
+
+CopiedProbeRequests buildCopiedGroupbyRequestSubset(
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    std::vector<size_t> const& subset,
+    rmm::cuda_stream_view stream) {
+  CopiedProbeRequests copied;
+  copied.requests.reserve(subset.size());
+  copied.copiedValues.reserve(subset.size());
+  for (auto const requestIdx : subset) {
+    VELOX_CHECK_LT(requestIdx, requests.size());
+    auto const& sourceRequest = requests[requestIdx];
+    auto copiedValues =
+        std::make_unique<cudf::column>(sourceRequest.values, stream);
+    cudf::groupby::aggregation_request copiedRequest;
+    copiedRequest.values = copiedValues->view();
+    copiedRequest.aggregations.reserve(sourceRequest.aggregations.size());
+    for (auto const& aggregation : sourceRequest.aggregations) {
+      VELOX_CHECK_NOT_NULL(aggregation);
+      auto aggregationClone = aggregation->clone();
+      auto* groupbyAggregationClone =
+          dynamic_cast<cudf::groupby_aggregation*>(aggregationClone.get());
+      VELOX_CHECK_NOT_NULL(groupbyAggregationClone);
+      aggregationClone.release();
+      copiedRequest.aggregations.emplace_back(groupbyAggregationClone);
+    }
+    copied.copiedValues.push_back(std::move(copiedValues));
+    copied.requests.push_back(std::move(copiedRequest));
+  }
+  return copied;
+}
+
+struct AggregateProbeCallStatus {
+  bool aggregateThrew{false};
+  std::string aggregateException;
+  int64_t outputRows{-1};
+  int64_t outputCount{-1};
+  cudaError_t peekErr{cudaSuccess};
+  cudaError_t streamSyncErr{cudaSuccess};
+  cudaError_t deviceSyncErr{cudaSuccess};
+};
+
+AggregateProbeCallStatus runAggregateProbeCall(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request>& probeRequests,
+    size_t probeOrdinal,
+    std::string const& subsetLabel,
+    const char* mode) {
+  AggregateProbeCallStatus status;
+  try {
+    cudf::groupby::groupby probeGroupBy(groupbyKeyView, nullPolicy);
+    auto probeOutput = probeGroupBy.aggregate(probeRequests, stream);
+    status.outputRows = probeOutput.first ? probeOutput.first->num_rows() : 0;
+    status.outputCount = probeOutput.second.size();
+  } catch (const std::exception& e) {
+    status.aggregateThrew = true;
+    status.aggregateException = e.what();
+  }
+
+  status.peekErr = cudaPeekAtLastError();
+  status.streamSyncErr = cudaStreamSynchronize(stream.value());
+  status.deviceSyncErr = cudaDeviceSynchronize();
+  LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
+               "aggregateProbe.result step="
+            << stepName(step) << " stream="
+            << reinterpret_cast<const void*>(stream.value())
+            << " probeOrdinal=" << probeOrdinal << " subset=" << subsetLabel
+            << " mode=" << mode << " subsetSize=" << probeRequests.size()
+            << " aggregateThrew=" << (status.aggregateThrew ? 1 : 0)
+            << " outputRows=" << status.outputRows
+            << " outputCount=" << status.outputCount
+            << " cudaPeek=" << cudaErrorNameSafe(status.peekErr) << "("
+            << static_cast<int>(status.peekErr) << ")"
+            << " cudaPeekMsg=" << cudaErrorStringSafe(status.peekErr)
+            << " cudaStreamSync=" << cudaErrorNameSafe(status.streamSyncErr)
+            << "(" << static_cast<int>(status.streamSyncErr) << ")"
+            << " cudaStreamSyncMsg=" << cudaErrorStringSafe(status.streamSyncErr)
+            << " cudaDeviceSync=" << cudaErrorNameSafe(status.deviceSyncErr)
+            << "(" << static_cast<int>(status.deviceSyncErr) << ")"
+            << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(status.deviceSyncErr)
+            << (status.aggregateThrew ? " exception=" + status.aggregateException
+                                      : "");
+  return status;
+}
+
+bool aggregateProbeFailed(AggregateProbeCallStatus const& status) {
+  return status.aggregateThrew || status.peekErr != cudaSuccess ||
+      status.streamSyncErr != cudaSuccess || status.deviceSyncErr != cudaSuccess;
+}
+
+std::string formatAggregateProbeFailure(
+    size_t probeOrdinal,
+    std::string const& subsetLabel,
+    const char* mode,
+    AggregateProbeCallStatus const& status) {
+  std::string failure = "probeOrdinal=" + std::to_string(probeOrdinal) +
+      " subset=" + subsetLabel + " mode=" + mode + " aggregateThrew=" +
+      (status.aggregateThrew ? "1" : "0") + " cudaPeek=" +
+      std::string(cudaErrorNameSafe(status.peekErr)) + "(" +
+      std::to_string(static_cast<int>(status.peekErr)) + ")" +
+      " cudaStreamSync=" + std::string(cudaErrorNameSafe(status.streamSyncErr)) +
+      "(" + std::to_string(static_cast<int>(status.streamSyncErr)) + ")" +
+      " cudaDeviceSync=" + std::string(cudaErrorNameSafe(status.deviceSyncErr)) +
+      "(" + std::to_string(static_cast<int>(status.deviceSyncErr)) + ")";
+  if (status.aggregateThrew) {
+    failure += " exception=" + status.aggregateException;
+  }
+  return failure;
+}
+
 std::string runGroupByAggregateRequestIsolationProbes(
     core::AggregationNode::Step step,
     rmm::cuda_stream_view stream,
@@ -592,7 +709,8 @@ std::string runGroupByAggregateRequestIsolationProbes(
             << " requestCount=" << requests.size()
             << " subsetCount=" << requestSubsets.size()
             << " exhaustive=" << (exhaustive ? 1 : 0)
-            << " selectedGroup=" << selectedGroup;
+            << " selectedGroup=" << selectedGroup
+            << " probeMode=copyThenView";
 
   for (size_t probeOrdinal = 0; probeOrdinal < requestSubsets.size();
        ++probeOrdinal) {
@@ -644,77 +762,87 @@ std::string runGroupByAggregateRequestIsolationProbes(
           std::to_string(static_cast<int>(preProbeDeviceSyncErr)) + ")";
     }
 
-    std::vector<cudf::groupby::aggregation_request> probeRequests;
+    std::vector<cudf::groupby::aggregation_request> viewProbeRequests;
     try {
-      probeRequests = cloneGroupbyRequestSubset(requests, requestSubset);
+      viewProbeRequests = cloneGroupbyRequestSubset(requests, requestSubset);
     } catch (const std::exception& e) {
       return "probeOrdinal=" + std::to_string(probeOrdinal) + " subset=" +
-          subsetLabel + " cloneException=" + e.what();
+          subsetLabel + " viewCloneException=" + e.what();
     }
-    logGroupbyRequestsDebug(step, stream, tableView, probeRequests);
 
-    bool aggregateThrew = false;
-    std::string aggregateException;
-    int64_t outputRows = -1;
-    int64_t outputCount = -1;
-
+    CopiedProbeRequests copiedProbeRequests;
     try {
-      cudf::groupby::groupby probeGroupBy(groupbyKeyView, nullPolicy);
-      auto probeOutput = probeGroupBy.aggregate(probeRequests, stream);
-      outputRows = probeOutput.first ? probeOutput.first->num_rows() : 0;
-      outputCount = probeOutput.second.size();
+      copiedProbeRequests =
+          buildCopiedGroupbyRequestSubset(requests, requestSubset, stream);
     } catch (const std::exception& e) {
-      aggregateThrew = true;
-      aggregateException = e.what();
+      return "probeOrdinal=" + std::to_string(probeOrdinal) + " subset=" +
+          subsetLabel + " copyCloneException=" + e.what();
     }
-
-    auto const peekErr = cudaPeekAtLastError();
-    auto const streamSyncErr = cudaStreamSynchronize(stream.value());
-    auto const deviceSyncErr = cudaDeviceSynchronize();
-    LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
-                 "aggregateProbe.result step="
-              << stepName(step) << " stream="
-              << reinterpret_cast<const void*>(stream.value())
-              << " probeOrdinal=" << probeOrdinal << " subset=" << subsetLabel
-              << " subsetSize=" << requestSubset.size()
-              << " aggregateThrew=" << (aggregateThrew ? 1 : 0)
-              << " outputRows=" << outputRows << " outputCount=" << outputCount
-              << " cudaPeek=" << cudaErrorNameSafe(peekErr) << "("
-              << static_cast<int>(peekErr) << ")"
-              << " cudaPeekMsg=" << cudaErrorStringSafe(peekErr)
-              << " cudaStreamSync=" << cudaErrorNameSafe(streamSyncErr) << "("
-              << static_cast<int>(streamSyncErr) << ")"
-              << " cudaStreamSyncMsg=" << cudaErrorStringSafe(streamSyncErr)
-              << " cudaDeviceSync=" << cudaErrorNameSafe(deviceSyncErr) << "("
-              << static_cast<int>(deviceSyncErr) << ")"
-              << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(deviceSyncErr)
-              << (aggregateThrew ? " exception=" + aggregateException : "");
 
     maybeDeviceSyncProbe(
         kDeviceSyncGroupGroupByRequestIsolation,
         probeIdBase + 2,
-        "HashAgg.doGroupByAggregation.aggregateProbe.afterSubset",
+        "HashAgg.doGroupByAggregation.aggregateProbe.beforeCopyAggregate",
         step,
         stream,
-        outputRows >= 0 ? outputRows : tableView.num_rows(),
+        tableView.num_rows(),
         static_cast<int64_t>(requestSubset.size()),
-        outputCount >= 0 ? outputCount : -1);
+        numGroupingKeys);
+    logGroupbyRequestsDebug(step, stream, tableView, copiedProbeRequests.requests);
+    auto const copyStatus = runAggregateProbeCall(
+        step,
+        stream,
+        groupbyKeyView,
+        nullPolicy,
+        copiedProbeRequests.requests,
+        probeOrdinal,
+        subsetLabel,
+        "copy");
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupGroupByRequestIsolation,
+        probeIdBase + 3,
+        "HashAgg.doGroupByAggregation.aggregateProbe.afterCopyAggregate",
+        step,
+        stream,
+        copyStatus.outputRows >= 0 ? copyStatus.outputRows : tableView.num_rows(),
+        static_cast<int64_t>(requestSubset.size()),
+        copyStatus.outputCount >= 0 ? copyStatus.outputCount : -1);
+    if (aggregateProbeFailed(copyStatus)) {
+      return formatAggregateProbeFailure(
+          probeOrdinal, subsetLabel, "copy", copyStatus);
+    }
 
-    if (aggregateThrew || peekErr != cudaSuccess ||
-        streamSyncErr != cudaSuccess || deviceSyncErr != cudaSuccess) {
-      std::string failure = "probeOrdinal=" + std::to_string(probeOrdinal) +
-          " subset=" + subsetLabel + " aggregateThrew=" +
-          (aggregateThrew ? "1" : "0") + " cudaPeek=" +
-          std::string(cudaErrorNameSafe(peekErr)) + "(" +
-          std::to_string(static_cast<int>(peekErr)) + ")" +
-          " cudaStreamSync=" + std::string(cudaErrorNameSafe(streamSyncErr)) +
-          "(" + std::to_string(static_cast<int>(streamSyncErr)) + ")" +
-          " cudaDeviceSync=" + std::string(cudaErrorNameSafe(deviceSyncErr)) +
-          "(" + std::to_string(static_cast<int>(deviceSyncErr)) + ")";
-      if (aggregateThrew) {
-        failure += " exception=" + aggregateException;
-      }
-      return failure;
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupGroupByRequestIsolation,
+        probeIdBase + 4,
+        "HashAgg.doGroupByAggregation.aggregateProbe.beforeViewAggregate",
+        step,
+        stream,
+        tableView.num_rows(),
+        static_cast<int64_t>(requestSubset.size()),
+        numGroupingKeys);
+    logGroupbyRequestsDebug(step, stream, tableView, viewProbeRequests);
+    auto const viewStatus = runAggregateProbeCall(
+        step,
+        stream,
+        groupbyKeyView,
+        nullPolicy,
+        viewProbeRequests,
+        probeOrdinal,
+        subsetLabel,
+        "view");
+    maybeDeviceSyncProbe(
+        kDeviceSyncGroupGroupByRequestIsolation,
+        probeIdBase + 5,
+        "HashAgg.doGroupByAggregation.aggregateProbe.afterViewAggregate",
+        step,
+        stream,
+        viewStatus.outputRows >= 0 ? viewStatus.outputRows : tableView.num_rows(),
+        static_cast<int64_t>(requestSubset.size()),
+        viewStatus.outputCount >= 0 ? viewStatus.outputCount : -1);
+    if (aggregateProbeFailed(viewStatus)) {
+      return formatAggregateProbeFailure(
+          probeOrdinal, subsetLabel, "view", viewStatus);
     }
   }
 
