@@ -30,6 +30,7 @@
 #include <cudf/unary.hpp>
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace facebook::velox::cudf_velox {
 
@@ -37,10 +38,26 @@ namespace {
 
 void debugPrintTree(
     const std::shared_ptr<velox::exec::Expr>& expr,
-    int indent = 0) {
-  std::cout << std::string(indent, ' ') << expr->name() << std::endl;
-  for (auto& input : expr->inputs()) {
-    debugPrintTree(input, indent + 2);
+    std::unordered_set<const velox::exec::Expr*>& visited,
+    int indent = 0,
+    int depth = 0) {
+  constexpr int kMaxDepth = 64;
+  if (!expr) {
+    LOG(INFO) << std::string(indent, ' ') << "<null-expr>";
+    return;
+  }
+  if (depth > kMaxDepth) {
+    LOG(INFO) << std::string(indent, ' ') << "<depth-limit>";
+    return;
+  }
+  if (!visited.insert(expr.get()).second) {
+    LOG(INFO) << std::string(indent, ' ') << "<revisit> " << expr->name();
+    return;
+  }
+
+  LOG(INFO) << std::string(indent, ' ') << expr->name();
+  for (const auto& input : expr->inputs()) {
+    debugPrintTree(input, visited, indent + 2, depth + 1);
   }
 }
 
@@ -183,7 +200,7 @@ void CudfFilterProject::initialize() {
       (dynamic_cast<const core::LazyDereferenceNode*>(project_.get()) !=
        nullptr);
   VELOX_CHECK(!(lazyDereference && filter_));
-  auto expr = exec::makeExprSetFromFlag(
+  auto exprSet = exec::makeExprSetFromFlag(
       std::move(allExprs), operatorCtx_->execCtx(), lazyDereference);
 
   const auto inputType = project_ ? project_->sources()[0]->outputType()
@@ -192,26 +209,27 @@ void CudfFilterProject::initialize() {
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
     int i = 0;
-    for (const auto& expr : expr->exprs()) {
-      LOG(INFO) << "expr[" << i++ << "] " << expr->toString() << std::endl;
-      debugPrintTree(expr);
+    for (const auto& compiledExpr : exprSet->exprs()) {
+      LOG(INFO) << "expr[" << i << "] " << compiledExpr->toString();
+      std::unordered_set<const velox::exec::Expr*> visited;
+      debugPrintTree(compiledExpr, visited);
       ++i;
     }
   }
   if (hasFilter_) {
     // First expr is Filter, rest are Project
-    filterEvaluator_ = createCudfExpression(expr->exprs()[0], inputType);
+    filterEvaluator_ = createCudfExpression(exprSet->exprs()[0], inputType);
     std::transform(
-        expr->exprs().begin() + 1,
-        expr->exprs().end(),
+        exprSet->exprs().begin() + 1,
+        exprSet->exprs().end(),
         std::back_inserter(projectEvaluators_),
         [inputType](const auto& expr) {
           return createCudfExpression(expr, inputType);
         });
   } else {
     std::transform(
-        expr->exprs().begin(),
-        expr->exprs().end(),
+        exprSet->exprs().begin(),
+        exprSet->exprs().end(),
         std::back_inserter(projectEvaluators_),
         [inputType](const auto& expr) {
           return createCudfExpression(expr, inputType);
