@@ -24,6 +24,8 @@ TEST(ConfigTest, CudfConfig) {
   std::unordered_map<std::string, std::string> options = {
       {CudfConfig::kCudfEnabled, "false"},
       {CudfConfig::kCudfDebugEnabled, "true"},
+      {CudfConfig::kCudfDebugOperatorFlow, "true"},
+      {CudfConfig::kCudfDebugOperatorFlowSync, "true"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -33,6 +35,8 @@ TEST(ConfigTest, CudfConfig) {
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
+  ASSERT_EQ(config.debugOperatorFlow, true);
+  ASSERT_EQ(config.debugOperatorFlowSync, true);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");

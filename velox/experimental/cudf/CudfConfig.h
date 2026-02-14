@@ -28,6 +28,8 @@ struct CudfConfig {
   static constexpr const char* kCudfDebugExprTree{"cudf.debug_expr_tree"};
   static constexpr const char* kCudfDebugOperatorFlow{
       "cudf.debug_operator_flow"};
+  static constexpr const char* kCudfDebugOperatorFlowSync{
+      "cudf.debug_operator_flow_sync"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -61,6 +63,11 @@ struct CudfConfig {
   /// Enable extra operator-level debug logs added for cuDF operator flow
   /// debugging (e.g. CudfTopN/CudfHashAggregation internals).
   bool debugOperatorFlow{false};
+
+  /// Optional: force CUDA stream sync checkpoints in operator-flow debug.
+  /// This is expensive and can perturb timing; use only for root-cause
+  /// localization.
+  bool debugOperatorFlowSync{false};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

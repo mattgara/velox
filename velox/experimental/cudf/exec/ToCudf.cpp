@@ -550,6 +550,9 @@ void CudfConfig::initialize(
   if (config.find(kCudfDebugOperatorFlow) != config.end()) {
     debugOperatorFlow = folly::to<bool>(config[kCudfDebugOperatorFlow]);
   }
+  if (config.find(kCudfDebugOperatorFlowSync) != config.end()) {
+    debugOperatorFlowSync = folly::to<bool>(config[kCudfDebugOperatorFlowSync]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }
@@ -572,11 +575,13 @@ void CudfConfig::initialize(
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }
-  if (debugEnabled || debugExprTree || debugOperatorFlow) {
+  if (debugEnabled || debugExprTree || debugOperatorFlow ||
+      debugOperatorFlowSync) {
     LOG(INFO) << "[CudfConfig] enabled=" << enabled
               << " debugEnabled=" << debugEnabled
               << " debugExprTree=" << debugExprTree
               << " debugOperatorFlow=" << debugOperatorFlow
+              << " debugOperatorFlowSync=" << debugOperatorFlowSync
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }
