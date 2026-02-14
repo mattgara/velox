@@ -213,6 +213,117 @@ class CudfDecimalTest : public exec::test::OperatorTestBase {
   }
 };
 
+TEST_F(CudfDecimalTest, decimal128TopNDeterministic) {
+  constexpr vector_size_t batchSize = 1'024;
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(6);
+
+  for (int32_t batch = 0; batch < 6; ++batch) {
+    auto id = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int64_t>(batch) * batchSize + row;
+    });
+    auto d128 = makeFlatVector<int128_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          // Generate repeating long-decimal values to force tie-breaking.
+          auto bucket = static_cast<int64_t>((row + batch * 17) % 257) - 128;
+          auto raw = static_cast<int128_t>(bucket) *
+              static_cast<int128_t>(1'000'000'000);
+          return raw;
+        },
+        nullptr,
+        DECIMAL(38, 10));
+    auto payload = makeFlatVector<int32_t>(batchSize, [&](vector_size_t row) {
+      return static_cast<int32_t>((row + batch) % 5);
+    });
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{id, d128, payload}));
+  }
+
+  createDuckDbTable(vectors);
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .topN(
+                      {"c1 DESC NULLS LAST", "c0 ASC NULLS LAST"},
+                      200,
+                      false)
+                  .planNode();
+
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .assertResults("SELECT c0, c1, c2 FROM tmp ORDER BY c1 DESC, c0 LIMIT 200");
+}
+
+TEST_F(CudfDecimalTest, decimalQ3ShapeAggregationTopN) {
+  constexpr vector_size_t batchSize = 2'048;
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(4);
+
+  for (int32_t batch = 0; batch < 4; ++batch) {
+    auto lOrderkey = makeFlatVector<int64_t>(batchSize, [&](vector_size_t row) {
+      // Repeating orderkeys create multi-row groups after aggregation.
+      return static_cast<int64_t>((batch * batchSize + row) % 1'500);
+    });
+    auto lExtendedprice = makeFlatVector<int64_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          // Scaled by 2 (e.g., 12345 => 123.45).
+          return static_cast<int64_t>(
+              10'000 + ((row * 37 + batch * 101) % 900'000));
+        },
+        nullptr,
+        DECIMAL(12, 2));
+    auto lDiscount = makeFlatVector<int64_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          // 0.00 to 0.10 in scale-2 representation.
+          return static_cast<int64_t>((row + batch) % 11);
+        },
+        nullptr,
+        DECIMAL(12, 2));
+    auto oOrderdate = makeFlatVector<int32_t>(
+        batchSize,
+        [&](vector_size_t row) {
+          // Days since epoch around 1995-01.
+          return static_cast<int32_t>(9'131 + ((row + batch * 13) % 60));
+        },
+        nullptr,
+        DATE());
+    auto oShippriority =
+        makeFlatVector<int32_t>(batchSize, [&](vector_size_t row) {
+          return static_cast<int32_t>((row + 2 * batch) % 3);
+        });
+
+    vectors.push_back(makeRowVector(std::vector<VectorPtr>{
+        lOrderkey, lExtendedprice, lDiscount, oOrderdate, oShippriority}));
+  }
+
+  createDuckDbTable(vectors);
+
+  auto plan = exec::test::PlanBuilder()
+                  .values(vectors)
+                  .project(
+                      {"c0",
+                       "c3",
+                       "c4",
+                       "c1 * (CAST('1.00' AS DECIMAL(12, 2)) - c2) AS amount"})
+                  .singleAggregation(
+                      {"c0", "c3", "c4"}, {"sum(amount) AS revenue"})
+                  .topN(
+                      {"revenue DESC NULLS LAST", "c3 ASC NULLS LAST"},
+                      100,
+                      false)
+                  .planNode();
+
+  facebook::velox::exec::test::AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .assertResults(
+          "SELECT c0, c3, c4, "
+          "sum(c1 * (CAST('1.00' AS DECIMAL(12, 2)) - c2)) AS revenue "
+          "FROM tmp "
+          "GROUP BY c0, c3, c4 "
+          "ORDER BY revenue DESC, c3 "
+          "LIMIT 100");
+}
+
 TEST_F(CudfDecimalTest, decimal64And128ArithmeticAndComparison) {
   // Short decimal (64-bit) uses scale 2, long decimal (128-bit) uses scale 10.
   auto rowType = ROW({
