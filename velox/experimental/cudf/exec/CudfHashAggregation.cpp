@@ -1367,6 +1367,14 @@ bool hasDecimalGroupbyRequest(
   });
 }
 
+bool hasDecimalAggregator(
+    std::vector<std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator>> const&
+        aggregators) {
+  return std::any_of(aggregators.begin(), aggregators.end(), [](auto const& agg) {
+    return agg && agg->resultType && agg->resultType->isDecimal();
+  });
+}
+
 bool isCpuDetourSupportedAggKind(cudf::aggregation::Kind kind) {
   return kind == cudf::aggregation::SUM || kind == cudf::aggregation::COUNT_VALID ||
       kind == cudf::aggregation::COUNT_ALL;
@@ -1413,27 +1421,46 @@ std::string buildGroupKeySignature(
   return key;
 }
 
-bool readIntegralLikeValue(
+struct CpuDetourNumericValue {
+  int128_t intValue{0};
+  long double floatValue{0.0};
+  bool isFloating{false};
+};
+
+bool readNumericLikeValue(
     DecodedVector const& vector,
     TypeKind kind,
     vector_size_t row,
-    int128_t& out,
+    CpuDetourNumericValue& out,
     std::string& error) {
   switch (kind) {
     case TypeKind::TINYINT:
-      out = vector.valueAt<int8_t>(row);
+      out.intValue = vector.valueAt<int8_t>(row);
+      out.isFloating = false;
       return true;
     case TypeKind::SMALLINT:
-      out = vector.valueAt<int16_t>(row);
+      out.intValue = vector.valueAt<int16_t>(row);
+      out.isFloating = false;
       return true;
     case TypeKind::INTEGER:
-      out = vector.valueAt<int32_t>(row);
+      out.intValue = vector.valueAt<int32_t>(row);
+      out.isFloating = false;
       return true;
     case TypeKind::BIGINT:
-      out = vector.valueAt<int64_t>(row);
+      out.intValue = vector.valueAt<int64_t>(row);
+      out.isFloating = false;
       return true;
     case TypeKind::HUGEINT:
-      out = vector.valueAt<int128_t>(row);
+      out.intValue = vector.valueAt<int128_t>(row);
+      out.isFloating = false;
+      return true;
+    case TypeKind::REAL:
+      out.floatValue = vector.valueAt<float>(row);
+      out.isFloating = true;
+      return true;
+    case TypeKind::DOUBLE:
+      out.floatValue = vector.valueAt<double>(row);
+      out.isFloating = true;
       return true;
     default:
       error = "unsupported request value type for CPU detour: " +
@@ -1443,7 +1470,8 @@ bool readIntegralLikeValue(
 }
 
 struct CpuDetourAggState {
-  int128_t sum{0};
+  int128_t sumInt{0};
+  long double sumFloat{0.0};
   int64_t count{0};
   bool sumSeen{false};
 };
@@ -1455,13 +1483,46 @@ VectorPtr makeCpuDetourSumVector(
     std::string& error) {
   auto out = BaseVector::create(type, states.size(), pool);
   switch (type->kind()) {
+    case TypeKind::TINYINT: {
+      auto flat = out->asFlatVector<int8_t>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<int8_t>(states[i].sumInt));
+        }
+      }
+      return out;
+    }
+    case TypeKind::SMALLINT: {
+      auto flat = out->asFlatVector<int16_t>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<int16_t>(states[i].sumInt));
+        }
+      }
+      return out;
+    }
+    case TypeKind::INTEGER: {
+      auto flat = out->asFlatVector<int32_t>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<int32_t>(states[i].sumInt));
+        }
+      }
+      return out;
+    }
     case TypeKind::BIGINT: {
       auto flat = out->asFlatVector<int64_t>();
       for (auto i = 0; i < states.size(); ++i) {
         if (!states[i].sumSeen) {
           flat->setNull(i, true);
         } else {
-          flat->set(i, static_cast<int64_t>(states[i].sum));
+          flat->set(i, static_cast<int64_t>(states[i].sumInt));
         }
       }
       return out;
@@ -1472,7 +1533,29 @@ VectorPtr makeCpuDetourSumVector(
         if (!states[i].sumSeen) {
           flat->setNull(i, true);
         } else {
-          flat->set(i, states[i].sum);
+          flat->set(i, states[i].sumInt);
+        }
+      }
+      return out;
+    }
+    case TypeKind::REAL: {
+      auto flat = out->asFlatVector<float>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<float>(states[i].sumFloat));
+        }
+      }
+      return out;
+    }
+    case TypeKind::DOUBLE: {
+      auto flat = out->asFlatVector<double>();
+      for (auto i = 0; i < states.size(); ++i) {
+        if (!states[i].sumSeen) {
+          flat->setNull(i, true);
+        } else {
+          flat->set(i, static_cast<double>(states[i].sumFloat));
         }
       }
       return out;
@@ -1532,7 +1615,8 @@ bool runDecimalCpuAggregateDetour(
     auto const valueType = valueRow->childAt(requestIdx)->type()->kind();
     if (valueType != TypeKind::BIGINT && valueType != TypeKind::HUGEINT &&
         valueType != TypeKind::INTEGER && valueType != TypeKind::SMALLINT &&
-        valueType != TypeKind::TINYINT) {
+        valueType != TypeKind::TINYINT && valueType != TypeKind::REAL &&
+        valueType != TypeKind::DOUBLE) {
       error = "CPU detour unsupported request value type at request[" +
           std::to_string(requestIdx) +
           "]: " + valueRow->childAt(requestIdx)->type()->toString();
@@ -1589,9 +1673,9 @@ bool runDecimalCpuAggregateDetour(
       auto const valueKind = valueRow->childAt(requestIdx)->type()->kind();
       auto const& decoded = *decodedValues[requestIdx];
       auto const isNull = decoded.isNullAt(row);
-      int128_t value = 0;
+      CpuDetourNumericValue value;
       if (!isNull &&
-          !readIntegralLikeValue(decoded, valueKind, row, value, error)) {
+          !readNumericLikeValue(decoded, valueKind, row, value, error)) {
         return false;
       }
       for (auto aggIdx = 0; aggIdx < requests[requestIdx].aggregations.size();
@@ -1600,7 +1684,11 @@ bool runDecimalCpuAggregateDetour(
         auto& state = states[requestIdx][aggIdx][groupIdx];
         if (kind == cudf::aggregation::SUM) {
           if (!isNull) {
-            state.sum += value;
+            if (value.isFloating) {
+              state.sumFloat += value.floatValue;
+            } else {
+              state.sumInt += value.intValue;
+            }
             state.sumSeen = true;
           }
         } else if (kind == cudf::aggregation::COUNT_ALL) {
@@ -3126,7 +3214,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
   auto const decimalCpuDetourEnabled = hashAggDebugDecimalCpuAggregateMode() != 0;
   auto const useDecimalCpuDetour =
-      decimalCpuDetourEnabled && hasDecimalGroupbyRequest(requests);
+      decimalCpuDetourEnabled &&
+      (hasDecimalGroupbyRequest(requests) || hasDecimalAggregator(aggregators));
   auto const fakeGroupbyMode = hashAggDebugFakeGroupbyMode();
   auto const fakeModeSupportedStep = (step_ == core::AggregationNode::Step::kFinal ||
                                       step_ == core::AggregationNode::Step::kSingle);
@@ -3395,6 +3484,19 @@ CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
       tableView.num_columns(),
       aggregators_.size());
   logTableViewDebug("HashAgg.doGlobalAggregation.inputTable", step_, stream, tableView);
+  auto const decimalCpuDetourEnabled = hashAggDebugDecimalCpuAggregateMode() != 0;
+  auto const useDecimalCpuDetour =
+      decimalCpuDetourEnabled && hasDecimalAggregator(aggregators_) &&
+      tableView.num_rows() > 0;
+  if (useDecimalCpuDetour) {
+    LOG(WARNING) << "[CudfHashAggDebug] stage=HashAgg.doGlobalAggregation."
+                    "cpuDecimalDetour.routeToGroupBy step="
+                 << stepName(step_) << " stream="
+                 << reinterpret_cast<const void*>(stream.value()) << " rows="
+                 << tableView.num_rows() << " cols=" << tableView.num_columns()
+                 << " requestCount=" << aggregators_.size();
+    return doGroupByAggregation(tableView, {}, aggregators_, stream);
+  }
   std::vector<std::unique_ptr<cudf::column>> resultColumns;
   resultColumns.reserve(aggregators_.size());
   for (auto i = 0; i < aggregators_.size(); i++) {
