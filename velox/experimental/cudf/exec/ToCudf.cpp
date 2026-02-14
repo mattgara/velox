@@ -572,6 +572,14 @@ void CudfConfig::initialize(
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }
+  if (debugEnabled || debugExprTree || debugOperatorFlow) {
+    LOG(INFO) << "[CudfConfig] enabled=" << enabled
+              << " debugEnabled=" << debugEnabled
+              << " debugExprTree=" << debugExprTree
+              << " debugOperatorFlow=" << debugOperatorFlow
+              << " allowCpuFallback=" << allowCpuFallback
+              << " logFallback=" << logFallback;
+  }
 }
 
 } // namespace facebook::velox::cudf_velox
