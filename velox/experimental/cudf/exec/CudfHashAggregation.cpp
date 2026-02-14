@@ -59,6 +59,11 @@ inline bool hashAggDebugSyncEnabled() {
       .debugOperatorFlowSync;
 }
 
+inline int32_t hashAggDebugDeviceSyncPoint() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugOperatorFlowDeviceSyncPoint;
+}
+
 const char* stepName(core::AggregationNode::Step step) {
   switch (step) {
     case core::AggregationNode::Step::kPartial:
@@ -114,6 +119,41 @@ void logCudaCheckpoint(
               << "(" << static_cast<int>(syncErr) << ")"
               << " cudaSyncMsg=" << cudaErrorStringSafe(syncErr);
   }
+}
+
+void maybeDeviceSyncProbe(
+    int32_t pointId,
+    const char* stage,
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    int64_t rows,
+    int64_t cols,
+    int64_t aux) {
+  auto const selectedPoint = hashAggDebugDeviceSyncPoint();
+  // Probe point IDs:
+  // 1 = getOutput.afterConcat
+  // 2 = doGroupByAggregation.preAggregate
+  // 3 = doGroupByAggregation.postAggregate
+  // 4 = doGroupByAggregation.preMakeOutputColumns
+  // 5 = doGroupByAggregation.postMakeOutputColumns
+  // Selector semantics:
+  //  0 => disabled
+  // -1 => all probe points
+  // >0 => only the selected point
+  if (selectedPoint == 0 ||
+      (selectedPoint != -1 && selectedPoint != pointId)) {
+    return;
+  }
+  auto const syncErr = cudaDeviceSynchronize();
+  LOG(INFO) << "[CudfHashAggDebug] stage=" << stage
+            << ".deviceSyncProbe point=" << pointId << " step="
+            << stepName(step) << " stream="
+            << reinterpret_cast<const void*>(stream.value()) << " rows="
+            << rows << " cols=" << cols << " aux=" << aux
+            << " selectedPoint=" << selectedPoint
+            << " cudaDeviceSync=" << cudaErrorNameSafe(syncErr)
+            << "(" << static_cast<int>(syncErr) << ")"
+            << " cudaDeviceSyncMsg=" << cudaErrorStringSafe(syncErr);
 }
 
 void logColumnViewDebug(
@@ -1646,6 +1686,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     }
   }
   logGroupbyRequestsDebug(step_, stream, tableView, requests);
+  maybeDeviceSyncProbe(
+      2,
+      "HashAgg.doGroupByAggregation.preAggregate",
+      step_,
+      stream,
+      tableView.num_rows(),
+      requests.size(),
+      numGroupingKeys);
   logHashAggDebug(
       "HashAgg.doGroupByAggregation.beforeAggregate",
       step_,
@@ -1683,6 +1731,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         requests.size());
     throw;
   }
+  maybeDeviceSyncProbe(
+      3,
+      "HashAgg.doGroupByAggregation.postAggregate",
+      step_,
+      stream,
+      groupKeys ? groupKeys->num_rows() : 0,
+      results.size(),
+      numGroupingKeys);
   logCudaCheckpoint(
       "HashAgg.doGroupByAggregation.afterAggregate.cudaCheckpoint",
       step_,
@@ -1709,6 +1765,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
       std::make_move_iterator(groupKeysColumns.end()));
 
   // then fill the aggregation results
+  maybeDeviceSyncProbe(
+      4,
+      "HashAgg.doGroupByAggregation.preMakeOutputColumns",
+      step_,
+      stream,
+      groupKeys ? groupKeys->num_rows() : 0,
+      results.size(),
+      aggregators.size());
   for (size_t i = 0; i < aggregators.size(); ++i) {
     auto& aggregator = aggregators[i];
     logCudaCheckpoint(
@@ -1735,6 +1799,14 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         results.size(),
         i);
   }
+  maybeDeviceSyncProbe(
+      5,
+      "HashAgg.doGroupByAggregation.postMakeOutputColumns",
+      step_,
+      stream,
+      groupKeys ? groupKeys->num_rows() : 0,
+      resultColumns.size(),
+      0);
 
   // make a cudf table out of columns
   auto resultTable = std::make_unique<cudf::table>(std::move(resultColumns));
@@ -1931,6 +2003,14 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       tbl->num_rows(),
       tbl->num_columns(),
       0);
+  maybeDeviceSyncProbe(
+      1,
+      "HashAgg.getOutput.afterConcat",
+      step_,
+      stream,
+      tbl->num_rows(),
+      tbl->num_columns(),
+      noMoreInput_ ? 1 : 0);
 
   // Use tbl->view() instead of moving the table.
   // tbl stays alive until the end of this function, keeping the view valid.

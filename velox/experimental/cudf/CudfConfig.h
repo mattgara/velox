@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 
@@ -30,6 +31,8 @@ struct CudfConfig {
       "cudf.debug_operator_flow"};
   static constexpr const char* kCudfDebugOperatorFlowSync{
       "cudf.debug_operator_flow_sync"};
+  static constexpr const char* kCudfDebugOperatorFlowDeviceSyncPoint{
+      "cudf.debug_operator_flow_device_sync_point"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -68,6 +71,13 @@ struct CudfConfig {
   /// This is expensive and can perturb timing; use only for root-cause
   /// localization.
   bool debugOperatorFlowSync{false};
+
+  /// Optional: inject full device sync probes in cuDF operator flow:
+  ///   0  => disabled
+  ///  -1  => enable all probe points
+  ///  >0  => enable only the matching numbered probe point
+  /// Intended for speculative stream-race triage.
+  int32_t debugOperatorFlowDeviceSyncPoint{0};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

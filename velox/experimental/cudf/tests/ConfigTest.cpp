@@ -26,6 +26,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugEnabled, "true"},
       {CudfConfig::kCudfDebugOperatorFlow, "true"},
       {CudfConfig::kCudfDebugOperatorFlowSync, "true"},
+      {CudfConfig::kCudfDebugOperatorFlowDeviceSyncPoint, "3"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -37,9 +38,19 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugEnabled, true);
   ASSERT_EQ(config.debugOperatorFlow, true);
   ASSERT_EQ(config.debugOperatorFlowSync, true);
+  ASSERT_EQ(config.debugOperatorFlowDeviceSyncPoint, 3);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+}
+
+TEST(ConfigTest, CudfConfigAllDeviceSyncProbes) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kCudfDebugOperatorFlowDeviceSyncPoint, "-1"}};
+
+  CudfConfig config;
+  config.initialize(std::move(options));
+  ASSERT_EQ(config.debugOperatorFlowDeviceSyncPoint, -1);
 }
 } // namespace facebook::velox::cudf_velox::test
