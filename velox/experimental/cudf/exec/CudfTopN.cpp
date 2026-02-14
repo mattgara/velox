@@ -28,7 +28,7 @@ namespace facebook::velox::cudf_velox {
 namespace {
 
 inline bool topNDebugEnabled() {
-  return CudfConfig::getInstance().debugEnabled;
+  return CudfConfig::getInstance().debugOperatorFlow;
 }
 
 void logTopNDebug(

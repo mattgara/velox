@@ -42,7 +42,8 @@ namespace {
 using namespace facebook::velox;
 
 inline bool hashAggDebugEnabled() {
-  return facebook::velox::cudf_velox::CudfConfig::getInstance().debugEnabled;
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugOperatorFlow;
 }
 
 const char* stepName(core::AggregationNode::Step step) {

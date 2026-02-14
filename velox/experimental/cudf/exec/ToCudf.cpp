@@ -547,6 +547,9 @@ void CudfConfig::initialize(
   if (config.find(kCudfDebugExprTree) != config.end()) {
     debugExprTree = folly::to<bool>(config[kCudfDebugExprTree]);
   }
+  if (config.find(kCudfDebugOperatorFlow) != config.end()) {
+    debugOperatorFlow = folly::to<bool>(config[kCudfDebugOperatorFlow]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }

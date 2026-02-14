@@ -26,6 +26,8 @@ struct CudfConfig {
   static constexpr const char* kCudfEnabled{"cudf.enabled"};
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfDebugExprTree{"cudf.debug_expr_tree"};
+  static constexpr const char* kCudfDebugOperatorFlow{
+      "cudf.debug_operator_flow"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -55,6 +57,10 @@ struct CudfConfig {
   /// Keep disabled by default because deep recursive traversal can be noisy
   /// and expensive.
   bool debugExprTree{false};
+
+  /// Enable extra operator-level debug logs added for cuDF operator flow
+  /// debugging (e.g. CudfTopN/CudfHashAggregation internals).
+  bool debugOperatorFlow{false};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

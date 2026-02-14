@@ -208,14 +208,18 @@ void CudfFilterProject::initialize() {
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
-    int i = 0;
-    for (const auto& compiledExpr : exprSet->exprs()) {
-      LOG(INFO) << "expr[" << i << "] " << compiledExpr->toString();
-      if (CudfConfig::getInstance().debugExprTree) {
+    LOG(INFO) << "[CudfFilterProjectDebug] exprCount=" << exprSet->exprs().size()
+              << " hasFilter=" << hasFilter_ << " hasProject="
+              << static_cast<bool>(project_)
+              << " debugExprTree=" << CudfConfig::getInstance().debugExprTree;
+    if (CudfConfig::getInstance().debugExprTree) {
+      int i = 0;
+      for (const auto& compiledExpr : exprSet->exprs()) {
+        LOG(INFO) << "expr[" << i << "]";
         std::unordered_set<const velox::exec::Expr*> visited;
         debugPrintTree(compiledExpr, visited);
+        ++i;
       }
-      ++i;
     }
   }
   if (hasFilter_) {
