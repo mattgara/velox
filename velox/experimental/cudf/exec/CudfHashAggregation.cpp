@@ -76,20 +76,27 @@ void aggDebugLog(
   if (!kDebugEnabled) {
     return;
   }
-  auto const peek = cudaPeekAtLastError();
   std::fprintf(
       stderr,
-      "[CudfAggDebug] stage=%s step=%s stream=%p rows=%lld cols=%lld aux=%lld "
-      "peek=%d(%s)\n",
+      "[CudfAggDebug] stage=%s step=%s stream=%p rows=%lld cols=%lld aux=%lld\n",
       stage,
       stepName(step),
       reinterpret_cast<const void*>(stream.value()),
       static_cast<long long>(rows),
       static_cast<long long>(cols),
-      static_cast<long long>(aux),
-      static_cast<int>(peek),
-      cudaGetErrorString(peek));
-
+      static_cast<long long>(aux));
+  static const bool kDebugCudaCheckEnabled =
+      getDebugFlag("VELOX_CUDF_DEBUG_CHECK_CUDA");
+  if (kDebugCudaCheckEnabled) {
+    auto const peek = cudaPeekAtLastError();
+    std::fprintf(
+        stderr,
+        "[CudfAggDebug] stage=%s step=%s peek=%d(%s)\n",
+        stage,
+        stepName(step),
+        static_cast<int>(peek),
+        cudaGetErrorString(peek));
+  }
   static const bool kDebugSyncEnabled =
       getDebugFlag("VELOX_CUDF_AGG_DEBUG_SYNC");
   if (kDebugSyncEnabled) {

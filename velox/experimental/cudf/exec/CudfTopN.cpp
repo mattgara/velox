@@ -46,18 +46,26 @@ void topNDebugLog(
   if (!kDebugEnabled) {
     return;
   }
-  auto const peek = cudaPeekAtLastError();
   std::fprintf(
       stderr,
-      "[CudfTopNDebug] node=%s stage=%s stream=%p rows=%lld aux=%lld "
-      "peek=%d(%s)\n",
+      "[CudfTopNDebug] node=%s stage=%s stream=%p rows=%lld aux=%lld\n",
       nodeId,
       stage,
       reinterpret_cast<const void*>(stream.value()),
       static_cast<long long>(rows),
-      static_cast<long long>(aux),
-      static_cast<int>(peek),
-      cudaGetErrorString(peek));
+      static_cast<long long>(aux));
+  static const bool kDebugCudaCheckEnabled =
+      getDebugFlag("VELOX_CUDF_DEBUG_CHECK_CUDA");
+  if (kDebugCudaCheckEnabled) {
+    auto const peek = cudaPeekAtLastError();
+    std::fprintf(
+        stderr,
+        "[CudfTopNDebug] node=%s stage=%s peek=%d(%s)\n",
+        nodeId,
+        stage,
+        static_cast<int>(peek),
+        cudaGetErrorString(peek));
+  }
   static const bool kDebugSyncEnabled =
       getDebugFlag("VELOX_CUDF_TOPN_DEBUG_SYNC");
   if (kDebugSyncEnabled) {
