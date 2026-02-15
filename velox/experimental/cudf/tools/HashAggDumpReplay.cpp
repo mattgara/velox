@@ -17,12 +17,15 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
+
+#include "velox/experimental/cudf/exec/DecimalAggregationKernels.h"
 
 #include <rmm/device_buffer.hpp>
 
@@ -90,6 +93,24 @@ std::unordered_map<std::string, std::string> parseManifest(
   return values;
 }
 
+enum class DumpStep { kPartial, kIntermediate, kFinal, kSingle, kUnknown };
+
+DumpStep parseDumpStep(std::string const& value) {
+  if (value == "partial") {
+    return DumpStep::kPartial;
+  }
+  if (value == "intermediate") {
+    return DumpStep::kIntermediate;
+  }
+  if (value == "final") {
+    return DumpStep::kFinal;
+  }
+  if (value == "single") {
+    return DumpStep::kSingle;
+  }
+  return DumpStep::kUnknown;
+}
+
 std::string requireValue(
     std::unordered_map<std::string, std::string> const& manifest,
     std::string const& key) {
@@ -98,6 +119,12 @@ std::string requireValue(
     throw std::runtime_error("missing manifest key: " + key);
   }
   return it->second;
+}
+
+DumpStep requireStep(
+    std::unordered_map<std::string, std::string> const& manifest,
+    std::string const& key) {
+  return parseDumpStep(requireValue(manifest, key));
 }
 
 int32_t requireInt32(
@@ -290,6 +317,26 @@ bool isSupportedAggKind(cudf::aggregation::Kind kind) {
       kind == cudf::aggregation::Kind::COUNT_ALL;
 }
 
+struct SumCountIndices {
+  int sumIdx{-1};
+  int countIdx{-1};
+};
+
+SumCountIndices findSumCountIndices(
+    std::vector<cudf::aggregation::Kind> const& kinds) {
+  SumCountIndices indices;
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    if (kinds[i] == cudf::aggregation::Kind::SUM && indices.sumIdx < 0) {
+      indices.sumIdx = static_cast<int>(i);
+    } else if ((kinds[i] == cudf::aggregation::Kind::COUNT_VALID ||
+                kinds[i] == cudf::aggregation::Kind::COUNT_ALL) &&
+               indices.countIdx < 0) {
+      indices.countIdx = static_cast<int>(i);
+    }
+  }
+  return indices;
+}
+
 bool decodeValueInt128(
     cudf::type_id type,
     const uint8_t* data,
@@ -478,7 +525,7 @@ std::filesystem::path parseManifestPath(int argc, char** argv) {
     throw std::runtime_error(
         "usage: velox_cudf_hashagg_dump_replay --manifest <path/to/manifest.txt> "
         "or --dump_dir <path/to/dump_dir> or --session <path/to/session_dir> "
-        "[--no-validate] [--validate-max-rows N]");
+        "[--replay-chain] [--no-validate] [--validate-max-rows N]");
   }
   return manifestPath;
 }
@@ -486,6 +533,10 @@ std::filesystem::path parseManifestPath(int argc, char** argv) {
 struct ValidationOptions {
   bool enabled{true};
   int64_t maxRows{0};
+};
+
+struct ReplayOptions {
+  bool replayChain{false};
 };
 
 ValidationOptions parseValidationOptions(int argc, char** argv) {
@@ -496,6 +547,17 @@ ValidationOptions parseValidationOptions(int argc, char** argv) {
       options.enabled = false;
     } else if (arg == "--validate-max-rows" && i + 1 < argc) {
       options.maxRows = std::stoll(argv[++i]);
+    }
+  }
+  return options;
+}
+
+ReplayOptions parseReplayOptions(int argc, char** argv) {
+  ReplayOptions options;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg{argv[i]};
+    if (arg == "--replay-chain") {
+      options.replayChain = true;
     }
   }
   return options;
@@ -521,12 +583,250 @@ std::vector<std::filesystem::path> readSessionIndex(
   return dumps;
 }
 
+int runChainSession(
+    std::filesystem::path const& sessionDir,
+    ValidationOptions const& validateOptions) {
+  auto dumps = readSessionIndex(sessionDir);
+  if (dumps.empty()) {
+    throw std::runtime_error("session index is empty");
+  }
+
+  struct DumpInfo {
+    std::filesystem::path manifestPath;
+    DumpStep step{DumpStep::kUnknown};
+    int32_t keyCount{0};
+    int32_t requestCount{0};
+    int32_t nullPolicyValue{0};
+    int32_t scale{0};
+    std::vector<cudf::aggregation::Kind> aggKinds;
+  };
+
+  std::vector<DumpInfo> partials;
+  for (auto const& dumpDir : dumps) {
+    auto manifestPath = dumpDir / "manifest.txt";
+    auto manifest = parseManifest(manifestPath);
+    DumpInfo info;
+    info.manifestPath = manifestPath;
+    info.step = requireStep(manifest, "step");
+    info.keyCount = requireInt32(manifest, "key_count");
+    info.requestCount = requireInt32(manifest, "request_count");
+    info.nullPolicyValue = requireInt32(manifest, "null_policy");
+    info.scale = requireInt32(manifest, "request.0.scale");
+    auto aggCount = requireInt32(manifest, "request.0.aggregation_count");
+    info.aggKinds.reserve(aggCount);
+    for (int32_t aggIdx = 0; aggIdx < aggCount; ++aggIdx) {
+      auto const kindValue = requireInt32(
+          manifest, "request.0.aggregation_kind." + std::to_string(aggIdx));
+      info.aggKinds.push_back(static_cast<cudf::aggregation::Kind>(kindValue));
+    }
+    if (info.step == DumpStep::kPartial || info.step == DumpStep::kSingle) {
+      partials.push_back(std::move(info));
+    }
+  }
+
+  if (partials.empty()) {
+    throw std::runtime_error("no partial or single dumps found in session");
+  }
+
+  auto const stream = cudf::get_default_stream();
+  std::unordered_map<__int128_t, __int128_t, Int128KeyHash> expectedSum;
+  expectedSum.reserve(1000000);
+
+  std::unique_ptr<cudf::table> partialOutput;
+  int32_t scale = partials.front().scale;
+  cudf::null_policy nullPolicy =
+      static_cast<cudf::null_policy>(partials.front().nullPolicyValue);
+
+  for (auto const& info : partials) {
+    auto manifest = parseManifest(info.manifestPath);
+    auto dumpDir = info.manifestPath.parent_path();
+    auto keySpec = parseColumnSpec(manifest, "key.0");
+    auto valueSpec = parseColumnSpec(manifest, "request.0");
+    auto keyHost = readColumnHostData(dumpDir, keySpec);
+    auto valueHost = readColumnHostData(dumpDir, valueSpec);
+
+    if (validateOptions.maxRows > 0 &&
+        keyHost.spec.size > validateOptions.maxRows) {
+      throw std::runtime_error("input rows exceed validate-max-rows");
+    }
+
+    // CPU expected accumulation.
+    for (int64_t row = 0; row < keyHost.spec.size; ++row) {
+      if (keyHost.spec.nullCount > 0 && !isValidAt(keyHost, row)) {
+        if (nullPolicy == cudf::null_policy::EXCLUDE) {
+          continue;
+        }
+        throw std::runtime_error("null key encountered in expected sum");
+      }
+      __int128_t keyValue{};
+      if (!decodeValueInt128(keyHost, row, keyValue)) {
+        throw std::runtime_error("unsupported key type in expected sum");
+      }
+      if (valueHost.spec.nullCount > 0 && !isValidAt(valueHost, row)) {
+        continue;
+      }
+      __int128_t value{};
+      if (!decodeValueInt128(valueHost, row, value)) {
+        throw std::runtime_error("unsupported value type in expected sum");
+      }
+      expectedSum[keyValue] += value;
+    }
+
+    // GPU groupby for this batch.
+    std::vector<std::unique_ptr<cudf::column>> keyColumns;
+    std::vector<cudf::column_view> keyViews;
+    auto keyCol = makeColumnFromHostData(keyHost, stream);
+    keyViews.push_back(keyCol->view());
+    keyColumns.push_back(std::move(keyCol));
+    cudf::table_view groupbyKeys(keyViews);
+
+    std::vector<std::unique_ptr<cudf::column>> requestColumns;
+    std::vector<cudf::groupby::aggregation_request> requests;
+    auto valueCol = makeColumnFromHostData(valueHost, stream);
+    requestColumns.push_back(std::move(valueCol));
+    cudf::groupby::aggregation_request request;
+    request.values = requestColumns.back()->view();
+    for (auto kind : info.aggKinds) {
+      request.aggregations.push_back(makeGroupbyAggregation(kind));
+    }
+    requests.push_back(std::move(request));
+
+    cudf::groupby::groupby groupby(groupbyKeys, nullPolicy);
+    auto output = groupby.aggregate(requests, stream);
+    auto groupKeys = std::move(output.first);
+    auto results = std::move(output.second);
+    if (!groupKeys || results.empty()) {
+      throw std::runtime_error("empty groupby output");
+    }
+
+    auto indices = findSumCountIndices(info.aggKinds);
+    if (indices.sumIdx < 0 || indices.countIdx < 0) {
+      throw std::runtime_error("missing SUM/COUNT in partial aggregation");
+    }
+    auto sumCol = std::move(results[0].results[indices.sumIdx]);
+    auto countCol = std::move(results[0].results[indices.countIdx]);
+
+    auto stateCol = facebook::velox::cudf_velox::serializeDecimalSumState(
+        sumCol->view(), countCol->view(), stream);
+
+    auto keyCols = groupKeys->release();
+    keyCols.push_back(std::move(stateCol));
+    auto batchTable = std::make_unique<cudf::table>(std::move(keyCols));
+
+    if (partialOutput) {
+      std::vector<cudf::table_view> tablesToConcat;
+      tablesToConcat.push_back(partialOutput->view());
+      tablesToConcat.push_back(batchTable->view());
+      auto concatenated = cudf::concatenate(tablesToConcat, stream);
+
+      auto stateView = concatenated->view().column(1);
+      auto decoded = facebook::velox::cudf_velox::deserializeDecimalSumStateWithCount(
+          stateView, scale, stream);
+      std::vector<cudf::column_view> mergeKeyViews;
+      mergeKeyViews.push_back(concatenated->view().column(0));
+      cudf::table_view mergeKeys(mergeKeyViews);
+
+      std::vector<cudf::groupby::aggregation_request> mergeRequests;
+      cudf::groupby::aggregation_request sumRequest;
+      sumRequest.values = decoded.sum->view();
+      sumRequest.aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      mergeRequests.push_back(std::move(sumRequest));
+
+      cudf::groupby::aggregation_request countRequest;
+      countRequest.values = decoded.count->view();
+      countRequest.aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+      mergeRequests.push_back(std::move(countRequest));
+
+      cudf::groupby::groupby mergeGroupby(mergeKeys, nullPolicy);
+      auto mergeOutput = mergeGroupby.aggregate(mergeRequests, stream);
+      auto mergeKeysOut = std::move(mergeOutput.first);
+      auto mergeResults = std::move(mergeOutput.second);
+      auto mergedSum = std::move(mergeResults[0].results[0]);
+      auto mergedCount = std::move(mergeResults[1].results[0]);
+      auto mergedState = facebook::velox::cudf_velox::serializeDecimalSumState(
+          mergedSum->view(), mergedCount->view(), stream);
+
+      auto mergedKeyCols = mergeKeysOut->release();
+      mergedKeyCols.push_back(std::move(mergedState));
+      partialOutput = std::make_unique<cudf::table>(std::move(mergedKeyCols));
+    } else {
+      partialOutput = std::move(batchTable);
+    }
+  }
+
+  if (!partialOutput) {
+    throw std::runtime_error("no partial output generated");
+  }
+
+  auto finalStateView = partialOutput->view().column(1);
+  auto finalDecoded = facebook::velox::cudf_velox::deserializeDecimalSumStateWithCount(
+      finalStateView, scale, stream);
+  std::vector<cudf::column_view> finalKeyViews;
+  finalKeyViews.push_back(partialOutput->view().column(0));
+  cudf::table_view finalKeys(finalKeyViews);
+
+  std::vector<cudf::groupby::aggregation_request> finalRequests;
+  cudf::groupby::aggregation_request finalSumRequest;
+  finalSumRequest.values = finalDecoded.sum->view();
+  finalSumRequest.aggregations.push_back(
+      cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+  finalRequests.push_back(std::move(finalSumRequest));
+
+  cudf::groupby::groupby finalGroupby(finalKeys, nullPolicy);
+  auto finalOutput = finalGroupby.aggregate(finalRequests, stream);
+  auto finalKeysOut = std::move(finalOutput.first);
+  auto finalResults = std::move(finalOutput.second);
+
+  auto keyHost = readOutputColumnHostData(finalKeysOut->view().column(0), stream);
+  auto sumHost =
+      readOutputColumnHostData(finalResults[0].results[0]->view(), stream);
+
+  int64_t mismatches = 0;
+  __int128_t firstMismatchKey = 0;
+  __int128_t firstExpected = 0;
+  __int128_t firstActual = 0;
+  for (int64_t row = 0; row < keyHost.spec.size; ++row) {
+    __int128_t keyValue{};
+    __int128_t outValue{};
+    if (!decodeValueInt128(keyHost, row, keyValue) ||
+        !decodeValueInt128(sumHost, row, outValue)) {
+      throw std::runtime_error("unsupported output types in final compare");
+    }
+    auto it = expectedSum.find(keyValue);
+    __int128_t expectedValue = (it != expectedSum.end()) ? it->second : 0;
+    if (outValue != expectedValue) {
+      if (mismatches == 0) {
+        firstMismatchKey = keyValue;
+        firstExpected = expectedValue;
+        firstActual = outValue;
+      }
+      ++mismatches;
+    }
+  }
+  if (static_cast<int64_t>(expectedSum.size()) != keyHost.spec.size) {
+    auto diff = static_cast<int64_t>(expectedSum.size()) - keyHost.spec.size;
+    mismatches += diff >= 0 ? diff : -diff;
+  }
+
+  std::cout << "[HashAggDumpReplay] chain_validate_mismatches " << mismatches;
+  if (mismatches > 0) {
+    std::cout << " firstMismatchKey=" << toString128(firstMismatchKey)
+              << " expected=" << toString128(firstExpected)
+              << " actual=" << toString128(firstActual);
+  }
+  std::cout << std::endl;
+  return mismatches > 0 ? 2 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   try {
     auto const inputPath = parseManifestPath(argc, argv);
     auto const validateOptions = parseValidationOptions(argc, argv);
+    auto const replayOptions = parseReplayOptions(argc, argv);
     auto runOne = [&](std::filesystem::path const& manifestPath) -> int {
       bool validate = validateOptions.enabled;
       auto const dumpDir = manifestPath.parent_path();
@@ -829,6 +1129,9 @@ int main(int argc, char** argv) {
 
     if (std::filesystem::is_directory(inputPath) &&
         std::filesystem::exists(inputPath / "hashagg_dump_index.txt")) {
+      if (replayOptions.replayChain) {
+        return runChainSession(inputPath, validateOptions);
+      }
       auto dumps = readSessionIndex(inputPath);
       int failedCount = 0;
       for (auto const& dumpDir : dumps) {
