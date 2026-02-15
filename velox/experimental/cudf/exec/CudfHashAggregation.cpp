@@ -2048,16 +2048,34 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         return;
       }
     } else {
-      auto& request = requests.emplace_back();
-      sumIdx_ = requests.size() - 1;
-      request.values = tbl.column(inputIndex);
-      request.aggregations.push_back(
-          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-      if (step == core::AggregationNode::Step::kPartial ||
-          (step == core::AggregationNode::Step::kSingle && isAvg_)) {
-        request.aggregations.push_back(
+      if (isAvg_ &&
+          (step == core::AggregationNode::Step::kPartial ||
+           step == core::AggregationNode::Step::kSingle)) {
+        // Isolate decimal AVG sum/count into independent requests. This avoids
+        // relying on multi-aggregation request behavior for decimal inputs.
+        sumIdx_ = requests.size();
+        auto& sumRequest = requests.emplace_back();
+        sumRequest.values = tbl.column(inputIndex);
+        sumRequest.aggregations.push_back(
+            cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+
+        countIdx_ = requests.size();
+        auto& countRequest = requests.emplace_back();
+        countRequest.values = tbl.column(inputIndex);
+        countRequest.aggregations.push_back(
             cudf::make_count_aggregation<cudf::groupby_aggregation>(
                 cudf::null_policy::EXCLUDE));
+      } else {
+        auto& request = requests.emplace_back();
+        sumIdx_ = requests.size() - 1;
+        request.values = tbl.column(inputIndex);
+        request.aggregations.push_back(
+            cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+        if (step == core::AggregationNode::Step::kPartial) {
+          request.aggregations.push_back(
+              cudf::make_count_aggregation<cudf::groupby_aggregation>(
+                  cudf::null_policy::EXCLUDE));
+        }
       }
       logHashAggDebug(
           "Decimal.addGroupbyRequest.rawInput",
@@ -2082,11 +2100,16 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         sumIdx_);
     auto col = std::move(results[sumIdx_].results[0]);
     if (isAvg_ && step == core::AggregationNode::Step::kSingle) {
-      auto count = std::move(results[sumIdx_].results[1]);
+      auto count = std::move(results[countIdx_].results[0]);
       return computeAvgColumn(std::move(col), std::move(count), stream);
     }
     if (step == core::AggregationNode::Step::kPartial) {
-      auto count = std::move(results[sumIdx_].results[1]);
+      std::unique_ptr<cudf::column> count;
+      if (isAvg_) {
+        count = std::move(results[countIdx_].results[0]);
+      } else {
+        count = std::move(results[sumIdx_].results[1]);
+      }
       if (count->type().id() != cudf::type_id::INT64) {
         count = cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream);
       }
