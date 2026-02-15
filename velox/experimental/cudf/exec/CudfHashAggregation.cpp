@@ -4221,6 +4221,17 @@ bool canBeEvaluatedByCudf(
 
   // Check supported aggregation functions using step-aware aggregation registry
   for (const auto& aggregate : aggregationNode.aggregates()) {
+    // Temporary detour: force CPU aggregation for decimal SUM/AVG inputs.
+    // This avoids cuDF decimal groupby issues while the bug is investigated.
+    const auto& rawTypes = aggregate.rawInputTypes;
+    if (rawTypes.size() == 1 && rawTypes[0] && rawTypes[0]->isDecimal()) {
+      const auto& name = aggregate.call->name();
+      const auto& prefix = CudfConfig::getInstance().functionNamePrefix;
+      if (name.rfind(prefix + "sum", 0) == 0 ||
+          name.rfind(prefix + "avg", 0) == 0) {
+        return false;
+      }
+    }
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {
