@@ -41,6 +41,8 @@ struct CudfConfig {
       "cudf.debug_hashagg_probe_dump_max_rows"};
   static constexpr const char* kCudfDebugHashAggDecimalCpuAggregateMode{
       "cudf.debug_hashagg_decimal_cpu_aggregate_mode"};
+  static constexpr const char* kCudfDebugDisableDecimalSumAvgGpu{
+      "cudf.debug_disable_decimal_sum_avg_gpu"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -114,6 +116,11 @@ struct CudfConfig {
   ///   0 => disabled
   ///   1 => enabled (fails fast if an unsupported aggregate shape is seen)
   int32_t debugHashAggDecimalCpuAggregateMode{0};
+
+  /// Optional: disable cuDF for decimal SUM/AVG and force CPU aggregation.
+  /// Default is true to preserve current safety detour; set to false to allow
+  /// cuDF decimal SUM/AVG execution.
+  bool debugDisableDecimalSumAvgGpu{true};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

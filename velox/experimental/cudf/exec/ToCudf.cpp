@@ -572,6 +572,10 @@ void CudfConfig::initialize(
     debugHashAggDecimalCpuAggregateMode =
         folly::to<int32_t>(config[kCudfDebugHashAggDecimalCpuAggregateMode]);
   }
+  if (config.find(kCudfDebugDisableDecimalSumAvgGpu) != config.end()) {
+    debugDisableDecimalSumAvgGpu =
+        folly::to<bool>(config[kCudfDebugDisableDecimalSumAvgGpu]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }
@@ -597,7 +601,8 @@ void CudfConfig::initialize(
   if (debugEnabled || debugExprTree || debugOperatorFlow ||
       debugOperatorFlowSync || debugOperatorFlowDeviceSyncPoint != 0 ||
       debugHashAggFakeGroupbyMode != 0 || !debugHashAggProbeDumpDir.empty() ||
-      debugHashAggDecimalCpuAggregateMode != 0) {
+      debugHashAggDecimalCpuAggregateMode != 0 ||
+      debugDisableDecimalSumAvgGpu) {
     LOG(INFO) << "[CudfConfig] enabled=" << enabled
               << " debugEnabled=" << debugEnabled
               << " debugExprTree=" << debugExprTree
@@ -612,6 +617,8 @@ void CudfConfig::initialize(
               << debugHashAggProbeDumpMaxRows
               << " debugHashAggDecimalCpuAggregateMode="
               << debugHashAggDecimalCpuAggregateMode
+              << " debugDisableDecimalSumAvgGpu="
+              << debugDisableDecimalSumAvgGpu
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }
