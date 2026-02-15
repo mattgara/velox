@@ -55,6 +55,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <optional>
 #include <mutex>
 #include <sstream>
@@ -1296,15 +1297,18 @@ std::string maybeWriteGroupbyDump(
 
   AggregateProbeCallStatus status;
   static std::atomic<uint64_t> dumpCounter{0};
-  auto const tsMicros =
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count();
-  auto const dumpId = dumpCounter.fetch_add(1);
-  auto const dumpDir =
-      std::filesystem::path(hashAggDebugDumpDir()) /
-      ("hashagg_main_" + std::to_string(tsMicros) + "_" +
-       std::to_string(dumpId));
+  auto const baseDir = std::filesystem::path(hashAggDebugDumpDir());
+  uint64_t dumpId = dumpCounter.fetch_add(1);
+  std::filesystem::path dumpDir;
+  for (int attempt = 0; attempt < 1024; ++attempt) {
+    std::ostringstream name;
+    name << "hashagg_main_" << std::setw(6) << std::setfill('0') << dumpId;
+    dumpDir = baseDir / name.str();
+    if (!std::filesystem::exists(dumpDir)) {
+      break;
+    }
+    dumpId = dumpCounter.fetch_add(1);
+  }
 
   std::error_code ec;
   std::filesystem::create_directories(dumpDir, ec);
@@ -1372,6 +1376,8 @@ std::string maybeWriteGroupbyDump(
   auto const subsetLabel = formatRequestSubset(requestSubset);
   manifest << "format_version=1\n";
   manifest << "dump_kind=main\n";
+  manifest << "dump_sequence=" << dumpId << "\n";
+  manifest << "dump_name=" << dumpDir.filename().string() << "\n";
   manifest << "step=" << stepName(step) << "\n";
   manifest << "probe_ordinal=0\n";
   manifest << "mode=main\n";
@@ -1436,6 +1442,17 @@ std::string maybeWriteGroupbyDump(
   manifest << "replay_command=velox_cudf_hashagg_replay --manifest "
            << manifestPath.string() << "\n";
   manifest.close();
+
+  auto const indexPath = baseDir / "hashagg_dump_index.txt";
+  std::ofstream indexFile(indexPath, std::ios::app);
+  if (indexFile.is_open()) {
+    indexFile << dumpDir.string() << "\n";
+  }
+  auto const latestPath = baseDir / "hashagg_dump_latest.txt";
+  std::ofstream latestFile(latestPath);
+  if (latestFile.is_open()) {
+    latestFile << dumpDir.string() << "\n";
+  }
 
   LOG(INFO) << "[CudfHashAggDebug] stage=HashAgg.doGroupByAggregation."
                "groupbyDumpWritten step="

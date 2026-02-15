@@ -21,6 +21,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -434,8 +435,13 @@ ColumnHostData readOutputColumnHostData(
 
 std::filesystem::path parseManifestPath(int argc, char** argv) {
   std::filesystem::path manifestPath;
+  std::filesystem::path sessionDir;
   for (int i = 1; i < argc; ++i) {
     std::string arg{argv[i]};
+    if (arg == "--session" && i + 1 < argc) {
+      sessionDir = argv[++i];
+      continue;
+    }
     if (arg == "--manifest" && i + 1 < argc) {
       manifestPath = argv[++i];
       continue;
@@ -445,10 +451,14 @@ std::filesystem::path parseManifestPath(int argc, char** argv) {
       continue;
     }
   }
+  if (!sessionDir.empty()) {
+    return sessionDir;
+  }
   if (manifestPath.empty()) {
     throw std::runtime_error(
         "usage: velox_cudf_hashagg_dump_replay --manifest <path/to/manifest.txt> "
-        "or --dump_dir <path/to/dump_dir> [--no-validate] [--validate-max-rows N]");
+        "or --dump_dir <path/to/dump_dir> or --session <path/to/session_dir> "
+        "[--no-validate] [--validate-max-rows N]");
   }
   return manifestPath;
 }
@@ -471,257 +481,297 @@ ValidationOptions parseValidationOptions(int argc, char** argv) {
   return options;
 }
 
+std::vector<std::filesystem::path> readSessionIndex(
+    std::filesystem::path const& sessionDir) {
+  auto const indexPath = sessionDir / "hashagg_dump_index.txt";
+  std::ifstream in(indexPath);
+  if (!in.is_open()) {
+    throw std::runtime_error(
+        "failed to open session index: " + indexPath.string());
+  }
+  std::vector<std::filesystem::path> dumps;
+  std::string line;
+  while (std::getline(in, line)) {
+    line = trim(line);
+    if (line.empty()) {
+      continue;
+    }
+    dumps.emplace_back(line);
+  }
+  return dumps;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
   try {
-    auto const manifestPath = parseManifestPath(argc, argv);
+    auto const inputPath = parseManifestPath(argc, argv);
     auto const validateOptions = parseValidationOptions(argc, argv);
-    bool validate = validateOptions.enabled;
-    auto const dumpDir = manifestPath.parent_path();
-    auto const manifest = parseManifest(manifestPath);
-    auto const stream = cudf::get_default_stream();
+    auto runOne = [&](std::filesystem::path const& manifestPath) -> int {
+      bool validate = validateOptions.enabled;
+      auto const dumpDir = manifestPath.parent_path();
+      auto const manifest = parseManifest(manifestPath);
+      auto const stream = cudf::get_default_stream();
 
-    auto const keyCount = requireInt32(manifest, "key_count");
-    auto const requestCount = requireInt32(manifest, "request_count");
-    auto const nullPolicyValue = requireInt32(manifest, "null_policy");
-    auto const nullPolicy = static_cast<cudf::null_policy>(nullPolicyValue);
+      auto const keyCount = requireInt32(manifest, "key_count");
+      auto const requestCount = requireInt32(manifest, "request_count");
+      auto const nullPolicyValue = requireInt32(manifest, "null_policy");
+      auto const nullPolicy = static_cast<cudf::null_policy>(nullPolicyValue);
 
-    std::vector<std::unique_ptr<cudf::column>> keyColumns;
-    std::vector<cudf::column_view> keyViews;
-    std::vector<ColumnHostData> keyHostData;
-    keyColumns.reserve(keyCount);
-    keyViews.reserve(keyCount);
-    keyHostData.reserve(keyCount);
-    for (int32_t i = 0; i < keyCount; ++i) {
-      auto spec = parseColumnSpec(manifest, "key." + std::to_string(i));
-      auto host = readColumnHostData(dumpDir, spec);
-      auto col = makeColumnFromHostData(host, stream);
-      keyViews.push_back(col->view());
-      keyColumns.push_back(std::move(col));
-      keyHostData.push_back(std::move(host));
-    }
-    cudf::table_view groupbyKeys(keyViews);
-
-    std::vector<std::unique_ptr<cudf::column>> requestValueColumns;
-    std::vector<cudf::groupby::aggregation_request> requests;
-    std::vector<ColumnHostData> requestHostData;
-    std::vector<std::vector<cudf::aggregation::Kind>> requestAggKinds;
-    requestValueColumns.reserve(requestCount);
-    requests.reserve(requestCount);
-    requestHostData.reserve(requestCount);
-    requestAggKinds.reserve(requestCount);
-    for (int32_t i = 0; i < requestCount; ++i) {
-      auto const prefix = "request." + std::to_string(i);
-      auto spec = parseColumnSpec(manifest, prefix);
-      auto host = readColumnHostData(dumpDir, spec);
-      auto col = makeColumnFromHostData(host, stream);
-      requestValueColumns.push_back(std::move(col));
-      requestHostData.push_back(std::move(host));
-
-      cudf::groupby::aggregation_request request;
-      request.values = requestValueColumns.back()->view();
-      auto const aggCount = requireInt32(manifest, prefix + ".aggregation_count");
-      request.aggregations.reserve(aggCount);
-      std::vector<cudf::aggregation::Kind> aggKinds;
-      aggKinds.reserve(aggCount);
-      for (int32_t aggIdx = 0; aggIdx < aggCount; ++aggIdx) {
-        auto const kindValue = requireInt32(
-            manifest, prefix + ".aggregation_kind." + std::to_string(aggIdx));
-        auto const kind = static_cast<cudf::aggregation::Kind>(kindValue);
-        request.aggregations.push_back(makeGroupbyAggregation(kind));
-        aggKinds.push_back(kind);
+      std::vector<std::unique_ptr<cudf::column>> keyColumns;
+      std::vector<cudf::column_view> keyViews;
+      std::vector<ColumnHostData> keyHostData;
+      keyColumns.reserve(keyCount);
+      keyViews.reserve(keyCount);
+      keyHostData.reserve(keyCount);
+      for (int32_t i = 0; i < keyCount; ++i) {
+        auto spec = parseColumnSpec(manifest, "key." + std::to_string(i));
+        auto host = readColumnHostData(dumpDir, spec);
+        auto col = makeColumnFromHostData(host, stream);
+        keyViews.push_back(col->view());
+        keyColumns.push_back(std::move(col));
+        keyHostData.push_back(std::move(host));
       }
-      requests.push_back(std::move(request));
-      requestAggKinds.push_back(std::move(aggKinds));
-    }
+      cudf::table_view groupbyKeys(keyViews);
 
-    std::cout << "[HashAggDumpReplay] manifest=" << manifestPath.string()
-              << " keyCount=" << keyCount << " requestCount=" << requestCount
-              << " nullPolicy=" << nullPolicyValue
-              << " validate=" << (validate ? 1 : 0) << std::endl;
+      std::vector<std::unique_ptr<cudf::column>> requestValueColumns;
+      std::vector<cudf::groupby::aggregation_request> requests;
+      std::vector<ColumnHostData> requestHostData;
+      std::vector<std::vector<cudf::aggregation::Kind>> requestAggKinds;
+      requestValueColumns.reserve(requestCount);
+      requests.reserve(requestCount);
+      requestHostData.reserve(requestCount);
+      requestAggKinds.reserve(requestCount);
+      for (int32_t i = 0; i < requestCount; ++i) {
+        auto const prefix = "request." + std::to_string(i);
+        auto spec = parseColumnSpec(manifest, prefix);
+        auto host = readColumnHostData(dumpDir, spec);
+        auto col = makeColumnFromHostData(host, stream);
+        requestValueColumns.push_back(std::move(col));
+        requestHostData.push_back(std::move(host));
 
-    bool aggregateThrew = false;
-    std::string exceptionText;
-    int64_t outputRows = -1;
-    int64_t outputCount = -1;
-    std::unique_ptr<cudf::table> outputKeys;
-    std::vector<cudf::groupby::aggregation_result> outputResults;
-    try {
-      cudf::groupby::groupby groupby(groupbyKeys, nullPolicy);
-      auto output = groupby.aggregate(requests, stream);
-      outputRows = output.first ? output.first->num_rows() : 0;
-      outputCount = output.second.size();
-      outputKeys = std::move(output.first);
-      outputResults = std::move(output.second);
-    } catch (const std::exception& e) {
-      aggregateThrew = true;
-      exceptionText = e.what();
-    }
-
-    auto const peekErr = cudaPeekAtLastError();
-    auto const streamSyncErr = cudaStreamSynchronize(stream.value());
-    auto const deviceSyncErr = cudaDeviceSynchronize();
-
-    std::cout << "[HashAggDumpReplay] aggregateThrew=" << (aggregateThrew ? 1 : 0)
-              << " outputRows=" << outputRows
-              << " outputCount=" << outputCount
-              << " cudaPeek=" << cudaGetErrorName(peekErr) << "("
-              << static_cast<int>(peekErr) << ")"
-              << " cudaStreamSync=" << cudaGetErrorName(streamSyncErr) << "("
-              << static_cast<int>(streamSyncErr) << ")"
-              << " cudaDeviceSync=" << cudaGetErrorName(deviceSyncErr) << "("
-              << static_cast<int>(deviceSyncErr) << ")" << std::endl;
-    if (aggregateThrew) {
-      std::cout << "[HashAggDumpReplay] exception=" << exceptionText << std::endl;
-    }
-
-    bool validationSkipped = false;
-    std::string validationSkipReason;
-    int64_t validationMismatches = 0;
-    __int128_t firstMismatchKey = 0;
-    __int128_t firstExpected = 0;
-    __int128_t firstActual = 0;
-    if (validate && !aggregateThrew) {
-      if (validateOptions.maxRows > 0 &&
-          !keyHostData.empty() &&
-          keyHostData[0].spec.size > validateOptions.maxRows) {
-        validationSkipped = true;
-        validationSkipReason = "input rows exceed validate-max-rows";
-      } else if (keyCount != 1) {
-        validationSkipped = true;
-        validationSkipReason = "validation requires single key column";
-      } else if (requestCount != 1) {
-        validationSkipped = true;
-        validationSkipReason = "validation requires single request column";
-      } else if (requestAggKinds[0].size() != 1) {
-        validationSkipped = true;
-        validationSkipReason = "validation requires single aggregation";
-      } else if (!isSupportedAggKind(requestAggKinds[0][0]) ||
-                 requestAggKinds[0][0] != cudf::aggregation::Kind::SUM) {
-        validationSkipped = true;
-        validationSkipReason = "validation supports SUM only";
-      } else if (keyHostData[0].spec.nullCount > 0 &&
-                 nullPolicy == cudf::null_policy::INCLUDE) {
-        validationSkipped = true;
-        validationSkipReason = "validation does not support null keys";
+        cudf::groupby::aggregation_request request;
+        request.values = requestValueColumns.back()->view();
+        auto const aggCount = requireInt32(manifest, prefix + ".aggregation_count");
+        request.aggregations.reserve(aggCount);
+        std::vector<cudf::aggregation::Kind> aggKinds;
+        aggKinds.reserve(aggCount);
+        for (int32_t aggIdx = 0; aggIdx < aggCount; ++aggIdx) {
+          auto const kindValue = requireInt32(
+              manifest, prefix + ".aggregation_kind." + std::to_string(aggIdx));
+          auto const kind = static_cast<cudf::aggregation::Kind>(kindValue);
+          request.aggregations.push_back(makeGroupbyAggregation(kind));
+          aggKinds.push_back(kind);
+        }
+        requests.push_back(std::move(request));
+        requestAggKinds.push_back(std::move(aggKinds));
       }
 
-      if (!validationSkipped) {
-        std::unordered_map<__int128_t, __int128_t, Int128KeyHash> expected;
-        auto const numRows = keyHostData[0].spec.size;
-        expected.reserve(static_cast<size_t>(numRows));
-        for (int64_t row = 0; row < numRows; ++row) {
-          if (keyHostData[0].spec.nullCount > 0 &&
-              !isValidAt(keyHostData[0], row)) {
-            if (nullPolicy == cudf::null_policy::EXCLUDE) {
-              continue;
-            }
-            validationSkipped = true;
-            validationSkipReason = "null key encountered";
-            break;
-          }
-          __int128_t keyValue{};
-          if (!decodeValueInt128(keyHostData[0], row, keyValue)) {
-            validationSkipped = true;
-            validationSkipReason = "unsupported key type";
-            break;
-          }
-          if (requestHostData[0].spec.nullCount > 0 &&
-              !isValidAt(requestHostData[0], row)) {
-            continue;
-          }
-          __int128_t value{};
-          if (!decodeValueInt128(requestHostData[0], row, value)) {
-            validationSkipped = true;
-            validationSkipReason = "unsupported request type";
-            break;
-          }
-          expected[keyValue] += value;
+      std::cout << "[HashAggDumpReplay] manifest=" << manifestPath.string()
+                << " keyCount=" << keyCount << " requestCount=" << requestCount
+                << " nullPolicy=" << nullPolicyValue
+                << " validate=" << (validate ? 1 : 0) << std::endl;
+
+      bool aggregateThrew = false;
+      std::string exceptionText;
+      int64_t outputRows = -1;
+      int64_t outputCount = -1;
+      std::unique_ptr<cudf::table> outputKeys;
+      std::vector<cudf::groupby::aggregation_result> outputResults;
+      try {
+        cudf::groupby::groupby groupby(groupbyKeys, nullPolicy);
+        auto output = groupby.aggregate(requests, stream);
+        outputRows = output.first ? output.first->num_rows() : 0;
+        outputCount = output.second.size();
+        outputKeys = std::move(output.first);
+        outputResults = std::move(output.second);
+      } catch (const std::exception& e) {
+        aggregateThrew = true;
+        exceptionText = e.what();
+      }
+
+      auto const peekErr = cudaPeekAtLastError();
+      auto const streamSyncErr = cudaStreamSynchronize(stream.value());
+      auto const deviceSyncErr = cudaDeviceSynchronize();
+
+      std::cout << "[HashAggDumpReplay] aggregateThrew="
+                << (aggregateThrew ? 1 : 0)
+                << " outputRows=" << outputRows
+                << " outputCount=" << outputCount
+                << " cudaPeek=" << cudaGetErrorName(peekErr) << "("
+                << static_cast<int>(peekErr) << ")"
+                << " cudaStreamSync=" << cudaGetErrorName(streamSyncErr) << "("
+                << static_cast<int>(streamSyncErr) << ")"
+                << " cudaDeviceSync=" << cudaGetErrorName(deviceSyncErr) << "("
+                << static_cast<int>(deviceSyncErr) << ")" << std::endl;
+      if (aggregateThrew) {
+        std::cout << "[HashAggDumpReplay] exception=" << exceptionText << std::endl;
+      }
+
+      bool validationSkipped = false;
+      std::string validationSkipReason;
+      int64_t validationMismatches = 0;
+      __int128_t firstMismatchKey = 0;
+      __int128_t firstExpected = 0;
+      __int128_t firstActual = 0;
+      if (validate && !aggregateThrew) {
+        if (validateOptions.maxRows > 0 &&
+            !keyHostData.empty() &&
+            keyHostData[0].spec.size > validateOptions.maxRows) {
+          validationSkipped = true;
+          validationSkipReason = "input rows exceed validate-max-rows";
+        } else if (keyCount != 1) {
+          validationSkipped = true;
+          validationSkipReason = "validation requires single key column";
+        } else if (requestCount != 1) {
+          validationSkipped = true;
+          validationSkipReason = "validation requires single request column";
+        } else if (requestAggKinds[0].size() != 1) {
+          validationSkipped = true;
+          validationSkipReason = "validation requires single aggregation";
+        } else if (!isSupportedAggKind(requestAggKinds[0][0]) ||
+                   requestAggKinds[0][0] != cudf::aggregation::Kind::SUM) {
+          validationSkipped = true;
+          validationSkipReason = "validation supports SUM only";
+        } else if (keyHostData[0].spec.nullCount > 0 &&
+                   nullPolicy == cudf::null_policy::INCLUDE) {
+          validationSkipped = true;
+          validationSkipReason = "validation does not support null keys";
         }
 
         if (!validationSkipped) {
-          if (!outputKeys || outputResults.empty()) {
-            validationSkipped = true;
-            validationSkipReason = "missing output for validation";
-          } else if (outputKeys->num_columns() != 1 ||
-                     outputResults[0].results.size() != 1) {
-            validationSkipped = true;
-            validationSkipReason = "output shape mismatch";
-          } else {
-            auto outputKeyHost =
-                readOutputColumnHostData(outputKeys->view().column(0), stream);
-            auto outputValHost =
-                readOutputColumnHostData(outputResults[0].results[0]->view(), stream);
-            if (outputKeyHost.spec.nullCount > 0 ||
-                outputValHost.spec.nullCount > 0) {
-              validationSkipped = true;
-              validationSkipReason = "output contains nulls";
-            } else {
-              auto const outRows = outputKeyHost.spec.size;
-              for (int64_t row = 0; row < outRows; ++row) {
-                __int128_t keyValue{};
-                __int128_t outValue{};
-                if (!decodeValueInt128(outputKeyHost, row, keyValue)) {
-                  validationSkipped = true;
-                  validationSkipReason = "unsupported output key type";
-                  break;
-                }
-                if (!decodeValueInt128(outputValHost, row, outValue)) {
-                  validationSkipped = true;
-                  validationSkipReason = "unsupported output value type";
-                  break;
-                }
-                auto it = expected.find(keyValue);
-                if (it == expected.end()) {
-                  if (validationMismatches == 0) {
-                    firstMismatchKey = keyValue;
-                    firstExpected = 0;
-                    firstActual = outValue;
-                  }
-                  ++validationMismatches;
-                  continue;
-                }
-                if (outValue != it->second) {
-                  if (validationMismatches == 0) {
-                    firstMismatchKey = keyValue;
-                    firstExpected = it->second;
-                    firstActual = outValue;
-                  }
-                  ++validationMismatches;
-                }
+          std::unordered_map<__int128_t, __int128_t, Int128KeyHash> expected;
+          auto const numRows = keyHostData[0].spec.size;
+          expected.reserve(static_cast<size_t>(numRows));
+          for (int64_t row = 0; row < numRows; ++row) {
+            if (keyHostData[0].spec.nullCount > 0 &&
+                !isValidAt(keyHostData[0], row)) {
+              if (nullPolicy == cudf::null_policy::EXCLUDE) {
+                continue;
               }
-              if (!validationSkipped &&
-                  static_cast<int64_t>(expected.size()) != outRows) {
-                auto diff = static_cast<int64_t>(expected.size()) - outRows;
-                validationMismatches += diff >= 0 ? diff : -diff;
+              validationSkipped = true;
+              validationSkipReason = "null key encountered";
+              break;
+            }
+            __int128_t keyValue{};
+            if (!decodeValueInt128(keyHostData[0], row, keyValue)) {
+              validationSkipped = true;
+              validationSkipReason = "unsupported key type";
+              break;
+            }
+            if (requestHostData[0].spec.nullCount > 0 &&
+                !isValidAt(requestHostData[0], row)) {
+              continue;
+            }
+            __int128_t value{};
+            if (!decodeValueInt128(requestHostData[0], row, value)) {
+              validationSkipped = true;
+              validationSkipReason = "unsupported request type";
+              break;
+            }
+            expected[keyValue] += value;
+          }
+
+          if (!validationSkipped) {
+            if (!outputKeys || outputResults.empty()) {
+              validationSkipped = true;
+              validationSkipReason = "missing output for validation";
+            } else if (outputKeys->num_columns() != 1 ||
+                       outputResults[0].results.size() != 1) {
+              validationSkipped = true;
+              validationSkipReason = "output shape mismatch";
+            } else {
+              auto outputKeyHost =
+                  readOutputColumnHostData(outputKeys->view().column(0), stream);
+              auto outputValHost = readOutputColumnHostData(
+                  outputResults[0].results[0]->view(), stream);
+              if (outputKeyHost.spec.nullCount > 0 ||
+                  outputValHost.spec.nullCount > 0) {
+                validationSkipped = true;
+                validationSkipReason = "output contains nulls";
+              } else {
+                auto const outRows = outputKeyHost.spec.size;
+                for (int64_t row = 0; row < outRows; ++row) {
+                  __int128_t keyValue{};
+                  __int128_t outValue{};
+                  if (!decodeValueInt128(outputKeyHost, row, keyValue)) {
+                    validationSkipped = true;
+                    validationSkipReason = "unsupported output key type";
+                    break;
+                  }
+                  if (!decodeValueInt128(outputValHost, row, outValue)) {
+                    validationSkipped = true;
+                    validationSkipReason = "unsupported output value type";
+                    break;
+                  }
+                  auto it = expected.find(keyValue);
+                  if (it == expected.end()) {
+                    if (validationMismatches == 0) {
+                      firstMismatchKey = keyValue;
+                      firstExpected = 0;
+                      firstActual = outValue;
+                    }
+                    ++validationMismatches;
+                    continue;
+                  }
+                  if (outValue != it->second) {
+                    if (validationMismatches == 0) {
+                      firstMismatchKey = keyValue;
+                      firstExpected = it->second;
+                      firstActual = outValue;
+                    }
+                    ++validationMismatches;
+                  }
+                }
+                if (!validationSkipped &&
+                    static_cast<int64_t>(expected.size()) != outRows) {
+                  auto diff = static_cast<int64_t>(expected.size()) - outRows;
+                  validationMismatches += diff >= 0 ? diff : -diff;
+                }
               }
             }
           }
         }
       }
-    }
 
-    if (validate) {
-      if (validationSkipped) {
-        std::cout << "[HashAggDumpReplay] validate=skipped reason="
-                  << validationSkipReason << std::endl;
-      } else {
-        std::cout << "[HashAggDumpReplay] validate=mismatches "
-                  << validationMismatches;
-        if (validationMismatches > 0) {
-          std::cout << " firstMismatchKey=" << toString128(firstMismatchKey)
-                    << " expected=" << toString128(firstExpected)
-                    << " actual=" << toString128(firstActual);
+      if (validate) {
+        if (validationSkipped) {
+          std::cout << "[HashAggDumpReplay] validate=skipped reason="
+                    << validationSkipReason << std::endl;
+        } else {
+          std::cout << "[HashAggDumpReplay] validate=mismatches "
+                    << validationMismatches;
+          if (validationMismatches > 0) {
+            std::cout << " firstMismatchKey=" << toString128(firstMismatchKey)
+                      << " expected=" << toString128(firstExpected)
+                      << " actual=" << toString128(firstActual);
+          }
+          std::cout << std::endl;
         }
-        std::cout << std::endl;
       }
+
+      auto const failed = aggregateThrew || peekErr != cudaSuccess ||
+          streamSyncErr != cudaSuccess || deviceSyncErr != cudaSuccess ||
+          (!validationSkipped && validationMismatches > 0);
+      return failed ? 2 : 0;
+    };
+
+    if (std::filesystem::is_directory(inputPath) &&
+        std::filesystem::exists(inputPath / "hashagg_dump_index.txt")) {
+      auto dumps = readSessionIndex(inputPath);
+      int failedCount = 0;
+      for (auto const& dumpDir : dumps) {
+        auto code = runOne(dumpDir / "manifest.txt");
+        if (code != 0) {
+          ++failedCount;
+        }
+      }
+      std::cout << "[HashAggDumpReplay] session_dumps=" << dumps.size()
+                << " failures=" << failedCount << std::endl;
+      return failedCount > 0 ? 2 : 0;
     }
 
-    auto const failed = aggregateThrew || peekErr != cudaSuccess ||
-        streamSyncErr != cudaSuccess || deviceSyncErr != cudaSuccess ||
-        (!validationSkipped && validationMismatches > 0);
-    return failed ? 2 : 0;
+    return runOne(inputPath);
   } catch (const std::exception& e) {
     std::cerr << "[HashAggDumpReplay] fatal error: " << e.what() << std::endl;
     return 1;
