@@ -705,6 +705,9 @@ int runChainSession(
     }
     auto sumCol = std::move(results[0].results[indices.sumIdx]);
     auto countCol = std::move(results[0].results[indices.countIdx]);
+    if (countCol->type().id() != cudf::type_id::INT64) {
+      countCol = cudf::cast(*countCol, cudf::data_type{cudf::type_id::INT64}, stream);
+    }
 
     auto stateCol = facebook::velox::cudf_velox::serializeDecimalSumState(
         sumCol->view(), countCol->view(), stream);
@@ -745,6 +748,10 @@ int runChainSession(
       auto mergeResults = std::move(mergeOutput.second);
       auto mergedSum = std::move(mergeResults[0].results[0]);
       auto mergedCount = std::move(mergeResults[1].results[0]);
+      if (mergedCount->type().id() != cudf::type_id::INT64) {
+        mergedCount =
+            cudf::cast(*mergedCount, cudf::data_type{cudf::type_id::INT64}, stream);
+      }
       auto mergedState = facebook::velox::cudf_velox::serializeDecimalSumState(
           mergedSum->view(), mergedCount->view(), stream);
 
