@@ -32,6 +32,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -222,7 +223,9 @@ int main(int argc, char** argv) {
       request.values = valCol->view();
       request.aggregations.push_back(
           cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-      auto output = groupby.aggregate({request}, stream);
+      std::vector<cudf::groupby::aggregation_request> requests;
+      requests.push_back(std::move(request));
+      auto output = groupby.aggregate(requests, stream);
       stream.synchronize();
 
       auto outKeysView = output.first->get_column(0).view();
@@ -234,23 +237,30 @@ int main(int argc, char** argv) {
       std::vector<__int128_t> outVals128(outRows);
       std::vector<int64_t> outVals64(outRows);
 
+      auto outKeysPtr = static_cast<const int64_t*>(outKeysView.head()) +
+          outKeysView.offset();
       cudaMemcpyAsync(
           outKeys.data(),
-          outKeysView.data<int64_t>(),
+          outKeysPtr,
           static_cast<size_t>(outRows) * sizeof(int64_t),
           cudaMemcpyDeviceToHost,
           stream.value());
       if (outIs128) {
+        auto outValsPtr128 =
+            static_cast<const __int128_t*>(outValsView.head()) +
+            outValsView.offset();
         cudaMemcpyAsync(
             outVals128.data(),
-            outValsView.data<__int128_t>(),
+            outValsPtr128,
             static_cast<size_t>(outRows) * sizeof(__int128_t),
             cudaMemcpyDeviceToHost,
             stream.value());
       } else {
+        auto outValsPtr64 = static_cast<const int64_t*>(outValsView.head()) +
+            outValsView.offset();
         cudaMemcpyAsync(
             outVals64.data(),
-            outValsView.data<int64_t>(),
+            outValsPtr64,
             static_cast<size_t>(outRows) * sizeof(int64_t),
             cudaMemcpyDeviceToHost,
             stream.value());
@@ -348,7 +358,9 @@ int main(int argc, char** argv) {
     request.values = valCol->view();
     request.aggregations.push_back(
         cudf::make_sum_aggregation<cudf::groupby_aggregation>());
-    auto output = groupby.aggregate({request}, stream);
+    std::vector<cudf::groupby::aggregation_request> requests;
+    requests.push_back(std::move(request));
+    auto output = groupby.aggregate(requests, stream);
     stream.synchronize();
 
     auto outKeysView = output.first->get_column(0).view();
@@ -359,23 +371,29 @@ int main(int argc, char** argv) {
     std::vector<__int128_t> outVals128(outRows);
     std::vector<int64_t> outVals64(outRows);
 
+    auto outKeysPtr = static_cast<const int64_t*>(outKeysView.head()) +
+        outKeysView.offset();
     cudaMemcpyAsync(
         outKeys.data(),
-        outKeysView.data<int64_t>(),
+        outKeysPtr,
         static_cast<size_t>(outRows) * sizeof(int64_t),
         cudaMemcpyDeviceToHost,
         stream.value());
     if (outIs128) {
+      auto outValsPtr128 = static_cast<const __int128_t*>(outValsView.head()) +
+          outValsView.offset();
       cudaMemcpyAsync(
           outVals128.data(),
-          outValsView.data<__int128_t>(),
+          outValsPtr128,
           static_cast<size_t>(outRows) * sizeof(__int128_t),
           cudaMemcpyDeviceToHost,
           stream.value());
     } else {
+      auto outValsPtr64 = static_cast<const int64_t*>(outValsView.head()) +
+          outValsView.offset();
       cudaMemcpyAsync(
           outVals64.data(),
-          outValsView.data<int64_t>(),
+          outValsPtr64,
           static_cast<size_t>(outRows) * sizeof(int64_t),
           cudaMemcpyDeviceToHost,
           stream.value());
