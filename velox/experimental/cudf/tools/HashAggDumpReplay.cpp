@@ -253,6 +253,26 @@ std::unique_ptr<cudf::groupby_aggregation> makeGroupbyAggregation(
   }
 }
 
+const char* aggregationKindName(cudf::aggregation::Kind kind) {
+  using Kind = cudf::aggregation::Kind;
+  switch (kind) {
+    case Kind::SUM:
+      return "SUM";
+    case Kind::MIN:
+      return "MIN";
+    case Kind::MAX:
+      return "MAX";
+    case Kind::COUNT_VALID:
+      return "COUNT_VALID";
+    case Kind::COUNT_ALL:
+      return "COUNT_ALL";
+    case Kind::MEAN:
+      return "MEAN";
+    default:
+      return "OTHER";
+  }
+}
+
 struct Int128KeyHash {
   size_t operator()(const __int128_t& value) const {
     uint64_t low = static_cast<uint64_t>(value);
@@ -626,13 +646,6 @@ int main(int argc, char** argv) {
         } else if (requestCount != 1) {
           validationSkipped = true;
           validationSkipReason = "validation requires single request column";
-        } else if (requestAggKinds[0].size() != 1) {
-          validationSkipped = true;
-          validationSkipReason = "validation requires single aggregation";
-        } else if (!isSupportedAggKind(requestAggKinds[0][0]) ||
-                   requestAggKinds[0][0] != cudf::aggregation::Kind::SUM) {
-          validationSkipped = true;
-          validationSkipReason = "validation supports SUM only";
         } else if (keyHostData[0].spec.nullCount > 0 &&
                    nullPolicy == cudf::null_policy::INCLUDE) {
           validationSkipped = true;
@@ -640,9 +653,38 @@ int main(int argc, char** argv) {
         }
 
         if (!validationSkipped) {
-          std::unordered_map<__int128_t, __int128_t, Int128KeyHash> expected;
+        bool hasSum = false;
+        for (auto kind : requestAggKinds[0]) {
+          if (kind == cudf::aggregation::Kind::SUM) {
+            hasSum = true;
+          }
+        }
+        if (!hasSum) {
+          validationSkipped = true;
+          validationSkipReason = "validation requires SUM aggregation";
+        }
+      }
+
+      if (!validationSkipped) {
+        for (auto kind : requestAggKinds[0]) {
+          if (!isSupportedAggKind(kind)) {
+            validationSkipped = true;
+            validationSkipReason =
+                std::string("unsupported aggregation kind: ") +
+                aggregationKindName(kind);
+            break;
+          }
+        }
+      }
+
+      if (!validationSkipped) {
+        std::unordered_map<__int128_t, __int128_t, Int128KeyHash> expectedSum;
+        std::unordered_map<__int128_t, int64_t, Int128KeyHash> expectedCount;
+        std::unordered_map<__int128_t, int64_t, Int128KeyHash> expectedCountAll;
           auto const numRows = keyHostData[0].spec.size;
-          expected.reserve(static_cast<size_t>(numRows));
+        expectedSum.reserve(static_cast<size_t>(numRows));
+        expectedCount.reserve(static_cast<size_t>(numRows));
+        expectedCountAll.reserve(static_cast<size_t>(numRows));
           for (int64_t row = 0; row < numRows; ++row) {
             if (keyHostData[0].spec.nullCount > 0 &&
                 !isValidAt(keyHostData[0], row)) {
@@ -659,17 +701,22 @@ int main(int argc, char** argv) {
               validationSkipReason = "unsupported key type";
               break;
             }
-            if (requestHostData[0].spec.nullCount > 0 &&
-                !isValidAt(requestHostData[0], row)) {
-              continue;
-            }
+          bool valueValid = true;
+          if (requestHostData[0].spec.nullCount > 0 &&
+              !isValidAt(requestHostData[0], row)) {
+            valueValid = false;
+          }
+          if (valueValid) {
             __int128_t value{};
             if (!decodeValueInt128(requestHostData[0], row, value)) {
               validationSkipped = true;
               validationSkipReason = "unsupported request type";
               break;
             }
-            expected[keyValue] += value;
+            expectedSum[keyValue] += value;
+            expectedCount[keyValue] += 1;
+          }
+          expectedCountAll[keyValue] += 1;
           }
 
           if (!validationSkipped) {
@@ -677,57 +724,81 @@ int main(int argc, char** argv) {
               validationSkipped = true;
               validationSkipReason = "missing output for validation";
             } else if (outputKeys->num_columns() != 1 ||
-                       outputResults[0].results.size() != 1) {
+                     outputResults[0].results.size() != requestAggKinds[0].size()) {
               validationSkipped = true;
               validationSkipReason = "output shape mismatch";
             } else {
               auto outputKeyHost =
                   readOutputColumnHostData(outputKeys->view().column(0), stream);
-              auto outputValHost = readOutputColumnHostData(
-                  outputResults[0].results[0]->view(), stream);
-              if (outputKeyHost.spec.nullCount > 0 ||
-                  outputValHost.spec.nullCount > 0) {
+            if (outputKeyHost.spec.nullCount > 0 ||
+                outputResults[0].results.empty()) {
                 validationSkipped = true;
-                validationSkipReason = "output contains nulls";
+              validationSkipReason = "output contains nulls or is empty";
+              } else {
+              std::vector<ColumnHostData> outputValHosts;
+              outputValHosts.reserve(outputResults[0].results.size());
+              for (auto const& col : outputResults[0].results) {
+                auto host = readOutputColumnHostData(col->view(), stream);
+                if (host.spec.nullCount > 0) {
+                  validationSkipped = true;
+                  validationSkipReason = "output contains nulls";
+                  break;
+                }
+                outputValHosts.push_back(std::move(host));
+              }
+              if (validationSkipped) {
+                // do not proceed
               } else {
                 auto const outRows = outputKeyHost.spec.size;
                 for (int64_t row = 0; row < outRows; ++row) {
                   __int128_t keyValue{};
-                  __int128_t outValue{};
                   if (!decodeValueInt128(outputKeyHost, row, keyValue)) {
                     validationSkipped = true;
                     validationSkipReason = "unsupported output key type";
                     break;
                   }
-                  if (!decodeValueInt128(outputValHost, row, outValue)) {
+                auto sumIt = expectedSum.find(keyValue);
+                auto countIt = expectedCount.find(keyValue);
+                auto countAllIt = expectedCountAll.find(keyValue);
+                for (size_t aggIdx = 0; aggIdx < requestAggKinds[0].size();
+                     ++aggIdx) {
+                  auto kind = requestAggKinds[0][aggIdx];
+                  __int128_t outValue{};
+                  if (!decodeValueInt128(outputValHosts[aggIdx], row, outValue)) {
                     validationSkipped = true;
                     validationSkipReason = "unsupported output value type";
                     break;
                   }
-                  auto it = expected.find(keyValue);
-                  if (it == expected.end()) {
+                  __int128_t expectedValue = 0;
+                  if (kind == cudf::aggregation::Kind::SUM) {
+                    expectedValue = (sumIt != expectedSum.end()) ? sumIt->second : 0;
+                  } else if (kind == cudf::aggregation::Kind::COUNT_VALID) {
+                    expectedValue =
+                        (countIt != expectedCount.end()) ? countIt->second : 0;
+                  } else if (kind == cudf::aggregation::Kind::COUNT_ALL) {
+                    expectedValue =
+                        (countAllIt != expectedCountAll.end()) ? countAllIt->second
+                                                               : 0;
+                  }
+                  if (outValue != expectedValue) {
                     if (validationMismatches == 0) {
                       firstMismatchKey = keyValue;
-                      firstExpected = 0;
+                      firstExpected = expectedValue;
                       firstActual = outValue;
                     }
                     ++validationMismatches;
-                    continue;
                   }
-                  if (outValue != it->second) {
-                    if (validationMismatches == 0) {
-                      firstMismatchKey = keyValue;
-                      firstExpected = it->second;
-                      firstActual = outValue;
-                    }
-                    ++validationMismatches;
-                  }
+                }
+                if (validationSkipped) {
+                  break;
+                }
                 }
                 if (!validationSkipped &&
-                    static_cast<int64_t>(expected.size()) != outRows) {
-                  auto diff = static_cast<int64_t>(expected.size()) - outRows;
+                  static_cast<int64_t>(expectedSum.size()) != outRows) {
+                auto diff = static_cast<int64_t>(expectedSum.size()) - outRows;
                   validationMismatches += diff >= 0 ? diff : -diff;
                 }
+              }
               }
             }
           }
