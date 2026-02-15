@@ -39,6 +39,10 @@ struct CudfConfig {
       "cudf.debug_hashagg_probe_dump_dir"};
   static constexpr const char* kCudfDebugHashAggProbeDumpMaxRows{
       "cudf.debug_hashagg_probe_dump_max_rows"};
+  static constexpr const char* kCudfDebugHashAggDumpDir{
+      "cudf.debug_hashagg_dump_dir"};
+  static constexpr const char* kCudfDebugHashAggDumpMaxRows{
+      "cudf.debug_hashagg_dump_max_rows"};
   static constexpr const char* kCudfDebugHashAggDecimalCpuAggregateMode{
       "cudf.debug_hashagg_decimal_cpu_aggregate_mode"};
   static constexpr const char* kCudfDebugDisableDecimalSumAvgGpu{
@@ -110,6 +114,14 @@ struct CudfConfig {
   ///   0 => no row limit
   ///  >0 => skip dump when row count exceeds this threshold
   int32_t debugHashAggProbeDumpMaxRows{50000};
+
+  /// Optional: when non-empty, dump each groupby input to a replay bundle.
+  std::string debugHashAggDumpDir;
+
+  /// Optional max input rows allowed for full groupby dumps:
+  ///   0 => no row limit
+  ///  >0 => skip dump when row count exceeds this threshold
+  int32_t debugHashAggDumpMaxRows{0};
 
   /// Optional: replace decimal hash groupby aggregate kernel calls with a
   /// host-side emulation path (debug only).

@@ -30,6 +30,8 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugHashAggFakeGroupbyMode, "2"},
       {CudfConfig::kCudfDebugHashAggProbeDumpDir, "/tmp/hashagg_dumps"},
       {CudfConfig::kCudfDebugHashAggProbeDumpMaxRows, "1234"},
+      {CudfConfig::kCudfDebugHashAggDumpDir, "/tmp/hashagg_full_dumps"},
+      {CudfConfig::kCudfDebugHashAggDumpMaxRows, "4321"},
       {CudfConfig::kCudfDebugHashAggDecimalCpuAggregateMode, "1"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
@@ -46,6 +48,8 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugHashAggFakeGroupbyMode, 2);
   ASSERT_EQ(config.debugHashAggProbeDumpDir, "/tmp/hashagg_dumps");
   ASSERT_EQ(config.debugHashAggProbeDumpMaxRows, 1234);
+  ASSERT_EQ(config.debugHashAggDumpDir, "/tmp/hashagg_full_dumps");
+  ASSERT_EQ(config.debugHashAggDumpMaxRows, 4321);
   ASSERT_EQ(config.debugHashAggDecimalCpuAggregateMode, 1);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
