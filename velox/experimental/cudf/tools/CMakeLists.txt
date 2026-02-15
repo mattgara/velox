@@ -15,3 +15,6 @@
 # Build replay utility even when VELOX_BUILD_TESTING=OFF.
 add_executable(velox_cudf_hashagg_replay ../tests/HashAggReplay.cpp)
 target_link_libraries(velox_cudf_hashagg_replay velox_cudf_exec)
+
+add_executable(velox_cudf_decimal_groupby_repro DecimalGroupbyRepro.cpp)
+target_link_libraries(velox_cudf_decimal_groupby_repro velox_cudf_exec)
