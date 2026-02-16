@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
@@ -57,14 +58,16 @@ struct HostColumnData {
 
 HostColumnData captureColumnHostData(
     rmm::cuda_stream_view stream,
-    cudf::column_view const& column) {
+    cudf::column_view const& column,
+    int64_t maxRows) {
   HostColumnData host;
   if (!cudf::is_fixed_width(column.type())) {
     throw std::runtime_error("unsupported non-fixed-width output column");
   }
   host.typeId = column.type().id();
   host.scale = column.type().scale();
-  host.size = column.size();
+  host.size = maxRows > 0 ? std::min<int64_t>(column.size(), maxRows)
+                          : column.size();
   host.elementSize = cudf::size_of(column.type());
   host.nullCount = column.null_count();
   auto const dataBytes =
@@ -88,7 +91,7 @@ HostColumnData captureColumnHostData(
   }
   if (host.nullCount > 0) {
     auto const maskBytes =
-        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(column.size()));
+        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(host.size));
     host.nullMask.resize(maskBytes);
     if (maskBytes > 0) {
       auto const* maskPtr = column.null_mask();
@@ -178,14 +181,7 @@ void compareCudfToVeloxOutput(
   auto numRows = static_cast<int64_t>(tableView.num_rows());
   if (config.debugCudfToVeloxMaxRows > 0 &&
       numRows > config.debugCudfToVeloxMaxRows) {
-    auto slice = cudf::slice(
-        tableView,
-        {0, static_cast<cudf::size_type>(config.debugCudfToVeloxMaxRows)});
-    if (!slice.empty()) {
-      numRows = slice.front().num_rows();
-      return compareCudfToVeloxOutput(
-          slice.front(), output, outputType, stream);
-    }
+    numRows = config.debugCudfToVeloxMaxRows;
   }
 
   if (output->size() < numRows) {
@@ -206,7 +202,7 @@ void compareCudfToVeloxOutput(
   hostColumns.reserve(tableView.num_columns());
   try {
     for (auto const& col : tableView) {
-      hostColumns.push_back(captureColumnHostData(stream, col));
+      hostColumns.push_back(captureColumnHostData(stream, col, numRows));
     }
     stream.synchronize();
   } catch (const std::exception& e) {
@@ -344,8 +340,9 @@ void compareSerdeRoundtrip(
   IndexRange range{0, static_cast<vector_size_t>(maxRows)};
   auto ranges = folly::Range<const IndexRange*>(&range, 1);
 
-  serializer::presto::PrestoVectorSerde serde;
-  serializer::presto::PrestoVectorSerde::PrestoOptions serdeOptions;
+  facebook::velox::serializer::presto::PrestoVectorSerde serde;
+  facebook::velox::serializer::presto::PrestoVectorSerde::PrestoOptions
+      serdeOptions;
   auto batchSerializer = serde.createBatchSerializer(pool, &serdeOptions);
 
   std::ostringstream buffer;
