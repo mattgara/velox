@@ -1614,29 +1614,17 @@ std::string toString128(__int128_t value) {
   return out;
 }
 
-bool isSupportedEndToEndRequest(
-    core::AggregationNode::Step step,
-    cudf::table_view const& groupbyKeyView,
-    cudf::null_policy nullPolicy,
+std::optional<std::pair<size_t, size_t>> findSumAggregation(
     std::vector<cudf::groupby::aggregation_request> const& requests) {
-  if (step != core::AggregationNode::Step::kFinal &&
-      step != core::AggregationNode::Step::kSingle) {
-    return false;
+  for (size_t reqIdx = 0; reqIdx < requests.size(); ++reqIdx) {
+    auto const& aggregations = requests[reqIdx].aggregations;
+    for (size_t aggIdx = 0; aggIdx < aggregations.size(); ++aggIdx) {
+      if (aggregations[aggIdx]->kind == cudf::aggregation::Kind::SUM) {
+        return std::make_pair(reqIdx, aggIdx);
+      }
+    }
   }
-  if (nullPolicy == cudf::null_policy::INCLUDE) {
-    return false;
-  }
-  if (groupbyKeyView.num_columns() != 1) {
-    return false;
-  }
-  if (requests.size() != 1) {
-    return false;
-  }
-  if (requests[0].aggregations.size() != 1) {
-    return false;
-  }
-  auto const kind = requests[0].aggregations[0]->kind;
-  return kind == cudf::aggregation::Kind::SUM;
+  return std::nullopt;
 }
 
 EndToEndValidationResult validateEndToEndHashAgg(
@@ -1649,14 +1637,36 @@ EndToEndValidationResult validateEndToEndHashAgg(
     int64_t maxRows,
     int64_t batchRows) {
   EndToEndValidationResult result;
-  if (!isSupportedEndToEndRequest(step, groupbyKeyView, nullPolicy, requests)) {
+  if (step != core::AggregationNode::Step::kFinal &&
+      step != core::AggregationNode::Step::kSingle) {
     result.skipped = true;
-    result.reason = "unsupported aggregation shape";
+    result.reason = "unsupported step";
+    return result;
+  }
+  if (nullPolicy == cudf::null_policy::INCLUDE) {
+    result.skipped = true;
+    result.reason = "null policy include";
+    return result;
+  }
+  if (groupbyKeyView.num_columns() != 1) {
+    result.skipped = true;
+    result.reason = "grouping key count != 1";
+    return result;
+  }
+  if (outputView.num_columns() != 2) {
+    result.skipped = true;
+    result.reason = "output column count != keys+1";
+    return result;
+  }
+  auto sumInfo = findSumAggregation(requests);
+  if (!sumInfo.has_value()) {
+    result.skipped = true;
+    result.reason = "no SUM aggregation";
     return result;
   }
 
   auto const& keyCol = groupbyKeyView.column(0);
-  auto const& valueCol = requests[0].values;
+  auto const& valueCol = requests[sumInfo->first].values;
   if (!cudf::is_fixed_width(keyCol.type()) ||
       !cudf::is_fixed_width(valueCol.type())) {
     result.skipped = true;
@@ -4327,7 +4337,11 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
         cfg.debugHashAggEndToEndMaxRows,
         cfg.debugHashAggEndToEndBatchRows);
     if (validation.skipped) {
-      LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason;
+      LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason
+                << " step=" << stepName(step_)
+                << " keyCols=" << groupbyKeyView.num_columns()
+                << " outputCols=" << resultTable->num_columns()
+                << " requestCount=" << requests.size();
     } else {
       LOG(INFO) << "[HashAggEndToEnd] expectedKeys=" << validation.expectedKeys
                 << " outputKeys=" << validation.outputKeys
