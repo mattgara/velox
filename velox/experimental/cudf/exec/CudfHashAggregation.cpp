@@ -1704,7 +1704,6 @@ bool parseScaledDecimalToInt128(
 
 struct ExpectedEntry {
   __int128_t value{0};
-  bool seen{false};
 };
 
 struct ExpectedCache {
@@ -1752,7 +1751,7 @@ ExpectedCache loadExpectedValues(
     if (!parseScaledDecimalToInt128(valueText, scale, value)) {
       throw std::runtime_error("failed to parse value: " + valueText);
     }
-    cache.values.emplace(key, ExpectedEntry{value, false});
+    cache.values.emplace(key, ExpectedEntry{value});
   }
   return cache;
 }
@@ -1799,21 +1798,22 @@ EndToEndValidationResult validateOutputAgainstExpected(
   }
 
   static std::mutex expectedMutex;
-  static std::optional<ExpectedCache> cachedExpected;
-  ExpectedCache expected;
+  static std::shared_ptr<ExpectedCache> cachedExpected;
+  std::shared_ptr<ExpectedCache> expected;
   {
     std::lock_guard<std::mutex> guard(expectedMutex);
-    if (!cachedExpected.has_value() ||
+    if (!cachedExpected ||
         cachedExpected->path != expectedPath ||
         cachedExpected->scale != outValCol.type().scale()) {
-      cachedExpected = loadExpectedValues(expectedPath, outValCol.type().scale());
+      cachedExpected = std::make_shared<ExpectedCache>(
+          loadExpectedValues(expectedPath, outValCol.type().scale()));
     }
-    expected = *cachedExpected;
+    expected = cachedExpected;
   }
 
   auto outRows = outputView.num_rows();
   result.outputKeys = outRows;
-  result.expectedKeys = expected.values.size();
+  result.expectedKeys = expected->values.size();
   if (batchRows <= 0) {
     batchRows = outRows;
   }
@@ -1893,8 +1893,8 @@ EndToEndValidationResult validateOutputAgainstExpected(
         actual = (static_cast<__int128_t>(hi) << 64) | lo;
       }
 
-      auto it = expected.values.find(key);
-      if (it == expected.values.end()) {
+      auto it = expected->values.find(key);
+      if (it == expected->values.end()) {
         result.missing++;
         if (result.mismatches == 0) {
           result.firstKey = key;
@@ -1904,7 +1904,6 @@ EndToEndValidationResult validateOutputAgainstExpected(
         result.mismatches++;
         continue;
       }
-      it->second.seen = true;
       result.checked++;
       if (it->second.value != actual) {
         if (result.mismatches == 0) {
@@ -1917,11 +1916,6 @@ EndToEndValidationResult validateOutputAgainstExpected(
     }
   }
 
-  for (auto const& entry : expected.values) {
-    if (!entry.second.seen) {
-      result.missing++;
-    }
-  }
   return result;
 }
 
@@ -4822,7 +4816,7 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                 << " outputKeys=" << validation.outputKeys
                 << " checked=" << validation.checked
                 << " mismatches=" << validation.mismatches
-                << " missing=" << validation.missing;
+                << " unexpected=" << validation.missing;
       if (validation.mismatches > 0) {
         LOG(INFO) << "[HashAggEndToEnd] firstMismatch key="
                   << validation.firstKey
