@@ -51,15 +51,20 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
+#include <cstdlib>
 #include <exception>
+#include <stdexcept>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <optional>
 #include <mutex>
 #include <unordered_map>
+#include <sstream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1614,6 +1619,312 @@ std::string toString128(__int128_t value) {
   return out;
 }
 
+std::string trimCopy(std::string const& input) {
+  size_t start = 0;
+  while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+    ++start;
+  }
+  size_t end = input.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+    --end;
+  }
+  return input.substr(start, end - start);
+}
+
+bool parseInt64(std::string const& text, int64_t& out) {
+  if (text.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  auto value = std::strtoll(text.c_str(), &end, 10);
+  if (errno != 0 || end == text.c_str() || *end != '\0') {
+    return false;
+  }
+  out = static_cast<int64_t>(value);
+  return true;
+}
+
+bool parseScaledDecimalToInt128(
+    std::string const& text,
+    int32_t scale,
+    __int128_t& out) {
+  if (text.empty()) {
+    return false;
+  }
+  if (scale > 0) {
+    return false;
+  }
+  std::string s = trimCopy(text);
+  if (s.empty()) {
+    return false;
+  }
+  bool negative = false;
+  if (s[0] == '-') {
+    negative = true;
+    s.erase(0, 1);
+  } else if (s[0] == '+') {
+    s.erase(0, 1);
+  }
+  auto dotPos = s.find('.');
+  std::string intPart = dotPos == std::string::npos ? s : s.substr(0, dotPos);
+  std::string fracPart = dotPos == std::string::npos ? "" : s.substr(dotPos + 1);
+  if (intPart.empty()) {
+    intPart = "0";
+  }
+  for (char c : intPart) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  for (char c : fracPart) {
+    if (!std::isdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  int32_t targetFrac = -scale;
+  if (static_cast<int32_t>(fracPart.size()) > targetFrac) {
+    return false;
+  }
+  int32_t padZeros = targetFrac - static_cast<int32_t>(fracPart.size());
+  __int128_t value = 0;
+  for (char c : intPart) {
+    value = value * 10 + (c - '0');
+  }
+  for (char c : fracPart) {
+    value = value * 10 + (c - '0');
+  }
+  for (int32_t i = 0; i < padZeros; ++i) {
+    value *= 10;
+  }
+  out = negative ? -value : value;
+  return true;
+}
+
+struct ExpectedEntry {
+  __int128_t value{0};
+  bool seen{false};
+};
+
+struct ExpectedCache {
+  std::string path;
+  int32_t scale{0};
+  std::unordered_map<int64_t, ExpectedEntry> values;
+};
+
+ExpectedCache loadExpectedValues(
+    std::string const& path,
+    int32_t scale) {
+  ExpectedCache cache;
+  cache.path = path;
+  cache.scale = scale;
+  std::ifstream input(path);
+  if (!input.is_open()) {
+    throw std::runtime_error("failed to open expected file: " + path);
+  }
+  std::string line;
+  bool headerSkipped = false;
+  while (std::getline(input, line)) {
+    line = trimCopy(line);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    std::string keyText;
+    std::string valueText;
+    auto commaPos = line.find(',');
+    if (commaPos != std::string::npos) {
+      keyText = trimCopy(line.substr(0, commaPos));
+      valueText = trimCopy(line.substr(commaPos + 1));
+    } else {
+      std::istringstream iss(line);
+      iss >> keyText >> valueText;
+    }
+    int64_t key = 0;
+    if (!parseInt64(keyText, key)) {
+      if (!headerSkipped) {
+        headerSkipped = true;
+        continue;
+      }
+      throw std::runtime_error("failed to parse key: " + keyText);
+    }
+    __int128_t value = 0;
+    if (!parseScaledDecimalToInt128(valueText, scale, value)) {
+      throw std::runtime_error("failed to parse value: " + valueText);
+    }
+    cache.values.emplace(key, ExpectedEntry{value, false});
+  }
+  return cache;
+}
+
+EndToEndValidationResult validateOutputAgainstExpected(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& outputView,
+    int64_t batchRows,
+    std::string const& expectedPath) {
+  EndToEndValidationResult result;
+  if (step != core::AggregationNode::Step::kFinal &&
+      step != core::AggregationNode::Step::kSingle) {
+    result.skipped = true;
+    result.reason = "expected validation only final/single";
+    return result;
+  }
+  if (outputView.num_columns() != 2) {
+    result.skipped = true;
+    result.reason = "output column count != keys+1";
+    return result;
+  }
+  auto outKeyCol = outputView.column(0);
+  auto outValCol = outputView.column(1);
+  if (!cudf::is_fixed_width(outKeyCol.type()) ||
+      !cudf::is_fixed_width(outValCol.type())) {
+    result.skipped = true;
+    result.reason = "non-fixed-width output";
+    return result;
+  }
+  auto outKeyType = outKeyCol.type().id();
+  auto outValType = outValCol.type().id();
+  if (outKeyType != cudf::type_id::INT64 &&
+      outKeyType != cudf::type_id::INT32) {
+    result.skipped = true;
+    result.reason = "unsupported key type";
+    return result;
+  }
+  if (outValType != cudf::type_id::DECIMAL64 &&
+      outValType != cudf::type_id::DECIMAL128) {
+    result.skipped = true;
+    result.reason = "unsupported value type";
+    return result;
+  }
+
+  static std::mutex expectedMutex;
+  static std::optional<ExpectedCache> cachedExpected;
+  ExpectedCache expected;
+  {
+    std::lock_guard<std::mutex> guard(expectedMutex);
+    if (!cachedExpected.has_value() ||
+        cachedExpected->path != expectedPath ||
+        cachedExpected->scale != outValCol.type().scale()) {
+      cachedExpected = loadExpectedValues(expectedPath, outValCol.type().scale());
+    }
+    expected = *cachedExpected;
+  }
+
+  auto outRows = outputView.num_rows();
+  result.outputKeys = outRows;
+  result.expectedKeys = expected.values.size();
+  if (batchRows <= 0) {
+    batchRows = outRows;
+  }
+
+  auto outKeyElementSize = cudf::size_of(outKeyCol.type());
+  auto outValElementSize = cudf::size_of(outValCol.type());
+  auto const* outKeyBase = static_cast<const uint8_t*>(outKeyCol.head()) +
+      outKeyCol.offset() * outKeyElementSize;
+  auto const* outValBase = static_cast<const uint8_t*>(outValCol.head()) +
+      outValCol.offset() * outValElementSize;
+
+  std::vector<uint8_t> outKeyHost;
+  std::vector<uint8_t> outValHost;
+
+  for (int64_t start = 0; start < outRows; start += batchRows) {
+    auto const rowsThis = std::min<int64_t>(batchRows, outRows - start);
+    auto const outKeyBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(outKeyElementSize);
+    auto const outValBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(outValElementSize);
+    outKeyHost.resize(outKeyBytes);
+    outValHost.resize(outValBytes);
+
+    auto const* outKeyPtr = outKeyBase + start * outKeyElementSize;
+    auto const* outValPtr = outValBase + start * outValElementSize;
+    auto outKeyStatus = cudaMemcpyAsync(
+        outKeyHost.data(),
+        outKeyPtr,
+        outKeyBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto outValStatus = cudaMemcpyAsync(
+        outValHost.data(),
+        outValPtr,
+        outValBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (outKeyStatus != cudaSuccess || outValStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output cudaMemcpyAsync failed";
+      return result;
+    }
+    auto outSync = cudaStreamSynchronize(stream.value());
+    if (outSync != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output cudaStreamSynchronize failed";
+      return result;
+    }
+
+    for (int64_t i = 0; i < rowsThis; ++i) {
+      int64_t key = 0;
+      if (outKeyType == cudf::type_id::INT64) {
+        std::memcpy(
+            &key, outKeyHost.data() + i * outKeyElementSize, sizeof(int64_t));
+      } else {
+        int32_t key32 = 0;
+        std::memcpy(
+            &key32,
+            outKeyHost.data() + i * outKeyElementSize,
+            sizeof(int32_t));
+        key = key32;
+      }
+      __int128_t actual = 0;
+      if (outValType == cudf::type_id::DECIMAL64) {
+        int64_t value64 = 0;
+        std::memcpy(
+            &value64,
+            outValHost.data() + i * outValElementSize,
+            sizeof(int64_t));
+        actual = static_cast<__int128_t>(value64);
+      } else {
+        uint64_t lo = 0;
+        int64_t hi = 0;
+        auto const* ptr = outValHost.data() + i * outValElementSize;
+        std::memcpy(&lo, ptr, sizeof(uint64_t));
+        std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+        actual = (static_cast<__int128_t>(hi) << 64) | lo;
+      }
+
+      auto it = expected.values.find(key);
+      if (it == expected.values.end()) {
+        result.missing++;
+        if (result.mismatches == 0) {
+          result.firstKey = key;
+          result.firstExpected = 0;
+          result.firstActual = actual;
+        }
+        result.mismatches++;
+        continue;
+      }
+      it->second.seen = true;
+      result.checked++;
+      if (it->second.value != actual) {
+        if (result.mismatches == 0) {
+          result.firstKey = key;
+          result.firstExpected = it->second.value;
+          result.firstActual = actual;
+        }
+        result.mismatches++;
+      }
+    }
+  }
+
+  for (auto const& entry : expected.values) {
+    if (!entry.second.seen) {
+      result.missing++;
+    }
+  }
+  return result;
+}
+
 std::optional<std::pair<size_t, size_t>> findSumAggregation(
     std::vector<cudf::groupby::aggregation_request> const& requests) {
   for (size_t reqIdx = 0; reqIdx < requests.size(); ++reqIdx) {
@@ -1749,12 +2060,12 @@ EndToEndValidationResult validateEndToEndHashAgg(
     }
   }
 
-  auto isValid = [](const std::vector<uint8_t>& mask, int64_t index) {
+  auto isValid = [](const std::vector<uint8_t>& mask, int64_t index) -> bool {
     if (mask.empty()) {
       return true;
     }
     auto const byte = mask[static_cast<size_t>(index) / 8];
-    return (byte >> (index % 8)) & 1;
+    return ((byte >> (index % 8)) & 1) != 0;
   };
 
   std::vector<uint8_t> keyHost;
@@ -4481,15 +4792,25 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
 
   if (CudfConfig::getInstance().debugHashAggEndToEndValidate) {
     auto const& cfg = CudfConfig::getInstance();
-    auto validation = validateEndToEndHashAgg(
-        step_,
-        stream,
-        groupbyKeyView,
-        nullPolicy,
-        requests,
-        resultTable->view(),
-        cfg.debugHashAggEndToEndMaxRows,
-        cfg.debugHashAggEndToEndBatchRows);
+    EndToEndValidationResult validation;
+    if (!cfg.debugHashAggExpectedPath.empty()) {
+      validation = validateOutputAgainstExpected(
+          step_,
+          stream,
+          resultTable->view(),
+          cfg.debugHashAggEndToEndBatchRows,
+          cfg.debugHashAggExpectedPath);
+    } else {
+      validation = validateEndToEndHashAgg(
+          step_,
+          stream,
+          groupbyKeyView,
+          nullPolicy,
+          requests,
+          resultTable->view(),
+          cfg.debugHashAggEndToEndMaxRows,
+          cfg.debugHashAggEndToEndBatchRows);
+    }
     if (validation.skipped) {
       LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason
                 << " step=" << stepName(step_)

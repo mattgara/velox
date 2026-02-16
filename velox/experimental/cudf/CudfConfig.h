@@ -53,6 +53,8 @@ struct CudfConfig {
       "cudf.debug_hashagg_end_to_end_max_rows"};
   static constexpr const char* kCudfDebugHashAggEndToEndBatchRows{
       "cudf.debug_hashagg_end_to_end_batch_rows"};
+  static constexpr const char* kCudfDebugHashAggExpectedPath{
+      "cudf.debug_hashagg_expected_path"};
   static constexpr const char* kCudfDebugSerdeValidate{
       "cudf.debug_serde_validate"};
   static constexpr const char* kCudfDebugSerdeValidateMaxRows{
@@ -156,6 +158,10 @@ struct CudfConfig {
 
   /// Optional: batch size for GPU->host copies during validation.
   int64_t debugHashAggEndToEndBatchRows{1000000};
+
+  /// Optional: expected SUM results file for HashAgg validation.
+  /// Format: key,sum on each line (sum can be decimal string).
+  std::string debugHashAggExpectedPath;
 
   /// Optional: validate Presto serialization roundtrip for RowVector outputs.
   bool debugSerdeValidate{false};

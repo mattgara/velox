@@ -595,6 +595,9 @@ void CudfConfig::initialize(
     debugHashAggEndToEndBatchRows =
         folly::to<int64_t>(config[kCudfDebugHashAggEndToEndBatchRows]);
   }
+  if (config.find(kCudfDebugHashAggExpectedPath) != config.end()) {
+    debugHashAggExpectedPath = config[kCudfDebugHashAggExpectedPath];
+  }
   if (config.find(kCudfDebugSerdeValidate) != config.end()) {
     debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);
   }
@@ -667,6 +670,7 @@ void CudfConfig::initialize(
               << debugHashAggEndToEndMaxRows
               << " debugHashAggEndToEndBatchRows="
               << debugHashAggEndToEndBatchRows
+              << " debugHashAggExpectedPath=" << debugHashAggExpectedPath
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }
