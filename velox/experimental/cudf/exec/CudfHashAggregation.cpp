@@ -52,12 +52,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <optional>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -1578,6 +1580,318 @@ std::string maybeWriteGroupbyOutputDump(
                "outputDumpWritten step="
             << stepName(step) << " dumpDir=" << dumpDir;
   return dumpDir;
+}
+
+struct EndToEndValidationResult {
+  bool skipped{false};
+  std::string reason;
+  int64_t mismatches{0};
+  int64_t missing{0};
+  int64_t checked{0};
+  int64_t expectedKeys{0};
+  int64_t outputKeys{0};
+  int64_t firstKey{0};
+  __int128_t firstExpected{0};
+  __int128_t firstActual{0};
+};
+
+std::string toString128(__int128_t value) {
+  if (value == 0) {
+    return "0";
+  }
+  bool negative = value < 0;
+  __int128_t absValue = negative ? -value : value;
+  std::string out;
+  while (absValue > 0) {
+    int digit = static_cast<int>(absValue % 10);
+    out.push_back(static_cast<char>('0' + digit));
+    absValue /= 10;
+  }
+  if (negative) {
+    out.push_back('-');
+  }
+  std::reverse(out.begin(), out.end());
+  return out;
+}
+
+bool isSupportedEndToEndRequest(
+    core::AggregationNode::Step step,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request> const& requests) {
+  if (step != core::AggregationNode::Step::kFinal &&
+      step != core::AggregationNode::Step::kSingle) {
+    return false;
+  }
+  if (nullPolicy == cudf::null_policy::INCLUDE) {
+    return false;
+  }
+  if (groupbyKeyView.num_columns() != 1) {
+    return false;
+  }
+  if (requests.size() != 1) {
+    return false;
+  }
+  if (requests[0].aggregations.size() != 1) {
+    return false;
+  }
+  auto const kind = requests[0].aggregations[0]->kind;
+  return kind == cudf::aggregation::Kind::SUM;
+}
+
+EndToEndValidationResult validateEndToEndHashAgg(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    cudf::table_view const& outputView,
+    int64_t maxRows,
+    int64_t batchRows) {
+  EndToEndValidationResult result;
+  if (!isSupportedEndToEndRequest(step, groupbyKeyView, nullPolicy, requests)) {
+    result.skipped = true;
+    result.reason = "unsupported aggregation shape";
+    return result;
+  }
+
+  auto const& keyCol = groupbyKeyView.column(0);
+  auto const& valueCol = requests[0].values;
+  if (!cudf::is_fixed_width(keyCol.type()) ||
+      !cudf::is_fixed_width(valueCol.type())) {
+    result.skipped = true;
+    result.reason = "non-fixed-width input";
+    return result;
+  }
+  if (keyCol.null_count() > 0 || valueCol.null_count() > 0) {
+    result.skipped = true;
+    result.reason = "nulls not supported";
+    return result;
+  }
+
+  auto keyType = keyCol.type().id();
+  auto valueType = valueCol.type().id();
+  if (keyType != cudf::type_id::INT64 &&
+      keyType != cudf::type_id::INT32) {
+    result.skipped = true;
+    result.reason = "unsupported key type";
+    return result;
+  }
+  if (valueType != cudf::type_id::DECIMAL64 &&
+      valueType != cudf::type_id::DECIMAL128) {
+    result.skipped = true;
+    result.reason = "unsupported value type";
+    return result;
+  }
+
+  int64_t totalRows = groupbyKeyView.num_rows();
+  if (maxRows > 0 && totalRows > maxRows) {
+    totalRows = maxRows;
+  }
+  if (batchRows <= 0) {
+    batchRows = totalRows;
+  }
+
+  std::unordered_map<int64_t, __int128_t> expected;
+  expected.reserve(static_cast<size_t>(std::min<int64_t>(totalRows, 1000000)));
+
+  auto keyElementSize = cudf::size_of(keyCol.type());
+  auto valueElementSize = cudf::size_of(valueCol.type());
+  auto const* keyBase = static_cast<const uint8_t*>(keyCol.head()) +
+      keyCol.offset() * keyElementSize;
+  auto const* valueBase = static_cast<const uint8_t*>(valueCol.head()) +
+      valueCol.offset() * valueElementSize;
+
+  std::vector<uint8_t> keyHost;
+  std::vector<uint8_t> valueHost;
+
+  for (int64_t start = 0; start < totalRows; start += batchRows) {
+    auto const rowsThis = std::min<int64_t>(batchRows, totalRows - start);
+    auto const keyBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(keyElementSize);
+    auto const valueBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(valueElementSize);
+    keyHost.resize(keyBytes);
+    valueHost.resize(valueBytes);
+
+    auto const* keyPtr = keyBase + start * keyElementSize;
+    auto const* valuePtr = valueBase + start * valueElementSize;
+    auto keyStatus = cudaMemcpyAsync(
+        keyHost.data(),
+        keyPtr,
+        keyBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto valueStatus = cudaMemcpyAsync(
+        valueHost.data(),
+        valuePtr,
+        valueBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (keyStatus != cudaSuccess || valueStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaMemcpyAsync failed";
+      return result;
+    }
+    auto syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaStreamSynchronize failed";
+      return result;
+    }
+
+    for (int64_t i = 0; i < rowsThis; ++i) {
+      int64_t key = 0;
+      if (keyType == cudf::type_id::INT64) {
+        std::memcpy(&key, keyHost.data() + i * keyElementSize, sizeof(int64_t));
+      } else {
+        int32_t key32 = 0;
+        std::memcpy(
+            &key32, keyHost.data() + i * keyElementSize, sizeof(int32_t));
+        key = key32;
+      }
+      __int128_t value = 0;
+      if (valueType == cudf::type_id::DECIMAL64) {
+        int64_t value64 = 0;
+        std::memcpy(
+            &value64,
+            valueHost.data() + i * valueElementSize,
+            sizeof(int64_t));
+        value = static_cast<__int128_t>(value64);
+      } else {
+        uint64_t lo = 0;
+        int64_t hi = 0;
+        auto const* ptr = valueHost.data() + i * valueElementSize;
+        std::memcpy(&lo, ptr, sizeof(uint64_t));
+        std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+        value = (static_cast<__int128_t>(hi) << 64) | lo;
+      }
+      expected[key] += value;
+    }
+  }
+
+  if (outputView.num_columns() < 2) {
+    result.skipped = true;
+    result.reason = "output shape mismatch";
+    return result;
+  }
+
+  auto outKeyCol = outputView.column(0);
+  auto outValCol = outputView.column(1);
+  if (!cudf::is_fixed_width(outKeyCol.type()) ||
+      !cudf::is_fixed_width(outValCol.type())) {
+    result.skipped = true;
+    result.reason = "non-fixed-width output";
+    return result;
+  }
+  if (outKeyCol.null_count() > 0 || outValCol.null_count() > 0) {
+    result.skipped = true;
+    result.reason = "output has nulls";
+    return result;
+  }
+
+  auto outKeyType = outKeyCol.type().id();
+  auto outValType = outValCol.type().id();
+  if (outKeyType != keyType || outValType != valueType) {
+    result.skipped = true;
+    result.reason = "output type mismatch";
+    return result;
+  }
+
+  auto outRows = outputView.num_rows();
+  result.outputKeys = outRows;
+  result.expectedKeys = expected.size();
+
+  auto outKeyElementSize = cudf::size_of(outKeyCol.type());
+  auto outValElementSize = cudf::size_of(outValCol.type());
+  auto const* outKeyBase = static_cast<const uint8_t*>(outKeyCol.head()) +
+      outKeyCol.offset() * outKeyElementSize;
+  auto const* outValBase = static_cast<const uint8_t*>(outValCol.head()) +
+      outValCol.offset() * outValElementSize;
+
+  std::vector<uint8_t> outKeyHost;
+  std::vector<uint8_t> outValHost;
+  auto outKeyBytes =
+      static_cast<size_t>(outRows) * static_cast<size_t>(outKeyElementSize);
+  auto outValBytes =
+      static_cast<size_t>(outRows) * static_cast<size_t>(outValElementSize);
+  outKeyHost.resize(outKeyBytes);
+  outValHost.resize(outValBytes);
+  auto outKeyStatus = cudaMemcpyAsync(
+      outKeyHost.data(),
+      outKeyBase,
+      outKeyBytes,
+      cudaMemcpyDeviceToHost,
+      stream.value());
+  auto outValStatus = cudaMemcpyAsync(
+      outValHost.data(),
+      outValBase,
+      outValBytes,
+      cudaMemcpyDeviceToHost,
+      stream.value());
+  if (outKeyStatus != cudaSuccess || outValStatus != cudaSuccess) {
+    result.skipped = true;
+    result.reason = "output cudaMemcpyAsync failed";
+    return result;
+  }
+  auto outSync = cudaStreamSynchronize(stream.value());
+  if (outSync != cudaSuccess) {
+    result.skipped = true;
+    result.reason = "output cudaStreamSynchronize failed";
+    return result;
+  }
+
+  for (int64_t i = 0; i < outRows; ++i) {
+    int64_t key = 0;
+    if (outKeyType == cudf::type_id::INT64) {
+      std::memcpy(
+          &key, outKeyHost.data() + i * outKeyElementSize, sizeof(int64_t));
+    } else {
+      int32_t key32 = 0;
+      std::memcpy(
+          &key32,
+          outKeyHost.data() + i * outKeyElementSize,
+          sizeof(int32_t));
+      key = key32;
+    }
+    __int128_t actual = 0;
+    if (outValType == cudf::type_id::DECIMAL64) {
+      int64_t value64 = 0;
+      std::memcpy(
+          &value64,
+          outValHost.data() + i * outValElementSize,
+          sizeof(int64_t));
+      actual = static_cast<__int128_t>(value64);
+    } else {
+      uint64_t lo = 0;
+      int64_t hi = 0;
+      auto const* ptr = outValHost.data() + i * outValElementSize;
+      std::memcpy(&lo, ptr, sizeof(uint64_t));
+      std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+      actual = (static_cast<__int128_t>(hi) << 64) | lo;
+    }
+    auto it = expected.find(key);
+    if (it == expected.end()) {
+      result.missing++;
+      if (result.mismatches == 0) {
+        result.firstKey = key;
+        result.firstExpected = 0;
+        result.firstActual = actual;
+      }
+      result.mismatches++;
+      continue;
+    }
+    result.checked++;
+    if (it->second != actual) {
+      if (result.mismatches == 0) {
+        result.firstKey = key;
+        result.firstExpected = it->second;
+        result.firstActual = actual;
+      }
+      result.mismatches++;
+    }
+  }
+  return result;
 }
 
 const char* fakeGroupbyModeName(int32_t mode) {
@@ -3999,6 +4313,34 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
   if (!dumpDir.empty()) {
     maybeWriteGroupbyOutputDump(
         dumpDir, step_, numGroupingKeys, stream, resultTable->view());
+  }
+
+  if (CudfConfig::getInstance().debugHashAggEndToEndValidate) {
+    auto const& cfg = CudfConfig::getInstance();
+    auto validation = validateEndToEndHashAgg(
+        step_,
+        stream,
+        groupbyKeyView,
+        nullPolicy,
+        requests,
+        resultTable->view(),
+        cfg.debugHashAggEndToEndMaxRows,
+        cfg.debugHashAggEndToEndBatchRows);
+    if (validation.skipped) {
+      LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason;
+    } else {
+      LOG(INFO) << "[HashAggEndToEnd] expectedKeys=" << validation.expectedKeys
+                << " outputKeys=" << validation.outputKeys
+                << " checked=" << validation.checked
+                << " mismatches=" << validation.mismatches
+                << " missing=" << validation.missing;
+      if (validation.mismatches > 0) {
+        LOG(INFO) << "[HashAggEndToEnd] firstMismatch key="
+                  << validation.firstKey
+                  << " expected=" << toString128(validation.firstExpected)
+                  << " actual=" << toString128(validation.firstActual);
+      }
+    }
   }
 
   auto numRows = resultTable->num_rows();

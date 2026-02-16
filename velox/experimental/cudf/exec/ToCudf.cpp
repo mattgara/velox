@@ -583,6 +583,18 @@ void CudfConfig::initialize(
     debugDisableDecimalSumAvgGpu =
         folly::to<bool>(config[kCudfDebugDisableDecimalSumAvgGpu]);
   }
+  if (config.find(kCudfDebugHashAggEndToEndValidate) != config.end()) {
+    debugHashAggEndToEndValidate =
+        folly::to<bool>(config[kCudfDebugHashAggEndToEndValidate]);
+  }
+  if (config.find(kCudfDebugHashAggEndToEndMaxRows) != config.end()) {
+    debugHashAggEndToEndMaxRows =
+        folly::to<int64_t>(config[kCudfDebugHashAggEndToEndMaxRows]);
+  }
+  if (config.find(kCudfDebugHashAggEndToEndBatchRows) != config.end()) {
+    debugHashAggEndToEndBatchRows =
+        folly::to<int64_t>(config[kCudfDebugHashAggEndToEndBatchRows]);
+  }
   if (config.find(kCudfDebugSerdeValidate) != config.end()) {
     debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);
   }
@@ -649,6 +661,12 @@ void CudfConfig::initialize(
               << " debugCudfToVeloxMaxRows=" << debugCudfToVeloxMaxRows
               << " debugSerdeValidate=" << debugSerdeValidate
               << " debugSerdeValidateMaxRows=" << debugSerdeValidateMaxRows
+              << " debugHashAggEndToEndValidate="
+              << debugHashAggEndToEndValidate
+              << " debugHashAggEndToEndMaxRows="
+              << debugHashAggEndToEndMaxRows
+              << " debugHashAggEndToEndBatchRows="
+              << debugHashAggEndToEndBatchRows
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }

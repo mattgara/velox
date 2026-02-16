@@ -47,6 +47,12 @@ struct CudfConfig {
       "cudf.debug_hashagg_decimal_cpu_aggregate_mode"};
   static constexpr const char* kCudfDebugDisableDecimalSumAvgGpu{
       "cudf.debug_disable_decimal_sum_avg_gpu"};
+  static constexpr const char* kCudfDebugHashAggEndToEndValidate{
+      "cudf.debug_hashagg_end_to_end_validate"};
+  static constexpr const char* kCudfDebugHashAggEndToEndMaxRows{
+      "cudf.debug_hashagg_end_to_end_max_rows"};
+  static constexpr const char* kCudfDebugHashAggEndToEndBatchRows{
+      "cudf.debug_hashagg_end_to_end_batch_rows"};
   static constexpr const char* kCudfDebugSerdeValidate{
       "cudf.debug_serde_validate"};
   static constexpr const char* kCudfDebugSerdeValidateMaxRows{
@@ -141,6 +147,15 @@ struct CudfConfig {
   /// Default is true to preserve current safety detour; set to false to allow
   /// cuDF decimal SUM/AVG execution.
   bool debugDisableDecimalSumAvgGpu{true};
+
+  /// Optional: end-to-end hash aggregation validation (input->output).
+  bool debugHashAggEndToEndValidate{false};
+
+  /// Optional: max input rows to validate (0 = all rows).
+  int64_t debugHashAggEndToEndMaxRows{0};
+
+  /// Optional: batch size for GPU->host copies during validation.
+  int64_t debugHashAggEndToEndBatchRows{1000000};
 
   /// Optional: validate Presto serialization roundtrip for RowVector outputs.
   bool debugSerdeValidate{false};
