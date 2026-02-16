@@ -47,6 +47,14 @@ struct CudfConfig {
       "cudf.debug_hashagg_decimal_cpu_aggregate_mode"};
   static constexpr const char* kCudfDebugDisableDecimalSumAvgGpu{
       "cudf.debug_disable_decimal_sum_avg_gpu"};
+  static constexpr const char* kCudfDebugSerdeValidate{
+      "cudf.debug_serde_validate"};
+  static constexpr const char* kCudfDebugSerdeValidateMaxRows{
+      "cudf.debug_serde_validate_max_rows"};
+  static constexpr const char* kCudfDebugCudfToVeloxValidate{
+      "cudf.debug_cudf_to_velox_validate"};
+  static constexpr const char* kCudfDebugCudfToVeloxMaxRows{
+      "cudf.debug_cudf_to_velox_max_rows"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
@@ -133,6 +141,18 @@ struct CudfConfig {
   /// Default is true to preserve current safety detour; set to false to allow
   /// cuDF decimal SUM/AVG execution.
   bool debugDisableDecimalSumAvgGpu{true};
+
+  /// Optional: validate Presto serialization roundtrip for RowVector outputs.
+  bool debugSerdeValidate{false};
+
+  /// Optional: max rows to validate per batch (0 = all rows).
+  int64_t debugSerdeValidateMaxRows{100000};
+
+  /// Optional: validate cuDF->Velox conversion by comparing column values.
+  bool debugCudfToVeloxValidate{false};
+
+  /// Optional: max rows to compare for cuDF->Velox validation (0 = all).
+  int64_t debugCudfToVeloxMaxRows{0};
 
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};

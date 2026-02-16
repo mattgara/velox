@@ -33,6 +33,10 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugHashAggDumpDir, "/tmp/hashagg_full_dumps"},
       {CudfConfig::kCudfDebugHashAggDumpMaxRows, "4321"},
       {CudfConfig::kCudfDebugHashAggDecimalCpuAggregateMode, "1"},
+      {CudfConfig::kCudfDebugCudfToVeloxValidate, "true"},
+      {CudfConfig::kCudfDebugCudfToVeloxMaxRows, "2048"},
+      {CudfConfig::kCudfDebugSerdeValidate, "true"},
+      {CudfConfig::kCudfDebugSerdeValidateMaxRows, "4096"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -51,6 +55,10 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugHashAggDumpDir, "/tmp/hashagg_full_dumps");
   ASSERT_EQ(config.debugHashAggDumpMaxRows, 4321);
   ASSERT_EQ(config.debugHashAggDecimalCpuAggregateMode, 1);
+  ASSERT_EQ(config.debugCudfToVeloxValidate, true);
+  ASSERT_EQ(config.debugCudfToVeloxMaxRows, 2048);
+  ASSERT_EQ(config.debugSerdeValidate, true);
+  ASSERT_EQ(config.debugSerdeValidateMaxRows, 4096);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");

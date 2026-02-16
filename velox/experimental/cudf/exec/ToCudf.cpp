@@ -583,6 +583,21 @@ void CudfConfig::initialize(
     debugDisableDecimalSumAvgGpu =
         folly::to<bool>(config[kCudfDebugDisableDecimalSumAvgGpu]);
   }
+  if (config.find(kCudfDebugSerdeValidate) != config.end()) {
+    debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);
+  }
+  if (config.find(kCudfDebugSerdeValidateMaxRows) != config.end()) {
+    debugSerdeValidateMaxRows =
+        folly::to<int64_t>(config[kCudfDebugSerdeValidateMaxRows]);
+  }
+  if (config.find(kCudfDebugCudfToVeloxValidate) != config.end()) {
+    debugCudfToVeloxValidate =
+        folly::to<bool>(config[kCudfDebugCudfToVeloxValidate]);
+  }
+  if (config.find(kCudfDebugCudfToVeloxMaxRows) != config.end()) {
+    debugCudfToVeloxMaxRows =
+        folly::to<int64_t>(config[kCudfDebugCudfToVeloxMaxRows]);
+  }
   if (config.find(kCudfMemoryResource) != config.end()) {
     memoryResource = config[kCudfMemoryResource];
   }
@@ -610,7 +625,8 @@ void CudfConfig::initialize(
       debugHashAggFakeGroupbyMode != 0 || !debugHashAggProbeDumpDir.empty() ||
       !debugHashAggDumpDir.empty() ||
       debugHashAggDecimalCpuAggregateMode != 0 ||
-      debugDisableDecimalSumAvgGpu) {
+      debugDisableDecimalSumAvgGpu || debugCudfToVeloxValidate ||
+      debugSerdeValidate) {
     LOG(INFO) << "[CudfConfig] enabled=" << enabled
               << " debugEnabled=" << debugEnabled
               << " debugExprTree=" << debugExprTree
@@ -629,6 +645,10 @@ void CudfConfig::initialize(
               << debugHashAggDecimalCpuAggregateMode
               << " debugDisableDecimalSumAvgGpu="
               << debugDisableDecimalSumAvgGpu
+              << " debugCudfToVeloxValidate=" << debugCudfToVeloxValidate
+              << " debugCudfToVeloxMaxRows=" << debugCudfToVeloxMaxRows
+              << " debugSerdeValidate=" << debugSerdeValidate
+              << " debugSerdeValidateMaxRows=" << debugSerdeValidateMaxRows
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }
