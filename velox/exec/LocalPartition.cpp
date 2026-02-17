@@ -31,6 +31,7 @@ void notify(std::vector<ContinuePromise>& promises) {
   }
 }
 
+#ifdef PRESTO_ENABLE_CUDF
 void logLocalExchangeDequeue(
     const RowVectorPtr& data,
     int partition,
