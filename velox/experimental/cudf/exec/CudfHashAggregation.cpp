@@ -5319,7 +5319,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       VectorPtr constant,
       bool isGlobal,
       const TypePtr& resultType,
-      const bool isAvg)
+      const bool isAvg,
+      std::optional<int32_t> inputScale)
       : Aggregator(
             step,
             cudf::aggregation::SUM,
@@ -5327,7 +5328,8 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
             constant,
             isGlobal,
             resultType),
-        isAvg_(isAvg) {}
+        isAvg_(isAvg),
+        inputScale_(inputScale) {}
 
   void addGroupbyRequest(
       cudf::table_view const& tbl,
@@ -5349,9 +5351,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         inputIndex);
     if (step == core::AggregationNode::Step::kIntermediate &&
         tbl.column(inputIndex).type().id() == cudf::type_id::STRING) {
-      auto scale = resultType->isDecimal()
-          ? getDecimalPrecisionScale(*resultType).second
-          : 0;
+      auto scale = resolveStateScale(resultType);
       logHashAggDebug(
           "Decimal.addGroupbyRequest.intermediate.deserialize",
           step,
@@ -5683,9 +5683,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
     }
     if (step == core::AggregationNode::Step::kIntermediate &&
         inputCol.type().id() == cudf::type_id::STRING) {
-      auto scale = outputType->isDecimal()
-          ? getDecimalPrecisionScale(*outputType).second
-          : 0;
+      auto scale = resolveStateScale(outputType);
       auto decoded =
           cudf_velox::deserializeDecimalSumStateWithCount(inputCol, scale, stream);
       if (decoded.sum) {
@@ -5837,6 +5835,16 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   }
 
  private:
+  int32_t resolveStateScale(const TypePtr& type) const {
+    if (type->isDecimal()) {
+      return getDecimalPrecisionScale(*type).second;
+    }
+    if (inputScale_.has_value()) {
+      return *inputScale_;
+    }
+    return 0;
+  }
+
   std::unique_ptr<cudf::column> computeAvgColumn(
       std::unique_ptr<cudf::column> sum,
       std::unique_ptr<cudf::column> count,
@@ -5918,6 +5926,7 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   uint32_t sumIdx_{0};
   uint32_t countIdx_{0};
   const bool isAvg_{false};
+  std::optional<int32_t> inputScale_;
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
 };
@@ -6247,8 +6256,10 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     bool isDecimalInput =
         rawInputTypes.size() == 1 && rawInputTypes[0]->isDecimal();
     if (isDecimalInput) {
+      std::optional<int32_t> inputScale =
+          getDecimalPrecisionScale(*rawInputTypes[0]).second;
       return std::make_unique<DecimalSumOrAvgAggregator>(
-          step, inputIndex, constant, isGlobal, resultType, false);
+          step, inputIndex, constant, isGlobal, resultType, false, inputScale);
     }
     return std::make_unique<SumAggregator>(
         step, inputIndex, constant, isGlobal, resultType);
@@ -6265,8 +6276,10 @@ std::unique_ptr<cudf_velox::CudfHashAggregation::Aggregator> createAggregator(
     bool isDecimalInput =
         rawInputTypes.size() == 1 && rawInputTypes[0]->isDecimal();
     if (isDecimalInput) {
+      std::optional<int32_t> inputScale =
+          getDecimalPrecisionScale(*rawInputTypes[0]).second;
       return std::make_unique<DecimalSumOrAvgAggregator>(
-          step, inputIndex, constant, isGlobal, resultType, true);
+          step, inputIndex, constant, isGlobal, resultType, true, inputScale);
     }
     return std::make_unique<MeanAggregator>(
         step, inputIndex, constant, isGlobal, resultType);
