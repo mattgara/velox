@@ -5921,7 +5921,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
       if (cfg.debugHashAggPartialInputValidate &&
           (step_ == core::AggregationNode::Step::kFinal ||
            step_ == core::AggregationNode::Step::kSingle)) {
-        auto const& outValCol = resultTable->view().column(1);
+        auto const resultView = resultTable->view();
+        auto outValCol = resultView.column(1);
         auto globalCompare = compareGlobalPartialToExpected(
             cfg.debugHashAggExpectedPath, outValCol.type().scale());
         if (globalCompare.skipped) {
