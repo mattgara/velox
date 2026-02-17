@@ -120,6 +120,11 @@ inline bool hashAggDebugStateRoundtripValidate() {
       .debugHashAggStateRoundtripValidate;
 }
 
+inline bool hashAggDebugPartialInputValidate() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggPartialInputValidate;
+}
+
 inline int32_t hashAggDebugDecimalCpuAggregateMode() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
       .debugHashAggDecimalCpuAggregateMode;
@@ -2681,6 +2686,519 @@ StateRoundtripResult validateDecimalStateRoundtrip(
   return result;
 }
 
+struct PartialInputValidationResult {
+  bool skipped{false};
+  std::string reason;
+  int64_t expectedKeys{0};
+  int64_t outputKeys{0};
+  int64_t checked{0};
+  int64_t sumMismatches{0};
+  int64_t countMismatches{0};
+  int64_t missing{0};
+  int64_t unexpected{0};
+  int64_t firstKey{0};
+  int64_t firstRow{-1};
+  __int128_t expectedSum{0};
+  __int128_t actualSum{0};
+  int64_t expectedCount{0};
+  int64_t actualCount{0};
+  bool expectedValid{false};
+  bool actualValid{false};
+};
+
+PartialInputValidationResult validatePartialStateAgainstInput(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    cudf::null_policy nullPolicy,
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    cudf::table_view const& outputView,
+    int64_t maxRows,
+    int64_t batchRows) {
+  PartialInputValidationResult result;
+  if (step != core::AggregationNode::Step::kPartial &&
+      step != core::AggregationNode::Step::kIntermediate) {
+    result.skipped = true;
+    result.reason = "only partial/intermediate";
+    return result;
+  }
+  if (groupbyKeyView.num_columns() != 1) {
+    result.skipped = true;
+    result.reason = "grouping key count != 1";
+    return result;
+  }
+  if (outputView.num_columns() != 2) {
+    result.skipped = true;
+    result.reason = "output column count != keys+1";
+    return result;
+  }
+  auto sumInfo = findSumAggregation(requests);
+  if (!sumInfo.has_value()) {
+    result.skipped = true;
+    result.reason = "no SUM aggregation";
+    return result;
+  }
+
+  auto const& keyCol = groupbyKeyView.column(0);
+  auto const& valueCol = requests[sumInfo->first].values;
+  if (!cudf::is_fixed_width(keyCol.type()) ||
+      !cudf::is_fixed_width(valueCol.type())) {
+    result.skipped = true;
+    result.reason = "non-fixed-width input";
+    return result;
+  }
+  auto keyType = keyCol.type().id();
+  auto valueType = valueCol.type().id();
+  if (keyType != cudf::type_id::INT64 &&
+      keyType != cudf::type_id::INT32) {
+    result.skipped = true;
+    result.reason = "unsupported key type";
+    return result;
+  }
+  if (valueType != cudf::type_id::DECIMAL64 &&
+      valueType != cudf::type_id::DECIMAL128) {
+    result.skipped = true;
+    result.reason = "unsupported value type";
+    return result;
+  }
+
+  auto outKeyCol = outputView.column(0);
+  auto stateCol = outputView.column(1);
+  if (stateCol.type().id() != cudf::type_id::STRING) {
+    result.skipped = true;
+    result.reason = "state column not string";
+    return result;
+  }
+  if (!cudf::is_fixed_width(outKeyCol.type())) {
+    result.skipped = true;
+    result.reason = "output key not fixed width";
+    return result;
+  }
+
+  int64_t totalRows = groupbyKeyView.num_rows();
+  if (maxRows > 0 && totalRows > maxRows) {
+    totalRows = maxRows;
+  }
+  if (batchRows <= 0) {
+    batchRows = totalRows;
+  }
+
+  struct ExpectedAgg {
+    __int128_t sum{0};
+    int64_t count{0};
+    int64_t rows{0};
+    bool seen{false};
+  };
+  std::unordered_map<int64_t, ExpectedAgg> expected;
+  expected.reserve(static_cast<size_t>(std::min<int64_t>(totalRows, 1000000)));
+  ExpectedAgg nullKeyAgg;
+  bool sawNullKey = false;
+
+  auto keyElementSize = cudf::size_of(keyCol.type());
+  auto valueElementSize = cudf::size_of(valueCol.type());
+  auto const* keyBase = static_cast<const uint8_t*>(keyCol.head()) +
+      keyCol.offset() * keyElementSize;
+  auto const* valueBase = static_cast<const uint8_t*>(valueCol.head()) +
+      valueCol.offset() * valueElementSize;
+  auto keyBitOffset = keyCol.offset();
+  auto valueBitOffset = valueCol.offset();
+
+  std::vector<uint8_t> keyMask;
+  std::vector<uint8_t> valueMask;
+  if (keyCol.null_count() > 0) {
+    auto const maskBytes = static_cast<size_t>(
+        cudf::bitmask_allocation_size_bytes(keyCol.offset() + keyCol.size()));
+    keyMask.resize(maskBytes);
+    auto const copyStatus = cudaMemcpyAsync(
+        keyMask.data(),
+        keyCol.null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (copyStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "key null mask copy failed";
+      return result;
+    }
+  }
+  if (valueCol.null_count() > 0) {
+    auto const maskBytes = static_cast<size_t>(
+        cudf::bitmask_allocation_size_bytes(valueCol.offset() + valueCol.size()));
+    valueMask.resize(maskBytes);
+    auto const copyStatus = cudaMemcpyAsync(
+        valueMask.data(),
+        valueCol.null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (copyStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "value null mask copy failed";
+      return result;
+    }
+  }
+  if (!keyMask.empty() || !valueMask.empty()) {
+    auto const syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "null mask stream sync failed";
+      return result;
+    }
+  }
+
+  auto isValid = [](const std::vector<uint8_t>& mask, int64_t index) -> bool {
+    if (mask.empty()) {
+      return true;
+    }
+    auto const byte = mask[static_cast<size_t>(index) / 8];
+    return ((byte >> (index % 8)) & 1) != 0;
+  };
+
+  std::vector<uint8_t> keyHost;
+  std::vector<uint8_t> valueHost;
+  for (int64_t start = 0; start < totalRows; start += batchRows) {
+    auto const rowsThis = std::min<int64_t>(batchRows, totalRows - start);
+    auto const keyBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(keyElementSize);
+    auto const valueBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(valueElementSize);
+    keyHost.resize(keyBytes);
+    valueHost.resize(valueBytes);
+
+    auto const* keyPtr = keyBase + start * keyElementSize;
+    auto const* valuePtr = valueBase + start * valueElementSize;
+    auto keyStatus = cudaMemcpyAsync(
+        keyHost.data(),
+        keyPtr,
+        keyBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto valueStatus = cudaMemcpyAsync(
+        valueHost.data(),
+        valuePtr,
+        valueBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (keyStatus != cudaSuccess || valueStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaMemcpyAsync failed";
+      return result;
+    }
+    auto syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaStreamSynchronize failed";
+      return result;
+    }
+
+    for (int64_t i = 0; i < rowsThis; ++i) {
+      auto const rowIndex = start + i;
+      bool keyValid = isValid(keyMask, keyBitOffset + rowIndex);
+      bool valueValid = isValid(valueMask, valueBitOffset + rowIndex);
+      int64_t key = 0;
+      if (keyValid) {
+        if (keyType == cudf::type_id::INT64) {
+          std::memcpy(
+              &key, keyHost.data() + i * keyElementSize, sizeof(int64_t));
+        } else {
+          int32_t key32 = 0;
+          std::memcpy(
+              &key32, keyHost.data() + i * keyElementSize, sizeof(int32_t));
+          key = key32;
+        }
+      }
+      if (!keyValid && nullPolicy == cudf::null_policy::EXCLUDE) {
+        continue;
+      }
+      ExpectedAgg* agg = nullptr;
+      if (!keyValid) {
+        sawNullKey = true;
+        agg = &nullKeyAgg;
+      } else {
+        agg = &expected[key];
+      }
+      agg->rows += 1;
+      if (!valueValid) {
+        continue;
+      }
+      __int128_t value = 0;
+      if (valueType == cudf::type_id::DECIMAL64) {
+        int64_t value64 = 0;
+        std::memcpy(
+            &value64,
+            valueHost.data() + i * valueElementSize,
+            sizeof(int64_t));
+        value = static_cast<__int128_t>(value64);
+      } else {
+        uint64_t lo = 0;
+        int64_t hi = 0;
+        auto const* ptr = valueHost.data() + i * valueElementSize;
+        std::memcpy(&lo, ptr, sizeof(uint64_t));
+        std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+        value = (static_cast<__int128_t>(hi) << 64) | lo;
+      }
+      agg->sum += value;
+      agg->count += 1;
+    }
+  }
+
+  int32_t scale = static_cast<int32_t>(valueCol.type().scale());
+  if (scale < 0) {
+    scale = -scale;
+  }
+  auto decoded = cudf_velox::deserializeDecimalSumStateWithCount(
+      stateCol, scale, stream);
+  auto decodedSumView = decoded.sum->view();
+  auto decodedCountView = decoded.count->view();
+
+  auto outRows = outKeyCol.size();
+  result.outputKeys = outRows;
+  result.expectedKeys =
+      static_cast<int64_t>(expected.size()) + (sawNullKey ? 1 : 0);
+  if (maxRows > 0 && outRows > maxRows) {
+    outRows = maxRows;
+  }
+  if (batchRows <= 0) {
+    batchRows = outRows;
+  }
+
+  std::vector<uint8_t> outKeyMask;
+  std::vector<uint8_t> decodedMask;
+  auto outKeyBitOffset = outKeyCol.offset();
+  auto decodedBitOffset = decodedSumView.offset();
+
+  if (outKeyCol.null_count() > 0) {
+    auto const maskBytes = static_cast<size_t>(
+        cudf::bitmask_allocation_size_bytes(outKeyCol.offset() + outKeyCol.size()));
+    outKeyMask.resize(maskBytes);
+    auto const copyStatus = cudaMemcpyAsync(
+        outKeyMask.data(),
+        outKeyCol.null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (copyStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output key mask copy failed";
+      return result;
+    }
+  }
+  if (decodedSumView.null_count() > 0) {
+    auto const maskBytes = static_cast<size_t>(
+        cudf::bitmask_allocation_size_bytes(
+            decodedSumView.offset() + decodedSumView.size()));
+    decodedMask.resize(maskBytes);
+    auto const copyStatus = cudaMemcpyAsync(
+        decodedMask.data(),
+        decodedSumView.null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (copyStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "decoded mask copy failed";
+      return result;
+    }
+  }
+  if (!outKeyMask.empty() || !decodedMask.empty()) {
+    auto const syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output mask stream sync failed";
+      return result;
+    }
+  }
+
+  auto outKeyElementSize = cudf::size_of(outKeyCol.type());
+  auto decodedSumElementSize = cudf::size_of(decodedSumView.type());
+  auto decodedCountElementSize = cudf::size_of(decodedCountView.type());
+  auto const* outKeyBase = static_cast<const uint8_t*>(outKeyCol.head()) +
+      outKeyCol.offset() * outKeyElementSize;
+  auto const* decodedSumBase =
+      static_cast<const uint8_t*>(decodedSumView.head()) +
+      decodedSumView.offset() * decodedSumElementSize;
+  auto const* decodedCountBase =
+      static_cast<const uint8_t*>(decodedCountView.head()) +
+      decodedCountView.offset() * decodedCountElementSize;
+
+  std::vector<uint8_t> outKeyHost;
+  std::vector<uint8_t> decodedSumHost;
+  std::vector<uint8_t> decodedCountHost;
+
+  for (int64_t start = 0; start < outRows; start += batchRows) {
+    auto const rowsThis = std::min<int64_t>(batchRows, outRows - start);
+    auto const outKeyBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(outKeyElementSize);
+    auto const decodedSumBytes = static_cast<size_t>(rowsThis) *
+        static_cast<size_t>(decodedSumElementSize);
+    auto const decodedCountBytes = static_cast<size_t>(rowsThis) *
+        static_cast<size_t>(decodedCountElementSize);
+    outKeyHost.resize(outKeyBytes);
+    decodedSumHost.resize(decodedSumBytes);
+    decodedCountHost.resize(decodedCountBytes);
+
+    auto const* outKeyPtr = outKeyBase + start * outKeyElementSize;
+    auto const* decodedSumPtr = decodedSumBase + start * decodedSumElementSize;
+    auto const* decodedCountPtr =
+        decodedCountBase + start * decodedCountElementSize;
+
+    auto outKeyStatus = cudaMemcpyAsync(
+        outKeyHost.data(),
+        outKeyPtr,
+        outKeyBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto decodedSumStatus = cudaMemcpyAsync(
+        decodedSumHost.data(),
+        decodedSumPtr,
+        decodedSumBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto decodedCountStatus = cudaMemcpyAsync(
+        decodedCountHost.data(),
+        decodedCountPtr,
+        decodedCountBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (outKeyStatus != cudaSuccess || decodedSumStatus != cudaSuccess ||
+        decodedCountStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output cudaMemcpyAsync failed";
+      return result;
+    }
+    auto outSync = cudaStreamSynchronize(stream.value());
+    if (outSync != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "output cudaStreamSynchronize failed";
+      return result;
+    }
+
+    for (int64_t i = 0; i < rowsThis; ++i) {
+      auto const rowIndex = start + i;
+      bool keyValid = isValid(outKeyMask, outKeyBitOffset + rowIndex);
+      bool stateValid = isValid(decodedMask, decodedBitOffset + rowIndex);
+      int64_t key = 0;
+      if (keyValid) {
+        if (outKeyCol.type().id() == cudf::type_id::INT64) {
+          std::memcpy(
+              &key, outKeyHost.data() + i * outKeyElementSize, sizeof(int64_t));
+        } else {
+          int32_t key32 = 0;
+          std::memcpy(
+              &key32,
+              outKeyHost.data() + i * outKeyElementSize,
+              sizeof(int32_t));
+          key = key32;
+        }
+      }
+
+      ExpectedAgg* agg = nullptr;
+      if (!keyValid) {
+        if (nullPolicy == cudf::null_policy::EXCLUDE) {
+          result.unexpected++;
+          if (result.firstRow < 0) {
+            result.firstRow = rowIndex;
+            result.firstKey = 0;
+            result.actualValid = stateValid;
+          }
+          continue;
+        }
+        if (!sawNullKey) {
+          result.unexpected++;
+          if (result.firstRow < 0) {
+            result.firstRow = rowIndex;
+            result.firstKey = 0;
+            result.actualValid = stateValid;
+          }
+          continue;
+        }
+        agg = &nullKeyAgg;
+      } else {
+        auto it = expected.find(key);
+        if (it == expected.end()) {
+          result.unexpected++;
+          if (result.firstRow < 0) {
+            result.firstRow = rowIndex;
+            result.firstKey = key;
+            result.actualValid = stateValid;
+          }
+          continue;
+        }
+        agg = &it->second;
+      }
+      agg->seen = true;
+      result.checked++;
+
+      bool expectedValid = agg->count != 0;
+      if (stateValid != expectedValid) {
+        result.sumMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.firstKey = key;
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+          result.expectedCount = agg->count;
+        }
+        continue;
+      }
+      if (!stateValid) {
+        continue;
+      }
+
+      __int128_t actualSum = 0;
+      uint64_t lo = 0;
+      int64_t hi = 0;
+      auto const* sumPtr = decodedSumHost.data() + i * decodedSumElementSize;
+      std::memcpy(&lo, sumPtr, sizeof(uint64_t));
+      std::memcpy(&hi, sumPtr + sizeof(uint64_t), sizeof(int64_t));
+      actualSum = (static_cast<__int128_t>(hi) << 64) | lo;
+
+      int64_t actualCount = 0;
+      std::memcpy(
+          &actualCount,
+          decodedCountHost.data() + i * decodedCountElementSize,
+          sizeof(int64_t));
+
+      if (agg->sum != actualSum) {
+        result.sumMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.firstKey = key;
+          result.expectedSum = agg->sum;
+          result.actualSum = actualSum;
+          result.expectedCount = agg->count;
+          result.actualCount = actualCount;
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+        }
+      }
+      if (agg->count != actualCount) {
+        result.countMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.firstKey = key;
+          result.expectedSum = agg->sum;
+          result.actualSum = actualSum;
+          result.expectedCount = agg->count;
+          result.actualCount = actualCount;
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+        }
+      }
+    }
+  }
+
+  for (auto& entry : expected) {
+    if (!entry.second.seen && entry.second.rows > 0) {
+      result.missing++;
+    }
+  }
+  if (sawNullKey && !nullKeyAgg.seen && nullKeyAgg.rows > 0) {
+    result.missing++;
+  }
+  return result;
+}
+
 const char* fakeGroupbyModeName(int32_t mode) {
   switch (mode) {
     case 1:
@@ -5210,6 +5728,50 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                       << inputValidation.firstKey
                       << " expected=" << toString128(inputValidation.firstExpected)
                       << " actual=" << toString128(inputValidation.firstActual);
+          }
+        }
+      }
+      if (cfg.debugHashAggPartialInputValidate &&
+          (step_ == core::AggregationNode::Step::kPartial ||
+           step_ == core::AggregationNode::Step::kIntermediate)) {
+        auto partialValidation = validatePartialStateAgainstInput(
+            step_,
+            stream,
+            groupbyKeyView,
+            nullPolicy,
+            requests,
+            resultTable->view(),
+            cfg.debugHashAggEndToEndMaxRows,
+            cfg.debugHashAggEndToEndBatchRows);
+        if (partialValidation.skipped) {
+          LOG(INFO) << "[HashAggPartialInput] skipped reason="
+                    << partialValidation.reason << " step=" << stepName(step_)
+                    << " keyCols=" << groupbyKeyView.num_columns()
+                    << " outputCols=" << resultTable->num_columns()
+                    << " requestCount=" << requests.size();
+        } else {
+          LOG(INFO) << "[HashAggPartialInput] expectedKeys="
+                    << partialValidation.expectedKeys
+                    << " outputKeys=" << partialValidation.outputKeys
+                    << " checked=" << partialValidation.checked
+                    << " sumMismatches=" << partialValidation.sumMismatches
+                    << " countMismatches=" << partialValidation.countMismatches
+                    << " missing=" << partialValidation.missing
+                    << " unexpected=" << partialValidation.unexpected;
+          if (partialValidation.sumMismatches > 0 ||
+              partialValidation.countMismatches > 0 ||
+              partialValidation.unexpected > 0) {
+            LOG(INFO) << "[HashAggPartialInput] firstMismatch key="
+                      << partialValidation.firstKey
+                      << " row=" << partialValidation.firstRow
+                      << " expectedSum="
+                      << toString128(partialValidation.expectedSum)
+                      << " actualSum="
+                      << toString128(partialValidation.actualSum)
+                      << " expectedCount=" << partialValidation.expectedCount
+                      << " actualCount=" << partialValidation.actualCount
+                      << " expectedValid=" << partialValidation.expectedValid
+                      << " actualValid=" << partialValidation.actualValid;
           }
         }
       }
