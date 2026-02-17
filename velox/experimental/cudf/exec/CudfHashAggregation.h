@@ -165,6 +165,9 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   void computeIntermediateDistinctPartial(CudfVectorPtr tbl);
 
   CudfVectorPtr partialOutput_;
+
+  // Debug-only: per-partial batch counter for tracking keys.
+  int64_t partialTrackBatch_{0};
 };
 
 // Step-aware aggregation function registry

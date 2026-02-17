@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -59,6 +60,8 @@ struct CudfConfig {
       "cudf.debug_hashagg_state_roundtrip_validate"};
   static constexpr const char* kCudfDebugHashAggPartialInputValidate{
       "cudf.debug_hashagg_partial_input_validate"};
+  static constexpr const char* kCudfDebugHashAggTrackKeys{
+      "cudf.debug_hashagg_track_keys"};
   static constexpr const char* kCudfDebugSerdeValidate{
       "cudf.debug_serde_validate"};
   static constexpr const char* kCudfDebugSerdeValidateMaxRows{
@@ -172,6 +175,9 @@ struct CudfConfig {
 
   /// Optional: validate partial/intermediate decimal state against raw input.
   bool debugHashAggPartialInputValidate{false};
+
+  /// Optional: track per-key partial input/output for debugging.
+  std::vector<int64_t> debugHashAggTrackKeys;
 
   /// Optional: validate Presto serialization roundtrip for RowVector outputs.
   bool debugSerdeValidate{false};

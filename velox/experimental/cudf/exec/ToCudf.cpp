@@ -54,6 +54,10 @@
 #include <cuda.h>
 
 #include <iostream>
+#include <cctype>
+#include <sstream>
+#include <cerrno>
+#include <cstdlib>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -64,6 +68,42 @@ namespace {
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
   return ((dynamic_cast<const Deriveds*>(p) != nullptr) || ...);
+}
+
+std::string trimCopy(std::string const& input) {
+  size_t start = 0;
+  while (start < input.size() &&
+         std::isspace(static_cast<unsigned char>(input[start]))) {
+    ++start;
+  }
+  size_t end = input.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+    --end;
+  }
+  return input.substr(start, end - start);
+}
+
+std::vector<int64_t> parseInt64List(std::string const& input) {
+  std::vector<int64_t> values;
+  std::stringstream ss(input);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    token = trimCopy(token);
+    if (token.empty()) {
+      continue;
+    }
+    errno = 0;
+    char* end = nullptr;
+    auto value = std::strtoll(token.c_str(), &end, 10);
+    if (errno != 0 || end == token.c_str() || *end != '\0') {
+      LOG(WARNING) << "[CudfConfig] invalid debug_hashagg_track_keys entry: "
+                   << token;
+      continue;
+    }
+    values.push_back(static_cast<int64_t>(value));
+  }
+  return values;
 }
 
 } // namespace
@@ -611,6 +651,10 @@ void CudfConfig::initialize(
     // Default to end-to-end validation flag when not explicitly configured.
     debugHashAggPartialInputValidate = debugHashAggEndToEndValidate;
   }
+  if (config.find(kCudfDebugHashAggTrackKeys) != config.end()) {
+    debugHashAggTrackKeys =
+        parseInt64List(config[kCudfDebugHashAggTrackKeys]);
+  }
   if (config.find(kCudfDebugSerdeValidate) != config.end()) {
     debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);
   }
@@ -688,6 +732,7 @@ void CudfConfig::initialize(
               << debugHashAggStateRoundtripValidate
               << " debugHashAggPartialInputValidate="
               << debugHashAggPartialInputValidate
+              << " debugHashAggTrackKeys=" << debugHashAggTrackKeys.size()
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }

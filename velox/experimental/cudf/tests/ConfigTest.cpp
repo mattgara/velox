@@ -43,6 +43,7 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfDebugHashAggExpectedPath, "/tmp/hashagg_expected.csv"},
       {CudfConfig::kCudfDebugHashAggStateRoundtripValidate, "true"},
       {CudfConfig::kCudfDebugHashAggPartialInputValidate, "true"},
+      {CudfConfig::kCudfDebugHashAggTrackKeys, "17355622,19412603"},
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
@@ -71,6 +72,9 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.debugHashAggExpectedPath, "/tmp/hashagg_expected.csv");
   ASSERT_EQ(config.debugHashAggStateRoundtripValidate, true);
   ASSERT_EQ(config.debugHashAggPartialInputValidate, true);
+  ASSERT_EQ(config.debugHashAggTrackKeys.size(), 2);
+  ASSERT_EQ(config.debugHashAggTrackKeys[0], 17355622);
+  ASSERT_EQ(config.debugHashAggTrackKeys[1], 19412603);
   ASSERT_EQ(config.memoryResource, "arena");
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
