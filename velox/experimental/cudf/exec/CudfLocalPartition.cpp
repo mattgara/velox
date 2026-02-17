@@ -653,25 +653,44 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
   } else {
     // Single partition case.
     ContinueFuture future;
-    if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
-      auto tableView = cudfVector->getTableView();
-      trackPartitionKeys(
-          tableView,
-          CudfConfig::getInstance().debugHashAggTrackKeys,
-          partitionKeyIndices_,
-          stream,
-          taskId(),
-          planNodeId(),
-          operatorId(),
-          splitGroupId(),
-          0,
-          cudfVector.get());
+    auto tableView = cudfVector->getTableView();
+    auto splitPoints = buildStringSafeSplits(tableView, stream);
+    std::vector<cudf::table_view> subTables;
+    if (!splitPoints.empty()) {
+      subTables = cudf::split(tableView, splitPoints, stream);
+    } else {
+      subTables.push_back(tableView);
     }
-    auto blockingReason =
-        queues_[0]->enqueue(input, input->retainedSize(), &future);
-    if (blockingReason != exec::BlockingReason::kNotBlocked) {
-      blockingReasons_.push_back(blockingReason);
-      futures_.push_back(std::move(future));
+
+    for (auto const& subTable : subTables) {
+      if (subTable.num_rows() == 0) {
+        continue;
+      }
+      auto subVector = std::make_shared<CudfVector>(
+          pool(),
+          outputType_,
+          subTable.num_rows(),
+          std::make_unique<cudf::table>(subTable, stream),
+          stream);
+      if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
+        trackPartitionKeys(
+            subTable,
+            CudfConfig::getInstance().debugHashAggTrackKeys,
+            partitionKeyIndices_,
+            stream,
+            taskId(),
+            planNodeId(),
+            operatorId(),
+            splitGroupId(),
+            0,
+            subVector.get());
+      }
+      auto blockingReason =
+          queues_[0]->enqueue(subVector, subTable.num_rows(), &future);
+      if (blockingReason != exec::BlockingReason::kNotBlocked) {
+        blockingReasons_.push_back(blockingReason);
+        futures_.push_back(std::move(future));
+      }
     }
   }
 }
