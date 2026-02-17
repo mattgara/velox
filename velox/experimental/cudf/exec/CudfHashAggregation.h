@@ -168,6 +168,9 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   // Debug-only: per-partial batch counter for tracking keys.
   int64_t partialTrackBatch_{0};
+
+  // Debug-only: per-final-input batch counter for tracking keys.
+  int64_t finalTrackBatch_{0};
 };
 
 // Step-aware aggregation function registry

@@ -78,7 +78,8 @@ void trackPartitionKeys(
     std::string const& planNodeId,
     int32_t operatorId,
     uint32_t splitGroupId,
-    int32_t partitionIndex) {
+    int32_t partitionIndex,
+    const void* vectorPtr) {
   if (keys.empty()) {
     return;
   }
@@ -318,6 +319,7 @@ void trackPartitionKeys(
               << " op=" << operatorId
               << " split=" << splitGroupId
               << " partition=" << partitionIndex
+              << " ptr=" << vectorPtr
               << " key=" << key
               << " rows=" << entry.rows
               << " stateRows=" << entry.stateRows
@@ -494,6 +496,12 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
         // Skip empty partitions.
         continue;
       }
+      auto cudfPartitionVector = std::make_shared<CudfVector>(
+          pool(),
+          outputType_,
+          partitionData.num_rows(),
+          std::make_unique<cudf::table>(partitionData),
+          stream);
       if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
         trackPartitionKeys(
             partitionData,
@@ -504,7 +512,8 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
             planNodeId(),
             operatorId(),
             splitGroupId(),
-            i);
+            i,
+            cudfPartitionVector.get());
       }
 
       ContinueFuture future;
@@ -514,12 +523,7 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
       // type of RowVector that can hold a table view and shared_ptr to the
       // table.
       auto blockingReason = queues_[i]->enqueue(
-          std::make_shared<CudfVector>(
-              pool(),
-              outputType_,
-              partitionData.num_rows(),
-              std::make_unique<cudf::table>(partitionData),
-              stream),
+          cudfPartitionVector,
           partitionData.num_rows(),
           &future);
       if (blockingReason != exec::BlockingReason::kNotBlocked) {
@@ -541,7 +545,8 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
           planNodeId(),
           operatorId(),
           splitGroupId(),
-          0);
+          0,
+          cudfVector.get());
     }
     auto blockingReason =
         queues_[0]->enqueue(input, input->retainedSize(), &future);
