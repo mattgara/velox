@@ -41,7 +41,6 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
-#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -77,115 +76,6 @@
 namespace {
 
 using namespace facebook::velox;
-
-constexpr int64_t kDecimalStateBytes = 32;
-constexpr int64_t kMaxDecimalStateRows =
-    static_cast<int64_t>(std::numeric_limits<int32_t>::max()) /
-    kDecimalStateBytes;
-constexpr int64_t kMaxStringBytes =
-    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-
-struct StringOffsets {
-  std::vector<int32_t> offsets;
-  cudf::size_type base{0};
-  cudf::size_type size{0};
-};
-
-std::vector<StringOffsets> captureStringOffsets(
-    cudf::table_view const& tableView,
-    rmm::cuda_stream_view stream) {
-  std::vector<StringOffsets> result;
-  for (cudf::size_type colIdx = 0; colIdx < tableView.num_columns(); ++colIdx) {
-    auto const col = tableView.column(colIdx);
-    if (col.type().id() != cudf::type_id::STRING) {
-      continue;
-    }
-    cudf::strings_column_view strings(col);
-    auto offsetsView = strings.offsets();
-    auto const offsetsCount = offsetsView.size();
-    if (offsetsCount == 0) {
-      continue;
-    }
-    std::vector<int32_t> hostOffsets(static_cast<size_t>(offsetsCount));
-    auto copyStatus = cudaMemcpyAsync(
-        hostOffsets.data(),
-        offsetsView.data<int32_t>(),
-        static_cast<size_t>(offsetsCount) * sizeof(int32_t),
-        cudaMemcpyDeviceToHost,
-        stream.value());
-    if (copyStatus != cudaSuccess) {
-      continue;
-    }
-    auto syncStatus = cudaStreamSynchronize(stream.value());
-    if (syncStatus != cudaSuccess) {
-      continue;
-    }
-    StringOffsets captured;
-    captured.offsets = std::move(hostOffsets);
-    captured.base = col.offset();
-    captured.size = col.size();
-    result.push_back(std::move(captured));
-  }
-  return result;
-}
-
-std::vector<cudf::size_type> buildStringSafeSplits(
-    cudf::table_view const& tableView,
-    rmm::cuda_stream_view stream) {
-  bool needsSplit = false;
-  for (cudf::size_type colIdx = 0; colIdx < tableView.num_columns(); ++colIdx) {
-    auto const col = tableView.column(colIdx);
-    if (col.type().id() != cudf::type_id::STRING) {
-      continue;
-    }
-    cudf::strings_column_view strings(col);
-    if (static_cast<int64_t>(strings.chars_size(stream)) > kMaxStringBytes) {
-      needsSplit = true;
-      break;
-    }
-  }
-  if (!needsSplit) {
-    return {};
-  }
-
-  auto offsetsPerColumn = captureStringOffsets(tableView, stream);
-  if (offsetsPerColumn.empty()) {
-    return {};
-  }
-
-  auto const totalRows = static_cast<int64_t>(tableView.num_rows());
-  std::vector<cudf::size_type> splitPoints;
-  int64_t start = 0;
-  while (start < totalRows) {
-    int64_t end = totalRows;
-    for (auto const& col : offsetsPerColumn) {
-      auto const colStart = col.base + start;
-      auto const colEnd = col.base + totalRows;
-      if (colStart >= static_cast<cudf::size_type>(col.offsets.size()) ||
-          colEnd + 1 > static_cast<cudf::size_type>(col.offsets.size())) {
-        continue;
-      }
-      int32_t baseOffset = col.offsets[colStart];
-      int32_t target = baseOffset + static_cast<int32_t>(kMaxStringBytes);
-      auto beginIt = col.offsets.begin() + colStart + 1;
-      auto endIt = col.offsets.begin() + colEnd + 1;
-      auto upper = std::upper_bound(beginIt, endIt, target);
-      auto upperIdx = static_cast<int64_t>(upper - col.offsets.begin());
-      int64_t colEndRow = upperIdx - 1 - col.base;
-      end = std::min(end, colEndRow + 1);
-    }
-    if (end <= start) {
-      VELOX_FAIL(
-          "String payload exceeds cuDF offset limit within a single row.");
-    }
-    if (end >= totalRows) {
-      break;
-    }
-    splitPoints.push_back(static_cast<cudf::size_type>(end));
-    start = end;
-  }
-  return splitPoints;
-}
 
 inline bool hashAggDebugEnabled() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
@@ -6600,19 +6490,9 @@ void CudfHashAggregation::initialize() {
   // We're postponing this for now.
 
   numAggregates_ = aggregationNode_->aggregates().size();
-  hasDecimalInput_ = std::any_of(
-      aggregationNode_->aggregates().begin(),
-      aggregationNode_->aggregates().end(),
-      [](auto const& agg) {
-        return std::any_of(
-            agg.rawInputTypes.begin(),
-            agg.rawInputTypes.end(),
-            [](auto const& type) { return type && type->isDecimal(); });
-      });
   aggregators_ = toAggregators(*aggregationNode_, *operatorCtx_);
   intermediateAggregators_ =
       toIntermediateAggregators(*aggregationNode_, *operatorCtx_);
-  useStreamingFinalMerge_ = shouldStreamFinalMerge();
 
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
@@ -6743,106 +6623,6 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
   }
 }
 
-void CudfHashAggregation::emitChunkedPartialOutputs(CudfVectorPtr input) {
-  if (!input || input->size() == 0) {
-    return;
-  }
-  auto stream = input->stream();
-  auto tableView = input->getTableView();
-  auto const totalRows = static_cast<int64_t>(tableView.num_rows());
-  if (totalRows <= kMaxDecimalStateRows) {
-    auto out = doGroupByAggregation(
-        tableView, groupingKeyInputChannels_, aggregators_, stream);
-    if (out) {
-      pendingOutputs_.push_back(std::move(out));
-    }
-    return;
-  }
-
-  std::vector<cudf::size_type> splitPoints;
-  splitPoints.reserve(static_cast<size_t>(totalRows / kMaxDecimalStateRows));
-  for (int64_t offset = kMaxDecimalStateRows; offset < totalRows;
-       offset += kMaxDecimalStateRows) {
-    splitPoints.push_back(static_cast<cudf::size_type>(offset));
-  }
-
-  auto splits = cudf::split(tableView, splitPoints, stream);
-  for (auto const& splitView : splits) {
-    if (splitView.num_rows() == 0) {
-      continue;
-    }
-    auto splitTable = std::make_unique<cudf::table>(splitView, stream);
-    auto splitVector = std::make_shared<cudf_velox::CudfVector>(
-        pool(),
-        input->type(),
-        splitView.num_rows(),
-        std::move(splitTable),
-        stream);
-    auto out = doGroupByAggregation(
-        splitVector->getTableView(),
-        groupingKeyInputChannels_,
-        aggregators_,
-        stream);
-    if (out) {
-      pendingOutputs_.push_back(std::move(out));
-    }
-  }
-}
-
-bool CudfHashAggregation::shouldStreamFinalMerge() const {
-  if (step_ != core::AggregationNode::Step::kFinal) {
-    return false;
-  }
-  if (isGlobal_ || isDistinct_) {
-    return false;
-  }
-  if (!inputType_) {
-    return false;
-  }
-  bool hasStringInput = false;
-  for (auto i = 0; i < inputType_->size(); ++i) {
-    auto const kind = inputType_->childAt(i)->kind();
-    if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
-      hasStringInput = true;
-      break;
-    }
-  }
-  if (!hasStringInput) {
-    return false;
-  }
-  return std::all_of(
-      intermediateAggregators_.begin(),
-      intermediateAggregators_.end(),
-      [](auto const& agg) { return agg != nullptr; });
-}
-
-void CudfHashAggregation::mergeFinalInput(CudfVectorPtr input) {
-  if (!input) {
-    return;
-  }
-  if (!partialOutput_) {
-    partialOutput_ = std::move(input);
-    return;
-  }
-
-  auto stream = partialOutput_->stream();
-  std::vector<rmm::cuda_stream_view> inputStreams{
-      partialOutput_->stream(), input->stream()};
-  cudf::detail::join_streams(inputStreams, stream);
-
-  std::vector<cudf::table_view> tablesToConcat{
-      partialOutput_->getTableView(), input->getTableView()};
-  auto concatenated = cudf::concatenate(
-      tablesToConcat, stream, cudf::get_current_device_resource_ref());
-
-  partialOutput_ = doGroupByAggregation(
-      concatenated->view(),
-      groupingKeyInputChannels_,
-      intermediateAggregators_,
-      stream,
-      inputType_);
-}
-
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input->size() == 0) {
@@ -6885,59 +6665,6 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
       numInputRows_);
 
   if (isPartialOutput_ && !isGlobal_) {
-    auto tableView = cudfInput->getTableView();
-    auto stream = cudfInput->stream();
-    auto stringSplits = buildStringSafeSplits(tableView, stream);
-    if (!stringSplits.empty()) {
-      if (partialOutput_) {
-        pendingOutputs_.push_back(releaseAndResetPartialOutput());
-      }
-      auto splits = cudf::split(tableView, stringSplits, stream);
-      for (auto const& splitView : splits) {
-        if (splitView.num_rows() == 0) {
-          continue;
-        }
-        auto splitTable = std::make_unique<cudf::table>(splitView, stream);
-        auto splitVector = std::make_shared<cudf_velox::CudfVector>(
-            pool(),
-            cudfInput->type(),
-            splitView.num_rows(),
-            std::move(splitTable),
-            stream);
-        if (!isDistinct_ && hasDecimalInput_ &&
-            splitView.num_rows() > kMaxDecimalStateRows) {
-          emitChunkedPartialOutputs(std::move(splitVector));
-          continue;
-        }
-        if (isDistinct_) {
-          auto out = getDistinctKeys(
-              splitVector->getTableView(),
-              groupingKeyInputChannels_,
-              stream);
-          if (out) {
-            pendingOutputs_.push_back(std::move(out));
-          }
-        } else {
-          auto out = doGroupByAggregation(
-              splitVector->getTableView(),
-              groupingKeyInputChannels_,
-              aggregators_,
-              stream);
-          if (out) {
-            pendingOutputs_.push_back(std::move(out));
-          }
-        }
-      }
-      return;
-    }
-    if (!isDistinct_ && hasDecimalInput_ &&
-        cudfInput->size() > kMaxDecimalStateRows) {
-      if (partialOutput_) {
-        pendingOutputs_.push_back(releaseAndResetPartialOutput());
-      }
-      emitChunkedPartialOutputs(std::move(cudfInput));
-      return;
-    }
     if (isDistinct_) {
       // Handle partial distinct aggregation.
       computeIntermediateDistinctPartial(cudfInput);
@@ -6961,18 +6688,6 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
         partialOutput_ ? partialOutput_->size() : 0,
         isDistinct_ ? 1 : 0,
         numInputRows_);
-    return;
-  }
-
-  if (useStreamingFinalMerge_) {
-    mergeFinalInput(std::move(cudfInput));
-    if (hashAggDebugEnabled()) {
-      LOG(INFO) << "[CudfHashAggDebug] stage=addInput.finalMerge step="
-                << stepName(step_)
-                << " partialOutputRows="
-                << (partialOutput_ ? partialOutput_->size() : 0)
-                << " numInputRows=" << numInputRows_;
-    }
     return;
   }
 
@@ -7667,12 +7382,6 @@ RowVectorPtr CudfHashAggregation::getOutput() {
               << static_cast<bool>(partialOutput_);
   }
 
-  if (!pendingOutputs_.empty()) {
-    auto out = std::move(pendingOutputs_.front());
-    pendingOutputs_.pop_front();
-    return out;
-  }
-
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_) {
     if (partialOutput_ &&
@@ -7690,25 +7399,6 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       return nullptr;
     }
     return releaseAndResetPartialOutput();
-  }
-
-  if (useStreamingFinalMerge_) {
-    if (finished_ || !noMoreInput_) {
-      return nullptr;
-    }
-    if (!partialOutput_) {
-      finished_ = true;
-      return nullptr;
-    }
-    auto stream = partialOutput_->stream();
-    auto result = doGroupByAggregation(
-        partialOutput_->getTableView(),
-        groupingKeyInputChannels_,
-        aggregators_,
-        stream);
-    finished_ = true;
-    partialOutput_.reset();
-    return result;
   }
 
   if (finished_) {

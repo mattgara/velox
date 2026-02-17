@@ -23,7 +23,6 @@
 
 #include <cudf/groupby.hpp>
 
-#include <deque>
 #include <unordered_map>
 
 namespace facebook::velox::cudf_velox {
@@ -166,10 +165,6 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   void computeIntermediateDistinctPartial(CudfVectorPtr tbl);
 
-  bool shouldStreamFinalMerge() const;
-  void mergeFinalInput(CudfVectorPtr input);
-  void emitChunkedPartialOutputs(CudfVectorPtr input);
-
   CudfVectorPtr partialOutput_;
 
   // Debug-only: per-partial batch counter for tracking keys.
@@ -178,9 +173,6 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   // Debug-only: per-final-input batch counter for tracking keys.
   int64_t finalTrackBatch_{0};
 
-  bool useStreamingFinalMerge_{false};
-  bool hasDecimalInput_{false};
-  std::deque<CudfVectorPtr> pendingOutputs_;
 };
 
 // Step-aware aggregation function registry

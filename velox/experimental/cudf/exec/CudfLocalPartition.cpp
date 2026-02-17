@@ -24,11 +24,9 @@
 
 #include <cudf/copying.hpp>
 #include <cudf/partitioning.hpp>
-#include <cudf/utilities/type_checks.hpp>
 
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -60,111 +58,6 @@ bool isValidAt(const std::vector<uint8_t>& mask, int64_t index) {
   }
   auto const byte = mask[static_cast<size_t>(index) / 8];
   return ((byte >> (index % 8)) & 1) != 0;
-}
-
-constexpr int64_t kMaxStringBytes =
-    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
-
-struct StringOffsets {
-  std::vector<int32_t> offsets;
-  cudf::size_type base{0};
-  cudf::size_type size{0};
-};
-
-std::vector<StringOffsets> captureStringOffsets(
-    cudf::table_view const& tableView,
-    rmm::cuda_stream_view stream) {
-  std::vector<StringOffsets> result;
-  for (cudf::size_type colIdx = 0; colIdx < tableView.num_columns(); ++colIdx) {
-    auto const col = tableView.column(colIdx);
-    if (col.type().id() != cudf::type_id::STRING) {
-      continue;
-    }
-    cudf::strings_column_view strings(col);
-    auto offsetsView = strings.offsets();
-    auto const offsetsCount = offsetsView.size();
-    if (offsetsCount == 0) {
-      continue;
-    }
-    std::vector<int32_t> hostOffsets(static_cast<size_t>(offsetsCount));
-    auto copyStatus = cudaMemcpyAsync(
-        hostOffsets.data(),
-        offsetsView.data<int32_t>(),
-        static_cast<size_t>(offsetsCount) * sizeof(int32_t),
-        cudaMemcpyDeviceToHost,
-        stream.value());
-    if (copyStatus != cudaSuccess) {
-      continue;
-    }
-    auto syncStatus = cudaStreamSynchronize(stream.value());
-    if (syncStatus != cudaSuccess) {
-      continue;
-    }
-    StringOffsets captured;
-    captured.offsets = std::move(hostOffsets);
-    captured.base = col.offset();
-    captured.size = col.size();
-    result.push_back(std::move(captured));
-  }
-  return result;
-}
-
-std::vector<cudf::size_type> buildStringSafeSplits(
-    cudf::table_view const& tableView,
-    rmm::cuda_stream_view stream) {
-  bool needsSplit = false;
-  for (cudf::size_type colIdx = 0; colIdx < tableView.num_columns(); ++colIdx) {
-    auto const col = tableView.column(colIdx);
-    if (col.type().id() != cudf::type_id::STRING) {
-      continue;
-    }
-    cudf::strings_column_view strings(col);
-    if (static_cast<int64_t>(strings.chars_size(stream)) > kMaxStringBytes) {
-      needsSplit = true;
-      break;
-    }
-  }
-  if (!needsSplit) {
-    return {};
-  }
-
-  auto offsetsPerColumn = captureStringOffsets(tableView, stream);
-  if (offsetsPerColumn.empty()) {
-    return {};
-  }
-
-  auto const totalRows = static_cast<int64_t>(tableView.num_rows());
-  std::vector<cudf::size_type> splitPoints;
-  int64_t start = 0;
-  while (start < totalRows) {
-    int64_t end = totalRows;
-    for (auto const& col : offsetsPerColumn) {
-      auto const colStart = col.base + start;
-      auto const colEnd = col.base + totalRows;
-      if (colStart >= static_cast<cudf::size_type>(col.offsets.size()) ||
-          colEnd + 1 > static_cast<cudf::size_type>(col.offsets.size())) {
-        continue;
-      }
-      int32_t baseOffset = col.offsets[colStart];
-      int32_t target = baseOffset + static_cast<int32_t>(kMaxStringBytes);
-      auto beginIt = col.offsets.begin() + colStart + 1;
-      auto endIt = col.offsets.begin() + colEnd + 1;
-      auto upper = std::upper_bound(beginIt, endIt, target);
-      auto upperIdx = static_cast<int64_t>(upper - col.offsets.begin());
-      int64_t colEndRow = upperIdx - 1 - col.base;
-      end = std::min(end, colEndRow + 1);
-    }
-    if (end <= start) {
-      VELOX_FAIL(
-          "String payload exceeds cuDF offset limit within a single row.");
-    }
-    if (end >= totalRows) {
-      break;
-    }
-    splitPoints.push_back(static_cast<cudf::size_type>(end));
-    start = end;
-  }
-  return splitPoints;
 }
 
 struct TrackKeyPartitionStats {
@@ -602,79 +495,15 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
         // Skip empty partitions.
         continue;
       }
-      auto splitPoints = buildStringSafeSplits(partitionData, stream);
-      std::vector<cudf::table_view> subTables;
-      if (!splitPoints.empty()) {
-        subTables = cudf::split(partitionData, splitPoints, stream);
-      } else {
-        subTables.push_back(partitionData);
-      }
-
-      for (auto const& subTable : subTables) {
-        if (subTable.num_rows() == 0) {
-          continue;
-        }
-        auto cudfPartitionVector = std::make_shared<CudfVector>(
-            pool(),
-            outputType_,
-            subTable.num_rows(),
-            std::make_unique<cudf::table>(subTable, stream),
-            stream);
-        if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
-          trackPartitionKeys(
-              subTable,
-              CudfConfig::getInstance().debugHashAggTrackKeys,
-              partitionKeyIndices_,
-              stream,
-              taskId(),
-              planNodeId(),
-              operatorId(),
-              splitGroupId(),
-              i,
-              cudfPartitionVector.get());
-        }
-
-        ContinueFuture future;
-        // DM: We should investigate if keeping partitionedTables alive and using
-        // the table view in partitonedData is more efficient than creating a new
-        // table each time. Currently out of scope because it would need a new
-        // type of RowVector that can hold a table view and shared_ptr to the
-        // table.
-        auto blockingReason = queues_[i]->enqueue(
-            cudfPartitionVector,
-            subTable.num_rows(),
-            &future);
-        if (blockingReason != exec::BlockingReason::kNotBlocked) {
-          blockingReasons_.push_back(blockingReason);
-          futures_.push_back(std::move(future));
-        }
-      }
-    }
-  } else {
-    // Single partition case.
-    ContinueFuture future;
-    auto tableView = cudfVector->getTableView();
-    auto splitPoints = buildStringSafeSplits(tableView, stream);
-    std::vector<cudf::table_view> subTables;
-    if (!splitPoints.empty()) {
-      subTables = cudf::split(tableView, splitPoints, stream);
-    } else {
-      subTables.push_back(tableView);
-    }
-
-    for (auto const& subTable : subTables) {
-      if (subTable.num_rows() == 0) {
-        continue;
-      }
-      auto subVector = std::make_shared<CudfVector>(
+      auto cudfPartitionVector = std::make_shared<CudfVector>(
           pool(),
           outputType_,
-          subTable.num_rows(),
-          std::make_unique<cudf::table>(subTable, stream),
+          partitionData.num_rows(),
+          std::make_unique<cudf::table>(partitionData, stream),
           stream);
       if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
         trackPartitionKeys(
-            subTable,
+            partitionData,
             CudfConfig::getInstance().debugHashAggTrackKeys,
             partitionKeyIndices_,
             stream,
@@ -682,15 +511,53 @@ void CudfLocalPartition::addInput(RowVectorPtr input) {
             planNodeId(),
             operatorId(),
             splitGroupId(),
-            0,
-            subVector.get());
+            i,
+            cudfPartitionVector.get());
       }
-      auto blockingReason =
-          queues_[0]->enqueue(subVector, subTable.num_rows(), &future);
+
+      ContinueFuture future;
+      // DM: We should investigate if keeping partitionedTables alive and using
+      // the table view in partitonedData is more efficient than creating a new
+      // table each time. Currently out of scope because it would need a new
+      // type of RowVector that can hold a table view and shared_ptr to the
+      // table.
+      auto blockingReason = queues_[i]->enqueue(
+          cudfPartitionVector,
+          partitionData.num_rows(),
+          &future);
       if (blockingReason != exec::BlockingReason::kNotBlocked) {
         blockingReasons_.push_back(blockingReason);
         futures_.push_back(std::move(future));
       }
+    }
+  } else {
+    // Single partition case.
+    ContinueFuture future;
+    auto tableView = cudfVector->getTableView();
+    auto subVector = std::make_shared<CudfVector>(
+        pool(),
+        outputType_,
+        tableView.num_rows(),
+        std::make_unique<cudf::table>(tableView, stream),
+        stream);
+    if (!CudfConfig::getInstance().debugHashAggTrackKeys.empty()) {
+      trackPartitionKeys(
+          tableView,
+          CudfConfig::getInstance().debugHashAggTrackKeys,
+          partitionKeyIndices_,
+          stream,
+          taskId(),
+          planNodeId(),
+          operatorId(),
+          splitGroupId(),
+          0,
+          subVector.get());
+    }
+    auto blockingReason =
+        queues_[0]->enqueue(subVector, tableView.num_rows(), &future);
+    if (blockingReason != exec::BlockingReason::kNotBlocked) {
+      blockingReasons_.push_back(blockingReason);
+      futures_.push_back(std::move(future));
     }
   }
 }
