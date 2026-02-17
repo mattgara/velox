@@ -602,9 +602,14 @@ void CudfConfig::initialize(
     debugHashAggStateRoundtripValidate =
         folly::to<bool>(config[kCudfDebugHashAggStateRoundtripValidate]);
   }
-  if (config.find(kCudfDebugHashAggPartialInputValidate) != config.end()) {
+  const bool partialInputConfigured =
+      config.find(kCudfDebugHashAggPartialInputValidate) != config.end();
+  if (partialInputConfigured) {
     debugHashAggPartialInputValidate =
         folly::to<bool>(config[kCudfDebugHashAggPartialInputValidate]);
+  } else {
+    // Default to end-to-end validation flag when not explicitly configured.
+    debugHashAggPartialInputValidate = debugHashAggEndToEndValidate;
   }
   if (config.find(kCudfDebugSerdeValidate) != config.end()) {
     debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);

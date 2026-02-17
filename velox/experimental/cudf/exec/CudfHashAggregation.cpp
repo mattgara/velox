@@ -2706,6 +2706,131 @@ struct PartialInputValidationResult {
   bool actualValid{false};
 };
 
+struct GlobalPartialAccumulator {
+  struct SumCount {
+    __int128_t sum{0};
+    int64_t count{0};
+  };
+
+  std::mutex mutex;
+  std::unordered_map<int64_t, SumCount> values;
+  SumCount nullKey;
+  bool sawNullKey{false};
+  int64_t rows{0};
+  int64_t batches{0};
+  bool reported{false};
+};
+
+GlobalPartialAccumulator& globalPartialAccumulator() {
+  static GlobalPartialAccumulator accumulator;
+  return accumulator;
+}
+
+struct GlobalPartialComparison {
+  bool skipped{false};
+  std::string reason;
+  int64_t expectedKeys{0};
+  int64_t observedKeys{0};
+  int64_t checked{0};
+  int64_t sumMismatches{0};
+  int64_t missing{0};
+  int64_t unexpected{0};
+  int64_t batches{0};
+  int64_t rows{0};
+  int64_t firstKey{0};
+  __int128_t expectedSum{0};
+  __int128_t actualSum{0};
+};
+
+GlobalPartialComparison compareGlobalPartialToExpected(
+    std::string const& expectedPath,
+    int32_t scale) {
+  GlobalPartialComparison result;
+  GlobalPartialAccumulator snapshot;
+  {
+    auto& global = globalPartialAccumulator();
+    std::lock_guard<std::mutex> guard(global.mutex);
+    if (global.values.empty() && !global.sawNullKey) {
+      result.skipped = true;
+      result.reason = "no partial input accumulated";
+      return result;
+    }
+    if (global.reported) {
+      result.skipped = true;
+      result.reason = "already reported";
+      return result;
+    }
+    snapshot.values = global.values;
+    snapshot.nullKey = global.nullKey;
+    snapshot.sawNullKey = global.sawNullKey;
+    snapshot.rows = global.rows;
+    snapshot.batches = global.batches;
+    global.reported = true;
+  }
+
+  static std::mutex expectedMutex;
+  static std::shared_ptr<ExpectedCache> cachedExpected;
+  std::shared_ptr<ExpectedCache> expected;
+  {
+    std::lock_guard<std::mutex> guard(expectedMutex);
+    if (!cachedExpected ||
+        cachedExpected->path != expectedPath ||
+        cachedExpected->scale != scale) {
+      cachedExpected =
+          std::make_shared<ExpectedCache>(loadExpectedValues(expectedPath, scale));
+    }
+    expected = cachedExpected;
+  }
+
+  result.expectedKeys = expected->values.size();
+  result.observedKeys =
+      static_cast<int64_t>(snapshot.values.size()) +
+      (snapshot.sawNullKey ? 1 : 0);
+  result.rows = snapshot.rows;
+  result.batches = snapshot.batches;
+
+  for (auto const& entry : snapshot.values) {
+    auto it = expected->values.find(entry.first);
+    if (it == expected->values.end()) {
+      result.unexpected++;
+      if (result.sumMismatches == 0) {
+        result.firstKey = entry.first;
+        result.expectedSum = 0;
+        result.actualSum = entry.second.sum;
+      }
+      result.sumMismatches++;
+      continue;
+    }
+    result.checked++;
+    if (it->second.value != entry.second.sum) {
+      if (result.sumMismatches == 0) {
+        result.firstKey = entry.first;
+        result.expectedSum = it->second.value;
+        result.actualSum = entry.second.sum;
+      }
+      result.sumMismatches++;
+    }
+  }
+
+  for (auto const& entry : expected->values) {
+    if (snapshot.values.find(entry.first) == snapshot.values.end()) {
+      result.missing++;
+    }
+  }
+
+  if (snapshot.sawNullKey) {
+    result.unexpected++;
+    if (result.sumMismatches == 0) {
+      result.firstKey = 0;
+      result.expectedSum = 0;
+      result.actualSum = snapshot.nullKey.sum;
+    }
+    result.sumMismatches++;
+  }
+
+  return result;
+}
+
 PartialInputValidationResult validatePartialStateAgainstInput(
     core::AggregationNode::Step step,
     rmm::cuda_stream_view stream,
@@ -3196,6 +3321,24 @@ PartialInputValidationResult validatePartialStateAgainstInput(
   if (sawNullKey && !nullKeyAgg.seen && nullKeyAgg.rows > 0) {
     result.missing++;
   }
+
+  if (step == core::AggregationNode::Step::kPartial) {
+    auto& global = globalPartialAccumulator();
+    std::lock_guard<std::mutex> guard(global.mutex);
+    for (auto const& entry : expected) {
+      auto& slot = global.values[entry.first];
+      slot.sum += entry.second.sum;
+      slot.count += entry.second.count;
+    }
+    if (sawNullKey) {
+      global.nullKey.sum += nullKeyAgg.sum;
+      global.nullKey.count += nullKeyAgg.count;
+      global.sawNullKey = true;
+    }
+    global.rows += totalRows;
+    global.batches += 1;
+  }
+
   return result;
 }
 
@@ -5772,6 +5915,35 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                       << " actualCount=" << partialValidation.actualCount
                       << " expectedValid=" << partialValidation.expectedValid
                       << " actualValid=" << partialValidation.actualValid;
+          }
+        }
+      }
+      if (cfg.debugHashAggPartialInputValidate &&
+          (step_ == core::AggregationNode::Step::kFinal ||
+           step_ == core::AggregationNode::Step::kSingle)) {
+        auto const& outValCol = resultTable->view().column(1);
+        auto globalCompare = compareGlobalPartialToExpected(
+            cfg.debugHashAggExpectedPath, outValCol.type().scale());
+        if (globalCompare.skipped) {
+          LOG(INFO) << "[HashAggGlobalInput] skipped reason="
+                    << globalCompare.reason << " step=" << stepName(step_)
+                    << " rows=" << globalCompare.rows
+                    << " batches=" << globalCompare.batches;
+        } else {
+          LOG(INFO) << "[HashAggGlobalInput] expectedKeys="
+                    << globalCompare.expectedKeys
+                    << " observedKeys=" << globalCompare.observedKeys
+                    << " checked=" << globalCompare.checked
+                    << " mismatches=" << globalCompare.sumMismatches
+                    << " missing=" << globalCompare.missing
+                    << " unexpected=" << globalCompare.unexpected
+                    << " rows=" << globalCompare.rows
+                    << " batches=" << globalCompare.batches;
+          if (globalCompare.sumMismatches > 0) {
+            LOG(INFO) << "[HashAggGlobalInput] firstMismatch key="
+                      << globalCompare.firstKey
+                      << " expected=" << toString128(globalCompare.expectedSum)
+                      << " actual=" << toString128(globalCompare.actualSum);
           }
         }
       }
