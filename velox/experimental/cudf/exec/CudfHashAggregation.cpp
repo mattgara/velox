@@ -2731,6 +2731,51 @@ GlobalPartialAccumulator& globalPartialAccumulator() {
   return accumulator;
 }
 
+std::string makeTrackContextKey(std::string const& taskId) {
+  // Use query-level key so partial and final operators can correlate.
+  auto dot = taskId.find('.');
+  if (dot != std::string::npos) {
+    return taskId.substr(0, dot);
+  }
+  return taskId;
+}
+
+struct TrackedKeyAggregate {
+  __int128_t inputSum{0};
+  int64_t inputCount{0};
+  int64_t inputRows{0};
+  int64_t inputBatches{0};
+  __int128_t outputSum{0};
+  int64_t outputCount{0};
+  int64_t outputBatches{0};
+  int64_t outputMissingBatches{0};
+  int64_t outputInvalidBatches{0};
+  int64_t outputDuplicateBatches{0};
+};
+
+struct TrackedKeyGlobalState {
+  std::unordered_map<int64_t, TrackedKeyAggregate> keys;
+  int64_t rows{0};
+  int64_t batches{0};
+  bool reported{false};
+};
+
+std::mutex trackedKeyMutex;
+std::unordered_map<std::string, TrackedKeyGlobalState> trackedKeyStates;
+
+TrackedKeyGlobalState& getTrackedKeyState(
+    std::string const& context,
+    std::vector<int64_t> const& keys) {
+  auto& state = trackedKeyStates[context];
+  if (state.keys.empty()) {
+    state.keys.reserve(keys.size());
+    for (auto key : keys) {
+      state.keys.emplace(key, TrackedKeyAggregate{});
+    }
+  }
+  return state;
+}
+
 struct GlobalPartialComparison {
   bool skipped{false};
   std::string reason;
@@ -3359,6 +3404,14 @@ struct TrackedKeyStats {
   int64_t outputDuplicates{0};
 };
 
+struct TrackedKeyFinalStats {
+  __int128_t finalInputSum{0};
+  int64_t finalInputCount{0};
+  bool finalInputSeen{false};
+  __int128_t finalOutputSum{0};
+  bool finalOutputSeen{false};
+};
+
 void trackPartialKeys(
     core::AggregationNode::Step step,
     rmm::cuda_stream_view stream,
@@ -3751,6 +3804,467 @@ void trackPartialKeys(
               << " outputCount=" << entry.outputCount
               << " outputSum=" << toString128(entry.outputSum)
               << " outputDupes=" << entry.outputDuplicates;
+  }
+
+  auto context = makeTrackContextKey(taskId);
+  {
+    std::lock_guard<std::mutex> guard(trackedKeyMutex);
+    auto& state = getTrackedKeyState(context, keys);
+    state.rows += totalRows;
+    state.batches += 1;
+    for (auto const& key : keys) {
+      auto it = stats.find(key);
+      if (it == stats.end()) {
+        continue;
+      }
+      auto const& entry = it->second;
+      auto& agg = state.keys[key];
+      if (entry.inputSeen) {
+        agg.inputRows += entry.inputRows;
+        agg.inputCount += entry.inputCount;
+        agg.inputSum += entry.inputSum;
+        agg.inputBatches += 1;
+      }
+      if (entry.outputSeen) {
+        agg.outputCount += entry.outputCount;
+        agg.outputSum += entry.outputSum;
+        agg.outputBatches += 1;
+        if (!entry.outputValid) {
+          agg.outputInvalidBatches += 1;
+        }
+        if (entry.outputDuplicates > 0) {
+          agg.outputDuplicateBatches += entry.outputDuplicates;
+        }
+      } else if (entry.inputSeen) {
+        agg.outputMissingBatches += 1;
+      }
+    }
+  }
+}
+
+void trackFinalKeys(
+    core::AggregationNode::Step step,
+    rmm::cuda_stream_view stream,
+    cudf::table_view const& groupbyKeyView,
+    std::vector<cudf::groupby::aggregation_request> const& requests,
+    cudf::table_view const& outputView,
+    int64_t maxRows,
+    int64_t batchRows,
+    std::vector<int64_t> const& keys,
+    std::string const& expectedPath,
+    std::string const& taskId,
+    std::string const& planNodeId,
+    int32_t operatorId,
+    uint32_t splitGroupId) {
+  if (keys.empty()) {
+    return;
+  }
+  if (step != core::AggregationNode::Step::kFinal &&
+      step != core::AggregationNode::Step::kSingle) {
+    return;
+  }
+  std::unordered_map<int64_t, TrackedKeyFinalStats> finalStats;
+  finalStats.reserve(keys.size());
+  for (auto key : keys) {
+    finalStats.emplace(key, TrackedKeyFinalStats{});
+  }
+
+  bool canReadInput = groupbyKeyView.num_columns() == 1;
+  bool keyTypeSupported = false;
+  std::optional<cudf::column_view> keyCol;
+  cudf::type_id keyType = cudf::type_id::INT32;
+  if (canReadInput) {
+    keyCol = groupbyKeyView.column(0);
+    keyType = keyCol->type().id();
+    keyTypeSupported = (keyType == cudf::type_id::INT64 ||
+                        keyType == cudf::type_id::INT32);
+  }
+
+  bool canReadOutput = outputView.num_columns() >= 2;
+  bool outputKeySupported = false;
+  bool outputValSupported = false;
+  std::optional<cudf::column_view> outKeyCol;
+  std::optional<cudf::column_view> outValCol;
+  cudf::type_id outKeyType = cudf::type_id::INT32;
+  cudf::type_id outValType = cudf::type_id::DECIMAL64;
+  if (canReadOutput) {
+    outKeyCol = outputView.column(0);
+    outValCol = outputView.column(1);
+    outKeyType = outKeyCol->type().id();
+    outValType = outValCol->type().id();
+    outputKeySupported = (outKeyType == cudf::type_id::INT64 ||
+                          outKeyType == cudf::type_id::INT32);
+    outputValSupported = (outValType == cudf::type_id::DECIMAL64 ||
+                          outValType == cudf::type_id::DECIMAL128);
+  }
+
+  std::optional<size_t> sumReqIdx;
+  std::optional<size_t> countReqIdx;
+  if (canReadInput && keyTypeSupported) {
+    for (size_t reqIdx = 0; reqIdx < requests.size(); ++reqIdx) {
+      auto const& req = requests[reqIdx];
+      if (!cudf::is_fixed_width(req.values.type())) {
+        continue;
+      }
+      for (auto const& agg : req.aggregations) {
+        if (agg->kind != cudf::aggregation::Kind::SUM) {
+          continue;
+        }
+        if (req.values.type().id() == cudf::type_id::DECIMAL64 ||
+            req.values.type().id() == cudf::type_id::DECIMAL128) {
+          if (!sumReqIdx.has_value()) {
+            sumReqIdx = reqIdx;
+          }
+        } else if (req.values.type().id() == cudf::type_id::INT64) {
+          if (!countReqIdx.has_value()) {
+            countReqIdx = reqIdx;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  bool canReadFinalInput = sumReqIdx.has_value() && keyTypeSupported;
+  std::optional<cudf::column_view> sumCol;
+  std::optional<cudf::column_view> countCol;
+  bool hasCount = false;
+  cudf::type_id sumType = cudf::type_id::DECIMAL64;
+  if (canReadFinalInput) {
+    sumCol = requests[*sumReqIdx].values;
+    sumType = sumCol->type().id();
+    if (sumType != cudf::type_id::DECIMAL64 &&
+        sumType != cudf::type_id::DECIMAL128) {
+      canReadFinalInput = false;
+    }
+    if (canReadFinalInput && countReqIdx.has_value()) {
+      countCol = requests[*countReqIdx].values;
+      if (countCol->type().id() == cudf::type_id::INT64) {
+        hasCount = true;
+      }
+    }
+  }
+
+  if (canReadFinalInput) {
+    int64_t totalRows = groupbyKeyView.num_rows();
+    if (maxRows > 0 && totalRows > maxRows) {
+      totalRows = maxRows;
+    }
+    if (batchRows <= 0) {
+      batchRows = totalRows;
+    }
+
+    auto keyElementSize = cudf::size_of(keyCol->type());
+    auto sumElementSize = cudf::size_of(sumCol->type());
+    auto countElementSize =
+        hasCount ? cudf::size_of(countCol->type()) : 0;
+    auto const* keyBase = static_cast<const uint8_t*>(keyCol->head()) +
+        keyCol->offset() * keyElementSize;
+    auto const* sumBase = static_cast<const uint8_t*>(sumCol->head()) +
+        sumCol->offset() * sumElementSize;
+    auto const* countBase =
+        hasCount
+            ? static_cast<const uint8_t*>(countCol->head()) +
+                countCol->offset() * countElementSize
+            : nullptr;
+
+    std::vector<uint8_t> keyHost;
+    std::vector<uint8_t> sumHost;
+    std::vector<uint8_t> countHost;
+
+    for (int64_t start = 0; start < totalRows; start += batchRows) {
+      auto const rowsThis = std::min<int64_t>(batchRows, totalRows - start);
+      auto const keyBytes =
+          static_cast<size_t>(rowsThis) * static_cast<size_t>(keyElementSize);
+      auto const sumBytes =
+          static_cast<size_t>(rowsThis) * static_cast<size_t>(sumElementSize);
+      auto const countBytes =
+          static_cast<size_t>(rowsThis) * static_cast<size_t>(countElementSize);
+      keyHost.resize(keyBytes);
+      sumHost.resize(sumBytes);
+      if (hasCount) {
+        countHost.resize(countBytes);
+      }
+
+      auto const* keyPtr = keyBase + start * keyElementSize;
+      auto const* sumPtr = sumBase + start * sumElementSize;
+      auto keyStatus = cudaMemcpyAsync(
+          keyHost.data(),
+          keyPtr,
+          keyBytes,
+          cudaMemcpyDeviceToHost,
+          stream.value());
+      auto sumStatus = cudaMemcpyAsync(
+          sumHost.data(),
+          sumPtr,
+          sumBytes,
+          cudaMemcpyDeviceToHost,
+          stream.value());
+      cudaError_t countStatus = cudaSuccess;
+      if (hasCount) {
+        auto const* countPtr = countBase + start * countElementSize;
+        countStatus = cudaMemcpyAsync(
+            countHost.data(),
+            countPtr,
+            countBytes,
+            cudaMemcpyDeviceToHost,
+            stream.value());
+      }
+      if (keyStatus != cudaSuccess || sumStatus != cudaSuccess ||
+          countStatus != cudaSuccess) {
+        return;
+      }
+      auto syncStatus = cudaStreamSynchronize(stream.value());
+      if (syncStatus != cudaSuccess) {
+        return;
+      }
+
+      for (int64_t i = 0; i < rowsThis; ++i) {
+        int64_t key = 0;
+        if (keyType == cudf::type_id::INT64) {
+          std::memcpy(
+              &key, keyHost.data() + i * keyElementSize, sizeof(int64_t));
+        } else {
+          int32_t key32 = 0;
+          std::memcpy(
+              &key32, keyHost.data() + i * keyElementSize, sizeof(int32_t));
+          key = key32;
+        }
+        auto it = finalStats.find(key);
+        if (it == finalStats.end()) {
+          continue;
+        }
+        auto& entry = it->second;
+        entry.finalInputSeen = true;
+        __int128_t sumValue = 0;
+        if (sumType == cudf::type_id::DECIMAL64) {
+          int64_t value64 = 0;
+          std::memcpy(
+              &value64, sumHost.data() + i * sumElementSize, sizeof(int64_t));
+          sumValue = static_cast<__int128_t>(value64);
+        } else {
+          uint64_t lo = 0;
+          int64_t hi = 0;
+          auto const* ptr = sumHost.data() + i * sumElementSize;
+          std::memcpy(&lo, ptr, sizeof(uint64_t));
+          std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+          sumValue = (static_cast<__int128_t>(hi) << 64) | lo;
+        }
+        entry.finalInputSum += sumValue;
+        if (hasCount) {
+          int64_t countValue = 0;
+          std::memcpy(
+              &countValue,
+              countHost.data() + i * countElementSize,
+              sizeof(int64_t));
+          entry.finalInputCount += countValue;
+        }
+      }
+    }
+  }
+
+  if (canReadOutput && outputKeySupported && outputValSupported) {
+    int64_t outRows = outKeyCol->size();
+    if (maxRows > 0 && outRows > maxRows) {
+      outRows = maxRows;
+    }
+    if (batchRows <= 0) {
+      batchRows = outRows;
+    }
+
+    auto outKeyElementSize = cudf::size_of(outKeyCol->type());
+    auto outValElementSize = cudf::size_of(outValCol->type());
+    auto const* outKeyBase = static_cast<const uint8_t*>(outKeyCol->head()) +
+        outKeyCol->offset() * outKeyElementSize;
+    auto const* outValBase = static_cast<const uint8_t*>(outValCol->head()) +
+        outValCol->offset() * outValElementSize;
+
+    std::vector<uint8_t> outKeyHost;
+    std::vector<uint8_t> outValHost;
+
+    for (int64_t start = 0; start < outRows; start += batchRows) {
+      auto const rowsThis = std::min<int64_t>(batchRows, outRows - start);
+      auto const outKeyBytes =
+          static_cast<size_t>(rowsThis) * static_cast<size_t>(outKeyElementSize);
+      auto const outValBytes =
+          static_cast<size_t>(rowsThis) * static_cast<size_t>(outValElementSize);
+      outKeyHost.resize(outKeyBytes);
+      outValHost.resize(outValBytes);
+
+      auto const* outKeyPtr = outKeyBase + start * outKeyElementSize;
+      auto const* outValPtr = outValBase + start * outValElementSize;
+      auto outKeyStatus = cudaMemcpyAsync(
+          outKeyHost.data(),
+          outKeyPtr,
+          outKeyBytes,
+          cudaMemcpyDeviceToHost,
+          stream.value());
+      auto outValStatus = cudaMemcpyAsync(
+          outValHost.data(),
+          outValPtr,
+          outValBytes,
+          cudaMemcpyDeviceToHost,
+          stream.value());
+      if (outKeyStatus != cudaSuccess || outValStatus != cudaSuccess) {
+        return;
+      }
+      auto outSync = cudaStreamSynchronize(stream.value());
+      if (outSync != cudaSuccess) {
+        return;
+      }
+
+      for (int64_t i = 0; i < rowsThis; ++i) {
+        int64_t key = 0;
+        if (outKeyType == cudf::type_id::INT64) {
+          std::memcpy(
+              &key, outKeyHost.data() + i * outKeyElementSize, sizeof(int64_t));
+        } else {
+          int32_t key32 = 0;
+          std::memcpy(
+              &key32, outKeyHost.data() + i * outKeyElementSize, sizeof(int32_t));
+          key = key32;
+        }
+        auto it = finalStats.find(key);
+        if (it == finalStats.end()) {
+          continue;
+        }
+        auto& entry = it->second;
+        entry.finalOutputSeen = true;
+        __int128_t outValue = 0;
+        if (outValType == cudf::type_id::DECIMAL64) {
+          int64_t value64 = 0;
+          std::memcpy(
+              &value64,
+              outValHost.data() + i * outValElementSize,
+              sizeof(int64_t));
+          outValue = static_cast<__int128_t>(value64);
+        } else {
+          uint64_t lo = 0;
+          int64_t hi = 0;
+          auto const* ptr = outValHost.data() + i * outValElementSize;
+          std::memcpy(&lo, ptr, sizeof(uint64_t));
+          std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+          outValue = (static_cast<__int128_t>(hi) << 64) | lo;
+        }
+        entry.finalOutputSum = outValue;
+      }
+    }
+  }
+
+  std::shared_ptr<ExpectedCache> expected;
+  int32_t expectedScale = 0;
+  bool haveScale = false;
+  if (outValCol && outputValSupported) {
+    expectedScale = outValCol->type().scale();
+    haveScale = true;
+  } else if (sumCol && canReadFinalInput) {
+    expectedScale = sumCol->type().scale();
+    haveScale = true;
+  }
+  if (haveScale && !expectedPath.empty()) {
+    static std::mutex expectedMutex;
+    static std::shared_ptr<ExpectedCache> cachedExpected;
+    std::lock_guard<std::mutex> guard(expectedMutex);
+    if (!cachedExpected ||
+        cachedExpected->path != expectedPath ||
+        cachedExpected->scale != expectedScale) {
+      cachedExpected = std::make_shared<ExpectedCache>(
+          loadExpectedValues(expectedPath, expectedScale));
+    }
+    expected = cachedExpected;
+  }
+
+  auto context = makeTrackContextKey(taskId);
+  TrackedKeyGlobalState snapshot;
+  {
+    std::lock_guard<std::mutex> guard(trackedKeyMutex);
+    auto it = trackedKeyStates.find(context);
+    if (it != trackedKeyStates.end()) {
+      snapshot = it->second;
+    }
+  }
+
+  auto sumToString = [](bool hasValue, __int128_t value) {
+    return hasValue ? toString128(value) : std::string("NA");
+  };
+  auto countToString = [](bool hasValue, int64_t value) {
+    return hasValue ? std::to_string(value) : std::string("NA");
+  };
+
+  for (auto key : keys) {
+    auto it = finalStats.find(key);
+    if (it == finalStats.end()) {
+      continue;
+    }
+    auto const& finalEntry = it->second;
+    TrackedKeyAggregate agg;
+    auto aggIt = snapshot.keys.find(key);
+    bool hasPartial = false;
+    if (aggIt != snapshot.keys.end()) {
+      agg = aggIt->second;
+      hasPartial = agg.inputBatches > 0 || agg.outputBatches > 0;
+    }
+    bool hasExpected = expected != nullptr;
+    __int128_t expectedSum = 0;
+    if (expected) {
+      auto expectedIt = expected->values.find(key);
+      if (expectedIt != expected->values.end()) {
+        expectedSum = expectedIt->second.value;
+      } else {
+        hasExpected = false;
+      }
+    }
+
+    LOG(INFO) << "[HashAggTrackKeySummary] step=" << stepName(step)
+              << " task=" << taskId
+              << " plan=" << planNodeId
+              << " op=" << operatorId
+              << " split=" << splitGroupId
+              << " key=" << key
+              << " partialInputSum=" << sumToString(hasPartial, agg.inputSum)
+              << " partialInputCount=" << countToString(hasPartial, agg.inputCount)
+              << " partialOutputSum=" << sumToString(agg.outputBatches > 0, agg.outputSum)
+              << " partialOutputCount=" << countToString(agg.outputBatches > 0, agg.outputCount)
+              << " partialOutputMissingBatches=" << agg.outputMissingBatches
+              << " partialOutputInvalidBatches=" << agg.outputInvalidBatches
+              << " finalInputSum=" << sumToString(finalEntry.finalInputSeen, finalEntry.finalInputSum)
+              << " finalInputCount=" << countToString(finalEntry.finalInputSeen, finalEntry.finalInputCount)
+              << " finalOutputSum=" << sumToString(finalEntry.finalOutputSeen, finalEntry.finalOutputSum)
+              << " expectedSum=" << (hasExpected ? toString128(expectedSum) : "NA");
+
+    bool mismatch = false;
+    if (hasExpected && finalEntry.finalOutputSeen &&
+        expectedSum != finalEntry.finalOutputSum) {
+      mismatch = true;
+    }
+    if (finalEntry.finalInputSeen && finalEntry.finalOutputSeen &&
+        finalEntry.finalInputSum != finalEntry.finalOutputSum) {
+      mismatch = true;
+    }
+    if (agg.outputBatches > 0 && finalEntry.finalInputSeen &&
+        agg.outputSum != finalEntry.finalInputSum) {
+      mismatch = true;
+    }
+    if (agg.outputBatches > 0 && finalEntry.finalOutputSeen &&
+        agg.outputSum != finalEntry.finalOutputSum) {
+      mismatch = true;
+    }
+    if (agg.outputMissingBatches > 0 || agg.outputInvalidBatches > 0 ||
+        agg.outputDuplicateBatches > 0) {
+      mismatch = true;
+    }
+
+    if (mismatch) {
+      LOG(INFO) << "[HashAggTrackKeyMismatch] key=" << key
+                << " partialOutputSum="
+                << sumToString(agg.outputBatches > 0, agg.outputSum)
+                << " finalInputSum="
+                << sumToString(finalEntry.finalInputSeen, finalEntry.finalInputSum)
+                << " finalOutputSum="
+                << sumToString(finalEntry.finalOutputSeen, finalEntry.finalOutputSum)
+                << " expectedSum="
+                << (hasExpected ? toString128(expectedSum) : "NA");
+    }
   }
 }
 
@@ -6408,6 +6922,25 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
                     << " actual=" << toString128(validation.firstActual);
         }
       }
+    }
+
+    if (!cfg.debugHashAggTrackKeys.empty() &&
+        (step_ == core::AggregationNode::Step::kFinal ||
+         step_ == core::AggregationNode::Step::kSingle)) {
+      trackFinalKeys(
+          step_,
+          stream,
+          groupbyKeyView,
+          requests,
+          resultTable->view(),
+          cfg.debugHashAggEndToEndMaxRows,
+          cfg.debugHashAggEndToEndBatchRows,
+          cfg.debugHashAggTrackKeys,
+          cfg.debugHashAggExpectedPath,
+          taskId(),
+          planNodeId(),
+          operatorId(),
+          splitGroupId());
     }
   }
 
