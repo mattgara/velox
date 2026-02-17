@@ -6478,6 +6478,7 @@ void CudfHashAggregation::initialize() {
   aggregators_ = toAggregators(*aggregationNode_, *operatorCtx_);
   intermediateAggregators_ =
       toIntermediateAggregators(*aggregationNode_, *operatorCtx_);
+  useStreamingFinalMerge_ = shouldStreamFinalMerge();
 
   // Check that aggregate result type match the output type.
   // TODO: This is output schema validation. In velox CPU, it's done using
@@ -6608,6 +6609,60 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
   }
 }
 
+bool CudfHashAggregation::shouldStreamFinalMerge() const {
+  if (step_ != core::AggregationNode::Step::kFinal) {
+    return false;
+  }
+  if (isGlobal_ || isDistinct_) {
+    return false;
+  }
+  if (!inputType_) {
+    return false;
+  }
+  bool hasStringInput = false;
+  for (auto i = 0; i < inputType_->size(); ++i) {
+    auto const kind = inputType_->childAt(i)->kind();
+    if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
+      hasStringInput = true;
+      break;
+    }
+  }
+  if (!hasStringInput) {
+    return false;
+  }
+  return std::all_of(
+      intermediateAggregators_.begin(),
+      intermediateAggregators_.end(),
+      [](auto const& agg) { return agg != nullptr; });
+}
+
+void CudfHashAggregation::mergeFinalInput(CudfVectorPtr input) {
+  if (!input) {
+    return;
+  }
+  if (!partialOutput_) {
+    partialOutput_ = std::move(input);
+    return;
+  }
+
+  auto stream = partialOutput_->stream();
+  std::vector<rmm::cuda_stream_view> inputStreams{
+      partialOutput_->stream(), input->stream()};
+  cudf::detail::join_streams(inputStreams, stream);
+
+  std::vector<cudf::table_view> tablesToConcat{
+      partialOutput_->getTableView(), input->getTableView()};
+  auto concatenated = cudf::concatenate(
+      tablesToConcat, stream, cudf::get_current_device_resource_ref());
+
+  partialOutput_ = doGroupByAggregation(
+      concatenated->view(),
+      groupingKeyInputChannels_,
+      intermediateAggregators_,
+      stream,
+      inputType_);
+}
+
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input->size() == 0) {
@@ -6676,6 +6731,18 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
     return;
   }
 
+  if (useStreamingFinalMerge_) {
+    mergeFinalInput(std::move(cudfInput));
+    if (hashAggDebugEnabled()) {
+      LOG(INFO) << "[CudfHashAggDebug] stage=addInput.finalMerge step="
+                << stepName(step_)
+                << " partialOutputRows="
+                << (partialOutput_ ? partialOutput_->size() : 0)
+                << " numInputRows=" << numInputRows_;
+    }
+    return;
+  }
+
   // Handle final aggregation or global cases.
   inputs_.push_back(std::move(cudfInput));
   if (hashAggDebugEnabled()) {
@@ -6699,7 +6766,8 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     cudf::table_view tableView,
     std::vector<column_index_t> const& groupByKeys,
     std::vector<std::unique_ptr<Aggregator>>& aggregators,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    const TypePtr& outputTypeOverride) {
   logHashAggDebug(
       "HashAgg.doGroupByAggregation.begin",
       step_,
@@ -7227,8 +7295,9 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
     return nullptr;
   }
 
+  const auto& resultType = outputTypeOverride ? outputTypeOverride : outputType_;
   return std::make_shared<cudf_velox::CudfVector>(
-      pool(), outputType_, numRows, std::move(resultTable), stream);
+      pool(), resultType, numRows, std::move(resultTable), stream);
 }
 
 CudfVectorPtr CudfHashAggregation::doGlobalAggregation(
@@ -7382,6 +7451,25 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       return nullptr;
     }
     return releaseAndResetPartialOutput();
+  }
+
+  if (useStreamingFinalMerge_) {
+    if (finished_ || !noMoreInput_) {
+      return nullptr;
+    }
+    if (!partialOutput_) {
+      finished_ = true;
+      return nullptr;
+    }
+    auto stream = partialOutput_->stream();
+    auto result = doGroupByAggregation(
+        partialOutput_->getTableView(),
+        groupingKeyInputChannels_,
+        aggregators_,
+        stream);
+    finished_ = true;
+    partialOutput_.reset();
+    return result;
   }
 
   if (finished_) {

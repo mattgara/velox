@@ -114,7 +114,8 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
       cudf::table_view tableView,
       std::vector<column_index_t> const& groupByKeys,
       std::vector<std::unique_ptr<Aggregator>>& aggregators,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      const TypePtr& outputTypeOverride = nullptr);
   CudfVectorPtr doGlobalAggregation(
       cudf::table_view tableView,
       rmm::cuda_stream_view stream);
@@ -164,6 +165,9 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   void computeIntermediateDistinctPartial(CudfVectorPtr tbl);
 
+  bool shouldStreamFinalMerge() const;
+  void mergeFinalInput(CudfVectorPtr input);
+
   CudfVectorPtr partialOutput_;
 
   // Debug-only: per-partial batch counter for tracking keys.
@@ -171,6 +175,8 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
 
   // Debug-only: per-final-input batch counter for tracking keys.
   int64_t finalTrackBatch_{0};
+
+  bool useStreamingFinalMerge_{false};
 };
 
 // Step-aware aggregation function registry
