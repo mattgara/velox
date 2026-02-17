@@ -2740,6 +2740,14 @@ std::string makeTrackContextKey(std::string const& taskId) {
   return taskId;
 }
 
+bool isValidAt(const std::vector<uint8_t>& mask, int64_t index) {
+  if (mask.empty()) {
+    return true;
+  }
+  auto const byte = mask[static_cast<size_t>(index) / 8];
+  return ((byte >> (index % 8)) & 1) != 0;
+}
+
 struct TrackedKeyAggregate {
   __int128_t inputSum{0};
   int64_t inputCount{0};
@@ -3410,6 +3418,14 @@ struct TrackedKeyFinalStats {
   bool finalInputSeen{false};
   __int128_t finalOutputSum{0};
   bool finalOutputSeen{false};
+};
+
+struct FinalInputKeyStats {
+  int64_t rows{0};
+  int64_t stateRows{0};
+  __int128_t sum{0};
+  int64_t count{0};
+  bool stateValid{false};
 };
 
 void trackPartialKeys(
@@ -4277,7 +4293,8 @@ void trackFinalInputKeys(
     std::string const& taskId,
     std::string const& planNodeId,
     int32_t operatorId,
-    uint32_t splitGroupId) {
+    uint32_t splitGroupId,
+    const void* vectorPtr) {
   if (keys.empty()) {
     return;
   }
@@ -4323,14 +4340,14 @@ void trackFinalInputKeys(
     return;
   }
 
-  std::unordered_map<int64_t, TrackKeyPartitionStats> stats;
+  std::unordered_map<int64_t, FinalInputKeyStats> stats;
   stats.reserve(keys.size());
   for (auto key : keys) {
-    stats.emplace(key, TrackKeyPartitionStats{});
+    stats.emplace(key, FinalInputKeyStats{});
   }
 
   int64_t totalRows = tableView.num_rows();
-  auto const& cfg = CudfConfig::getInstance();
+  auto const& cfg = facebook::velox::cudf_velox::CudfConfig::getInstance();
   if (cfg.debugHashAggEndToEndMaxRows > 0 &&
       totalRows > cfg.debugHashAggEndToEndMaxRows) {
     totalRows = cfg.debugHashAggEndToEndMaxRows;
@@ -4500,6 +4517,7 @@ void trackFinalInputKeys(
               << " op=" << operatorId
               << " split=" << splitGroupId
               << " batch=" << batchId
+              << " ptr=" << vectorPtr
               << " key=" << key
               << " rows=" << entry.rows
               << " stateRows=" << entry.stateRows
@@ -6618,7 +6636,8 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
         taskId(),
         planNodeId(),
         operatorId(),
-        splitGroupId());
+        splitGroupId(),
+        cudfInput.get());
   }
   maybeDeviceSyncProbe(
       kDeviceSyncGroupOperatorBoundary,
