@@ -598,6 +598,10 @@ void CudfConfig::initialize(
   if (config.find(kCudfDebugHashAggExpectedPath) != config.end()) {
     debugHashAggExpectedPath = config[kCudfDebugHashAggExpectedPath];
   }
+  if (config.find(kCudfDebugHashAggStateRoundtripValidate) != config.end()) {
+    debugHashAggStateRoundtripValidate =
+        folly::to<bool>(config[kCudfDebugHashAggStateRoundtripValidate]);
+  }
   if (config.find(kCudfDebugSerdeValidate) != config.end()) {
     debugSerdeValidate = folly::to<bool>(config[kCudfDebugSerdeValidate]);
   }
@@ -671,6 +675,8 @@ void CudfConfig::initialize(
               << " debugHashAggEndToEndBatchRows="
               << debugHashAggEndToEndBatchRows
               << " debugHashAggExpectedPath=" << debugHashAggExpectedPath
+              << " debugHashAggStateRoundtripValidate="
+              << debugHashAggStateRoundtripValidate
               << " allowCpuFallback=" << allowCpuFallback
               << " logFallback=" << logFallback;
   }

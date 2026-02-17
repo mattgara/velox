@@ -115,6 +115,11 @@ inline int32_t hashAggDebugDumpMaxRows() {
       .debugHashAggDumpMaxRows;
 }
 
+inline bool hashAggDebugStateRoundtripValidate() {
+  return facebook::velox::cudf_velox::CudfConfig::getInstance()
+      .debugHashAggStateRoundtripValidate;
+}
+
 inline int32_t hashAggDebugDecimalCpuAggregateMode() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
       .debugHashAggDecimalCpuAggregateMode;
@@ -2363,6 +2368,319 @@ EndToEndValidationResult validateEndToEndHashAgg(
   return result;
 }
 
+struct StateRoundtripResult {
+  bool skipped{false};
+  std::string reason;
+  int64_t rows{0};
+  int64_t checked{0};
+  int64_t maskMismatches{0};
+  int64_t sumMismatches{0};
+  int64_t countMismatches{0};
+  int64_t firstRow{-1};
+  __int128_t expectedSum{0};
+  __int128_t actualSum{0};
+  int64_t expectedCount{0};
+  int64_t actualCount{0};
+  bool expectedValid{false};
+  bool actualValid{false};
+};
+
+StateRoundtripResult validateDecimalStateRoundtrip(
+    cudf::column_view const& sumCol,
+    cudf::column_view const& countCol,
+    cudf::column_view const& stateCol,
+    int32_t scale,
+    rmm::cuda_stream_view stream,
+    int64_t maxRows,
+    int64_t batchRows) {
+  StateRoundtripResult result;
+  if (stateCol.type().id() != cudf::type_id::STRING) {
+    result.skipped = true;
+    result.reason = "state type not string";
+    return result;
+  }
+  if (countCol.type().id() != cudf::type_id::INT64) {
+    result.skipped = true;
+    result.reason = "count type not int64";
+    return result;
+  }
+  auto sumType = sumCol.type().id();
+  if (sumType != cudf::type_id::DECIMAL64 &&
+      sumType != cudf::type_id::DECIMAL128) {
+    result.skipped = true;
+    result.reason = "sum type not decimal";
+    return result;
+  }
+  if (sumCol.size() != countCol.size() ||
+      sumCol.size() != stateCol.size()) {
+    result.skipped = true;
+    result.reason = "column size mismatch";
+    return result;
+  }
+
+  auto decoded = cudf_velox::deserializeDecimalSumStateWithCount(
+      stateCol, scale, stream);
+  auto decodedSumView = decoded.sum->view();
+  auto decodedCountView = decoded.count->view();
+  if (decodedSumView.size() != stateCol.size() ||
+      decodedCountView.size() != stateCol.size()) {
+    result.skipped = true;
+    result.reason = "decoded size mismatch";
+    return result;
+  }
+  if (decodedCountView.type().id() != cudf::type_id::INT64) {
+    result.skipped = true;
+    result.reason = "decoded count type mismatch";
+    return result;
+  }
+
+  int64_t totalRows = stateCol.size();
+  if (maxRows > 0 && totalRows > maxRows) {
+    totalRows = maxRows;
+  }
+  result.rows = totalRows;
+  if (batchRows <= 0) {
+    batchRows = totalRows;
+  }
+
+  std::vector<uint8_t> stateMask;
+  std::vector<uint8_t> sumMask;
+  std::vector<uint8_t> countMask;
+  auto stateBitOffset = stateCol.offset();
+  auto sumBitOffset = sumCol.offset();
+  auto countBitOffset = countCol.offset();
+
+  auto copyMask = [&](cudf::column_view const& col,
+                      std::vector<uint8_t>& mask) -> bool {
+    if (col.null_count() == 0) {
+      return true;
+    }
+    auto const maskBytes = static_cast<size_t>(
+        cudf::bitmask_allocation_size_bytes(col.offset() + col.size()));
+    mask.resize(maskBytes);
+    auto const status = cudaMemcpyAsync(
+        mask.data(),
+        col.null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    return status == cudaSuccess;
+  };
+
+  if (!copyMask(stateCol, stateMask)) {
+    result.skipped = true;
+    result.reason = "state mask copy failed";
+    return result;
+  }
+  if (!copyMask(sumCol, sumMask)) {
+    result.skipped = true;
+    result.reason = "sum mask copy failed";
+    return result;
+  }
+  if (!copyMask(countCol, countMask)) {
+    result.skipped = true;
+    result.reason = "count mask copy failed";
+    return result;
+  }
+  if (!stateMask.empty() || !sumMask.empty() || !countMask.empty()) {
+    auto const syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "mask stream sync failed";
+      return result;
+    }
+  }
+
+  auto isValid = [](const std::vector<uint8_t>& mask, int64_t index) -> bool {
+    if (mask.empty()) {
+      return true;
+    }
+    auto const byte = mask[static_cast<size_t>(index) / 8];
+    return ((byte >> (index % 8)) & 1) != 0;
+  };
+
+  auto sumElementSize = cudf::size_of(sumCol.type());
+  auto countElementSize = cudf::size_of(countCol.type());
+  auto decodedSumElementSize = cudf::size_of(decodedSumView.type());
+  auto decodedCountElementSize = cudf::size_of(decodedCountView.type());
+
+  auto const* sumBase = static_cast<const uint8_t*>(sumCol.head()) +
+      sumCol.offset() * sumElementSize;
+  auto const* countBase = static_cast<const uint8_t*>(countCol.head()) +
+      countCol.offset() * countElementSize;
+  auto const* decodedSumBase =
+      static_cast<const uint8_t*>(decodedSumView.head()) +
+      decodedSumView.offset() * decodedSumElementSize;
+  auto const* decodedCountBase =
+      static_cast<const uint8_t*>(decodedCountView.head()) +
+      decodedCountView.offset() * decodedCountElementSize;
+
+  auto readSumValue = [&](const std::vector<uint8_t>& buffer,
+                          int64_t index,
+                          cudf::type_id type) -> __int128_t {
+    if (type == cudf::type_id::DECIMAL64) {
+      int64_t value64 = 0;
+      std::memcpy(
+          &value64,
+          buffer.data() + index * sumElementSize,
+          sizeof(int64_t));
+      return static_cast<__int128_t>(value64);
+    }
+    uint64_t lo = 0;
+    int64_t hi = 0;
+    auto const* ptr = buffer.data() + index * sumElementSize;
+    std::memcpy(&lo, ptr, sizeof(uint64_t));
+    std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+    return (static_cast<__int128_t>(hi) << 64) | lo;
+  };
+
+  auto readDecodedSumValue = [&](const std::vector<uint8_t>& buffer,
+                                 int64_t index) -> __int128_t {
+    uint64_t lo = 0;
+    int64_t hi = 0;
+    auto const* ptr = buffer.data() + index * decodedSumElementSize;
+    std::memcpy(&lo, ptr, sizeof(uint64_t));
+    std::memcpy(&hi, ptr + sizeof(uint64_t), sizeof(int64_t));
+    return (static_cast<__int128_t>(hi) << 64) | lo;
+  };
+
+  auto readCountValue = [&](const std::vector<uint8_t>& buffer,
+                            int64_t index) -> int64_t {
+    int64_t value = 0;
+    std::memcpy(
+        &value,
+        buffer.data() + index * countElementSize,
+        sizeof(int64_t));
+    return value;
+  };
+
+  auto readDecodedCountValue = [&](const std::vector<uint8_t>& buffer,
+                                   int64_t index) -> int64_t {
+    int64_t value = 0;
+    std::memcpy(
+        &value,
+        buffer.data() + index * decodedCountElementSize,
+        sizeof(int64_t));
+    return value;
+  };
+
+  std::vector<uint8_t> sumHost;
+  std::vector<uint8_t> countHost;
+  std::vector<uint8_t> decodedSumHost;
+  std::vector<uint8_t> decodedCountHost;
+
+  for (int64_t start = 0; start < totalRows; start += batchRows) {
+    auto const rowsThis = std::min<int64_t>(batchRows, totalRows - start);
+    auto const sumBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(sumElementSize);
+    auto const countBytes =
+        static_cast<size_t>(rowsThis) * static_cast<size_t>(countElementSize);
+    auto const decodedSumBytes = static_cast<size_t>(rowsThis) *
+        static_cast<size_t>(decodedSumElementSize);
+    auto const decodedCountBytes = static_cast<size_t>(rowsThis) *
+        static_cast<size_t>(decodedCountElementSize);
+    sumHost.resize(sumBytes);
+    countHost.resize(countBytes);
+    decodedSumHost.resize(decodedSumBytes);
+    decodedCountHost.resize(decodedCountBytes);
+
+    auto const* sumPtr = sumBase + start * sumElementSize;
+    auto const* countPtr = countBase + start * countElementSize;
+    auto const* decodedSumPtr = decodedSumBase + start * decodedSumElementSize;
+    auto const* decodedCountPtr =
+        decodedCountBase + start * decodedCountElementSize;
+
+    auto sumStatus = cudaMemcpyAsync(
+        sumHost.data(),
+        sumPtr,
+        sumBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto countStatus = cudaMemcpyAsync(
+        countHost.data(),
+        countPtr,
+        countBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto decodedSumStatus = cudaMemcpyAsync(
+        decodedSumHost.data(),
+        decodedSumPtr,
+        decodedSumBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    auto decodedCountStatus = cudaMemcpyAsync(
+        decodedCountHost.data(),
+        decodedCountPtr,
+        decodedCountBytes,
+        cudaMemcpyDeviceToHost,
+        stream.value());
+    if (sumStatus != cudaSuccess || countStatus != cudaSuccess ||
+        decodedSumStatus != cudaSuccess || decodedCountStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaMemcpyAsync failed";
+      return result;
+    }
+    auto syncStatus = cudaStreamSynchronize(stream.value());
+    if (syncStatus != cudaSuccess) {
+      result.skipped = true;
+      result.reason = "cudaStreamSynchronize failed";
+      return result;
+    }
+
+    for (int64_t i = 0; i < rowsThis; ++i) {
+      auto const rowIndex = start + i;
+      bool stateValid = isValid(stateMask, stateBitOffset + rowIndex);
+      bool sumValid = isValid(sumMask, sumBitOffset + rowIndex);
+      bool countValid = isValid(countMask, countBitOffset + rowIndex);
+      int64_t countValue = readCountValue(countHost, i);
+      bool expectedValid =
+          sumValid && countValid && static_cast<int64_t>(countValue) != 0;
+      if (stateValid != expectedValid) {
+        result.maskMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+          result.expectedCount = countValue;
+        }
+      }
+      if (!stateValid) {
+        continue;
+      }
+      result.checked++;
+      __int128_t expectedSum = readSumValue(sumHost, i, sumType);
+      __int128_t actualSum = readDecodedSumValue(decodedSumHost, i);
+      if (expectedSum != actualSum) {
+        result.sumMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.expectedSum = expectedSum;
+          result.actualSum = actualSum;
+          result.expectedCount = countValue;
+          result.actualCount = readDecodedCountValue(decodedCountHost, i);
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+        }
+      }
+      int64_t actualCount = readDecodedCountValue(decodedCountHost, i);
+      if (countValue != actualCount) {
+        result.countMismatches++;
+        if (result.firstRow < 0) {
+          result.firstRow = rowIndex;
+          result.expectedSum = expectedSum;
+          result.actualSum = actualSum;
+          result.expectedCount = countValue;
+          result.actualCount = actualCount;
+          result.expectedValid = expectedValid;
+          result.actualValid = stateValid;
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 const char* fakeGroupbyModeName(int32_t mode) {
   switch (mode) {
     case 1:
@@ -3371,6 +3689,50 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
         isAvg_ ? 1 : 0,
         sumIdx_);
     auto col = std::move(results[sumIdx_].results[0]);
+    auto maybeValidateStateRoundtrip =
+        [&](cudf::column_view const& sumView,
+            cudf::column_view const& countView,
+            cudf::column_view const& stateView) {
+          if (!hashAggDebugStateRoundtripValidate()) {
+            return;
+          }
+          auto const& cfg = facebook::velox::cudf_velox::CudfConfig::getInstance();
+          int32_t scale = static_cast<int32_t>(sumView.type().scale());
+          if (scale < 0) {
+            scale = -scale;
+          }
+          auto roundtrip = validateDecimalStateRoundtrip(
+              sumView,
+              countView,
+              stateView,
+              scale,
+              stream,
+              cfg.debugHashAggEndToEndMaxRows,
+              cfg.debugHashAggEndToEndBatchRows);
+          if (roundtrip.skipped) {
+            LOG(INFO) << "[HashAggStateRoundtrip] skipped reason="
+                      << roundtrip.reason << " step=" << stepName(step)
+                      << " rows=" << sumView.size();
+            return;
+          }
+          LOG(INFO) << "[HashAggStateRoundtrip] step=" << stepName(step)
+                    << " rows=" << roundtrip.rows
+                    << " checked=" << roundtrip.checked
+                    << " maskMismatches=" << roundtrip.maskMismatches
+                    << " sumMismatches=" << roundtrip.sumMismatches
+                    << " countMismatches=" << roundtrip.countMismatches;
+          if (roundtrip.maskMismatches > 0 || roundtrip.sumMismatches > 0 ||
+              roundtrip.countMismatches > 0) {
+            LOG(INFO) << "[HashAggStateRoundtrip] firstMismatch row="
+                      << roundtrip.firstRow
+                      << " expectedValid=" << roundtrip.expectedValid
+                      << " actualValid=" << roundtrip.actualValid
+                      << " expectedSum=" << toString128(roundtrip.expectedSum)
+                      << " actualSum=" << toString128(roundtrip.actualSum)
+                      << " expectedCount=" << roundtrip.expectedCount
+                      << " actualCount=" << roundtrip.actualCount;
+          }
+        };
     if (isAvg_ && step == core::AggregationNode::Step::kSingle) {
       auto count = std::move(results[countIdx_].results[0]);
       return computeAvgColumn(std::move(col), std::move(count), stream);
@@ -3385,16 +3747,20 @@ struct DecimalSumOrAvgAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       if (count->type().id() != cudf::type_id::INT64) {
         count = cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream);
       }
-      return cudf_velox::serializeDecimalSumState(
+      auto stateCol = cudf_velox::serializeDecimalSumState(
           col->view(), count->view(), stream);
+      maybeValidateStateRoundtrip(col->view(), count->view(), stateCol->view());
+      return stateCol;
     }
     if (step == core::AggregationNode::Step::kIntermediate) {
       auto count = std::move(results[countIdx_].results[0]);
       if (count->type().id() != cudf::type_id::INT64) {
         count = cudf::cast(*count, cudf::data_type{cudf::type_id::INT64}, stream);
       }
-      return cudf_velox::serializeDecimalSumState(
+      auto stateCol = cudf_velox::serializeDecimalSumState(
           col->view(), count->view(), stream);
+      maybeValidateStateRoundtrip(col->view(), count->view(), stateCol->view());
+      return stateCol;
     }
     if (isAvg_ && step == core::AggregationNode::Step::kFinal) {
       auto count = std::move(results[countIdx_].results[0]);

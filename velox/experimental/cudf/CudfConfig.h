@@ -55,6 +55,8 @@ struct CudfConfig {
       "cudf.debug_hashagg_end_to_end_batch_rows"};
   static constexpr const char* kCudfDebugHashAggExpectedPath{
       "cudf.debug_hashagg_expected_path"};
+  static constexpr const char* kCudfDebugHashAggStateRoundtripValidate{
+      "cudf.debug_hashagg_state_roundtrip_validate"};
   static constexpr const char* kCudfDebugSerdeValidate{
       "cudf.debug_serde_validate"};
   static constexpr const char* kCudfDebugSerdeValidateMaxRows{
@@ -162,6 +164,9 @@ struct CudfConfig {
   /// Optional: expected SUM results file for HashAgg validation.
   /// Format: key,sum on each line (sum can be decimal string).
   std::string debugHashAggExpectedPath;
+
+  /// Optional: validate decimal sum-state serialization roundtrip.
+  bool debugHashAggStateRoundtripValidate{false};
 
   /// Optional: validate Presto serialization roundtrip for RowVector outputs.
   bool debugSerdeValidate{false};
