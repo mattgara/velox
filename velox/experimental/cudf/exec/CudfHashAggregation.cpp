@@ -61,6 +61,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <mutex>
 #include <unordered_map>
@@ -74,6 +75,11 @@
 namespace {
 
 using namespace facebook::velox;
+
+constexpr int64_t kDecimalStateBytes = 32;
+constexpr int64_t kMaxDecimalStateRows =
+    static_cast<int64_t>(std::numeric_limits<int32_t>::max()) /
+    kDecimalStateBytes;
 
 inline bool hashAggDebugEnabled() {
   return facebook::velox::cudf_velox::CudfConfig::getInstance()
@@ -6488,6 +6494,15 @@ void CudfHashAggregation::initialize() {
   // We're postponing this for now.
 
   numAggregates_ = aggregationNode_->aggregates().size();
+  hasDecimalInput_ = std::any_of(
+      aggregationNode_->aggregates().begin(),
+      aggregationNode_->aggregates().end(),
+      [](auto const& agg) {
+        return std::any_of(
+            agg.rawInputTypes.begin(),
+            agg.rawInputTypes.end(),
+            [](auto const& type) { return type && type->isDecimal(); });
+      });
   aggregators_ = toAggregators(*aggregationNode_, *operatorCtx_);
   intermediateAggregators_ =
       toIntermediateAggregators(*aggregationNode_, *operatorCtx_);
@@ -6622,6 +6637,52 @@ void CudfHashAggregation::computeIntermediateDistinctPartial(
   }
 }
 
+void CudfHashAggregation::emitChunkedPartialOutputs(CudfVectorPtr input) {
+  if (!input || input->size() == 0) {
+    return;
+  }
+  auto stream = input->stream();
+  auto tableView = input->getTableView();
+  auto const totalRows = static_cast<int64_t>(tableView.num_rows());
+  if (totalRows <= kMaxDecimalStateRows) {
+    auto out = doGroupByAggregation(
+        tableView, groupingKeyInputChannels_, aggregators_, stream);
+    if (out) {
+      pendingOutputs_.push_back(std::move(out));
+    }
+    return;
+  }
+
+  std::vector<cudf::size_type> splitPoints;
+  splitPoints.reserve(static_cast<size_t>(totalRows / kMaxDecimalStateRows));
+  for (int64_t offset = kMaxDecimalStateRows; offset < totalRows;
+       offset += kMaxDecimalStateRows) {
+    splitPoints.push_back(static_cast<cudf::size_type>(offset));
+  }
+
+  auto splits = cudf::split(tableView, splitPoints, stream);
+  for (auto const& splitView : splits) {
+    if (splitView.num_rows() == 0) {
+      continue;
+    }
+    auto splitTable = std::make_unique<cudf::table>(splitView, stream);
+    auto splitVector = std::make_shared<cudf_velox::CudfVector>(
+        pool(),
+        input->type(),
+        splitView.num_rows(),
+        std::move(splitTable),
+        stream);
+    auto out = doGroupByAggregation(
+        splitVector->getTableView(),
+        groupingKeyInputChannels_,
+        aggregators_,
+        stream);
+    if (out) {
+      pendingOutputs_.push_back(std::move(out));
+    }
+  }
+}
+
 bool CudfHashAggregation::shouldStreamFinalMerge() const {
   if (step_ != core::AggregationNode::Step::kFinal) {
     return false;
@@ -6718,6 +6779,13 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
       numInputRows_);
 
   if (isPartialOutput_ && !isGlobal_) {
+    if (hasDecimalInput_ && cudfInput->size() > kMaxDecimalStateRows) {
+      if (partialOutput_) {
+        pendingOutputs_.push_back(releaseAndResetPartialOutput());
+      }
+      emitChunkedPartialOutputs(std::move(cudfInput));
+      return;
+    }
     if (isDistinct_) {
       // Handle partial distinct aggregation.
       computeIntermediateDistinctPartial(cudfInput);
@@ -7445,6 +7513,12 @@ RowVectorPtr CudfHashAggregation::getOutput() {
               << " noMoreInput=" << noMoreInput_ << " bufferedInputs="
               << inputs_.size() << " hasPartialOutput="
               << static_cast<bool>(partialOutput_);
+  }
+
+  if (!pendingOutputs_.empty()) {
+    auto out = std::move(pendingOutputs_.front());
+    pendingOutputs_.pop_front();
+    return out;
   }
 
   // Handle partial groupby and distinct.
