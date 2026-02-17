@@ -4794,6 +4794,59 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
           resultTable->view(),
           cfg.debugHashAggEndToEndBatchRows,
           cfg.debugHashAggExpectedPath);
+      if (validation.skipped) {
+        LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason
+                  << " step=" << stepName(step_)
+                  << " keyCols=" << groupbyKeyView.num_columns()
+                  << " outputCols=" << resultTable->num_columns()
+                  << " requestCount=" << requests.size();
+      } else {
+        LOG(INFO) << "[HashAggEndToEnd] expectedKeys=" << validation.expectedKeys
+                  << " outputKeys=" << validation.outputKeys
+                  << " checked=" << validation.checked
+                  << " mismatches=" << validation.mismatches
+                  << " unexpected=" << validation.missing;
+        if (validation.mismatches > 0) {
+          LOG(INFO) << "[HashAggEndToEnd] firstMismatch key="
+                    << validation.firstKey
+                    << " expected=" << toString128(validation.firstExpected)
+                    << " actual=" << toString128(validation.firstActual);
+        }
+      }
+
+      if (!validation.skipped && validation.mismatches > 0 &&
+          (step_ == core::AggregationNode::Step::kFinal ||
+           step_ == core::AggregationNode::Step::kSingle)) {
+        auto inputValidation = validateEndToEndHashAgg(
+            step_,
+            stream,
+            groupbyKeyView,
+            nullPolicy,
+            requests,
+            resultTable->view(),
+            cfg.debugHashAggEndToEndMaxRows,
+            cfg.debugHashAggEndToEndBatchRows);
+        if (inputValidation.skipped) {
+          LOG(INFO) << "[HashAggEndToEndInput] skipped reason="
+                    << inputValidation.reason << " step=" << stepName(step_)
+                    << " keyCols=" << groupbyKeyView.num_columns()
+                    << " outputCols=" << resultTable->num_columns()
+                    << " requestCount=" << requests.size();
+        } else {
+          LOG(INFO) << "[HashAggEndToEndInput] expectedKeys="
+                    << inputValidation.expectedKeys
+                    << " outputKeys=" << inputValidation.outputKeys
+                    << " checked=" << inputValidation.checked
+                    << " mismatches=" << inputValidation.mismatches
+                    << " missing=" << inputValidation.missing;
+          if (inputValidation.mismatches > 0) {
+            LOG(INFO) << "[HashAggEndToEndInput] firstMismatch key="
+                      << inputValidation.firstKey
+                      << " expected=" << toString128(inputValidation.firstExpected)
+                      << " actual=" << toString128(inputValidation.firstActual);
+          }
+        }
+      }
     } else {
       validation = validateEndToEndHashAgg(
           step_,
@@ -4804,24 +4857,24 @@ CudfVectorPtr CudfHashAggregation::doGroupByAggregation(
           resultTable->view(),
           cfg.debugHashAggEndToEndMaxRows,
           cfg.debugHashAggEndToEndBatchRows);
-    }
-    if (validation.skipped) {
-      LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason
-                << " step=" << stepName(step_)
-                << " keyCols=" << groupbyKeyView.num_columns()
-                << " outputCols=" << resultTable->num_columns()
-                << " requestCount=" << requests.size();
-    } else {
-      LOG(INFO) << "[HashAggEndToEnd] expectedKeys=" << validation.expectedKeys
-                << " outputKeys=" << validation.outputKeys
-                << " checked=" << validation.checked
-                << " mismatches=" << validation.mismatches
-                << " unexpected=" << validation.missing;
-      if (validation.mismatches > 0) {
-        LOG(INFO) << "[HashAggEndToEnd] firstMismatch key="
-                  << validation.firstKey
-                  << " expected=" << toString128(validation.firstExpected)
-                  << " actual=" << toString128(validation.firstActual);
+      if (validation.skipped) {
+        LOG(INFO) << "[HashAggEndToEnd] skipped reason=" << validation.reason
+                  << " step=" << stepName(step_)
+                  << " keyCols=" << groupbyKeyView.num_columns()
+                  << " outputCols=" << resultTable->num_columns()
+                  << " requestCount=" << requests.size();
+      } else {
+        LOG(INFO) << "[HashAggEndToEnd] expectedKeys=" << validation.expectedKeys
+                  << " outputKeys=" << validation.outputKeys
+                  << " checked=" << validation.checked
+                  << " mismatches=" << validation.mismatches
+                  << " unexpected=" << validation.missing;
+        if (validation.mismatches > 0) {
+          LOG(INFO) << "[HashAggEndToEnd] firstMismatch key="
+                    << validation.firstKey
+                    << " expected=" << toString128(validation.firstExpected)
+                    << " actual=" << toString128(validation.firstActual);
+        }
       }
     }
   }
