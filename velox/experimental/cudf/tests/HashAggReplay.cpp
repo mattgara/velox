@@ -62,6 +62,11 @@ struct ReplayOptions {
   bool showHelp{false};
 };
 
+struct ColumnBuffers {
+  std::vector<uint8_t> data;
+  std::vector<uint8_t> mask;
+};
+
 constexpr int32_t kSampleCount = 10;
 
 std::string trim(std::string value) {
@@ -102,7 +107,8 @@ std::string usageString() {
   out << "usage: velox_cudf_hashagg_replay --manifest <path/to/manifest.txt> "
       << "[--dump_input_samples]\n"
       << "   or: velox_cudf_hashagg_replay --dump_dir <path/to/dump_dir> "
-      << "[--dump_input_samples]";
+      << "[--dump_input_samples]\n"
+      << "   --dump_input_samples prints samples and exits";
   return out.str();
 }
 
@@ -558,6 +564,38 @@ void dumpInputSamples(
             << formatSampleList(spec, data, mask, random) << std::endl;
 }
 
+ColumnBuffers readColumnBuffers(
+    std::filesystem::path const& dumpDir,
+    ColumnSpec const& spec) {
+  ColumnBuffers buffers;
+  buffers.data = readBinaryFile(dumpDir / spec.dataFile);
+  auto const expectedBytes =
+      static_cast<size_t>(spec.size) * static_cast<size_t>(spec.elementSize);
+  if (buffers.data.size() != expectedBytes) {
+    throw std::runtime_error(
+        "data size mismatch for " + spec.dataFile + ": expected " +
+        std::to_string(expectedBytes) + " got " + std::to_string(buffers.data.size()));
+  }
+
+  if (spec.nullCount > 0) {
+    if (spec.nullMaskFile.empty()) {
+      throw std::runtime_error(
+          "null_count > 0 but null mask file missing for " + spec.dataFile);
+    }
+    buffers.mask = readBinaryFile(dumpDir / spec.nullMaskFile);
+    auto const expectedMaskBytes =
+        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(
+            static_cast<cudf::size_type>(spec.size)));
+    if (buffers.mask.size() != expectedMaskBytes) {
+      throw std::runtime_error(
+          "null-mask size mismatch for " + spec.nullMaskFile + ": expected " +
+          std::to_string(expectedMaskBytes) + " got " +
+          std::to_string(buffers.mask.size()));
+    }
+  }
+  return buffers;
+}
+
 ColumnSpec parseColumnSpec(
     std::unordered_map<std::string, std::string> const& manifest,
     std::string const& prefix) {
@@ -586,40 +624,18 @@ std::unique_ptr<cudf::column> makeColumnFromHost(
   auto col = cudf::make_fixed_width_column(
       type, size, cudf::mask_state::UNALLOCATED, stream);
 
-  auto const hostData = readBinaryFile(dumpDir / spec.dataFile);
-  auto const expectedBytes =
-      static_cast<size_t>(spec.size) * static_cast<size_t>(spec.elementSize);
-  if (hostData.size() != expectedBytes) {
-    throw std::runtime_error(
-        "data size mismatch for " + spec.dataFile + ": expected " +
-        std::to_string(expectedBytes) + " got " + std::to_string(hostData.size()));
-  }
-
-  std::vector<uint8_t> hostMask;
-  if (spec.nullCount > 0) {
-    if (spec.nullMaskFile.empty()) {
-      throw std::runtime_error(
-          "null_count > 0 but null mask file missing for " + spec.dataFile);
-    }
-    hostMask = readBinaryFile(dumpDir / spec.nullMaskFile);
-    auto const expectedMaskBytes =
-        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(size));
-    if (hostMask.size() != expectedMaskBytes) {
-      throw std::runtime_error(
-          "null-mask size mismatch for " + spec.nullMaskFile + ": expected " +
-          std::to_string(expectedMaskBytes) + " got " +
-          std::to_string(hostMask.size()));
-    }
-  }
+  auto buffers = readColumnBuffers(dumpDir, spec);
 
   if (dumpSamples) {
-    dumpInputSamples(label, spec, hostData, hostMask, rng);
+    dumpInputSamples(label, spec, buffers.data, buffers.mask, rng);
   }
 
+  auto const expectedBytes =
+      static_cast<size_t>(spec.size) * static_cast<size_t>(spec.elementSize);
   if (expectedBytes > 0) {
     auto const copyStatus = cudaMemcpyAsync(
         col->mutable_view().data<uint8_t>(),
-        hostData.data(),
+        buffers.data.data(),
         expectedBytes,
         cudaMemcpyHostToDevice,
         stream.value());
@@ -638,7 +654,7 @@ std::unique_ptr<cudf::column> makeColumnFromHost(
     if (expectedMaskBytes > 0) {
       auto const copyStatus = cudaMemcpyAsync(
           maskBuffer.data(),
-          hostMask.data(),
+          buffers.mask.data(),
           expectedMaskBytes,
           cudaMemcpyHostToDevice,
           stream.value());
@@ -699,6 +715,23 @@ int main(int argc, char** argv) {
     auto const requestCount = requireInt32(manifest, "request_count");
     auto const nullPolicyValue = requireInt32(manifest, "null_policy");
     auto const nullPolicy = static_cast<cudf::null_policy>(nullPolicyValue);
+
+    if (options.dumpInputSamples) {
+      for (int32_t i = 0; i < keyCount; ++i) {
+        auto spec = parseColumnSpec(manifest, "key." + std::to_string(i));
+        auto buffers = readColumnBuffers(dumpDir, spec);
+        dumpInputSamples(
+            "key." + std::to_string(i), spec, buffers.data, buffers.mask, rng);
+      }
+      for (int32_t i = 0; i < requestCount; ++i) {
+        auto const prefix = "request." + std::to_string(i);
+        auto spec = parseColumnSpec(manifest, prefix);
+        auto buffers = readColumnBuffers(dumpDir, spec);
+        dumpInputSamples(
+            prefix, spec, buffers.data, buffers.mask, rng);
+      }
+      return 0;
+    }
 
     std::vector<std::unique_ptr<cudf::column>> keyColumns;
     std::vector<cudf::column_view> keyViews;
