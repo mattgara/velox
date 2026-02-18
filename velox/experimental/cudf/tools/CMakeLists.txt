@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_subdirectory(exec)
-add_subdirectory(connectors)
-add_subdirectory(vector)
-add_subdirectory(expression)
-add_subdirectory(tools)
-
-if(VELOX_BUILD_TESTING)
-  add_subdirectory(tests)
-endif()
-
-if(VELOX_ENABLE_BENCHMARKS)
-  add_subdirectory(benchmarks)
-endif()
+# Build replay utility even when VELOX_BUILD_TESTING=OFF.
+add_executable(velox_cudf_hashagg_replay ../tests/HashAggReplay.cpp)
+target_link_libraries(velox_cudf_hashagg_replay velox_cudf_exec)
