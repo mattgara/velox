@@ -27,12 +27,21 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -46,6 +55,14 @@ struct ColumnSpec {
   std::string dataFile;
   std::string nullMaskFile;
 };
+
+struct ReplayOptions {
+  std::filesystem::path manifestPath;
+  bool dumpInputSamples{false};
+  bool showHelp{false};
+};
+
+constexpr int32_t kSampleCount = 10;
 
 std::string trim(std::string value) {
   auto const begin = value.find_first_not_of(" \t\r\n");
@@ -78,6 +95,43 @@ std::unordered_map<std::string, std::string> parseManifest(
     values[key] = value;
   }
   return values;
+}
+
+std::string usageString() {
+  std::ostringstream out;
+  out << "usage: velox_cudf_hashagg_replay --manifest <path/to/manifest.txt> "
+      << "[--dump_input_samples]\n"
+      << "   or: velox_cudf_hashagg_replay --dump_dir <path/to/dump_dir> "
+      << "[--dump_input_samples]";
+  return out.str();
+}
+
+ReplayOptions parseOptions(int argc, char** argv) {
+  ReplayOptions options;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg{argv[i]};
+    if ((arg == "-h") || (arg == "--help")) {
+      options.showHelp = true;
+      continue;
+    }
+    if (arg == "--manifest" && i + 1 < argc) {
+      options.manifestPath = argv[++i];
+      continue;
+    }
+    if (arg == "--dump_dir" && i + 1 < argc) {
+      options.manifestPath = std::filesystem::path(argv[++i]) / "manifest.txt";
+      continue;
+    }
+    if (arg == "--dump_input_samples" || arg == "--dump-input-samples") {
+      options.dumpInputSamples = true;
+      continue;
+    }
+    throw std::runtime_error("unknown argument: " + arg + "\n" + usageString());
+  }
+  if (!options.showHelp && options.manifestPath.empty()) {
+    throw std::runtime_error(usageString());
+  }
+  return options;
 }
 
 std::string requireValue(
@@ -120,6 +174,390 @@ std::vector<uint8_t> readBinaryFile(std::filesystem::path const& path) {
   return data;
 }
 
+std::string typeIdToString(cudf::type_id typeId) {
+  switch (typeId) {
+    case cudf::type_id::EMPTY:
+      return "EMPTY";
+    case cudf::type_id::INT8:
+      return "INT8";
+    case cudf::type_id::INT16:
+      return "INT16";
+    case cudf::type_id::INT32:
+      return "INT32";
+    case cudf::type_id::INT64:
+      return "INT64";
+    case cudf::type_id::UINT8:
+      return "UINT8";
+    case cudf::type_id::UINT16:
+      return "UINT16";
+    case cudf::type_id::UINT32:
+      return "UINT32";
+    case cudf::type_id::UINT64:
+      return "UINT64";
+    case cudf::type_id::FLOAT32:
+      return "FLOAT32";
+    case cudf::type_id::FLOAT64:
+      return "FLOAT64";
+    case cudf::type_id::BOOL8:
+      return "BOOL8";
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return "TIMESTAMP_DAYS";
+    case cudf::type_id::TIMESTAMP_SECONDS:
+      return "TIMESTAMP_SECONDS";
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      return "TIMESTAMP_MILLISECONDS";
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return "TIMESTAMP_MICROSECONDS";
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return "TIMESTAMP_NANOSECONDS";
+    case cudf::type_id::DURATION_DAYS:
+      return "DURATION_DAYS";
+    case cudf::type_id::DURATION_SECONDS:
+      return "DURATION_SECONDS";
+    case cudf::type_id::DURATION_MILLISECONDS:
+      return "DURATION_MILLISECONDS";
+    case cudf::type_id::DURATION_MICROSECONDS:
+      return "DURATION_MICROSECONDS";
+    case cudf::type_id::DURATION_NANOSECONDS:
+      return "DURATION_NANOSECONDS";
+    case cudf::type_id::DICTIONARY32:
+      return "DICTIONARY32";
+    case cudf::type_id::STRING:
+      return "STRING";
+    case cudf::type_id::LIST:
+      return "LIST";
+    case cudf::type_id::DECIMAL32:
+      return "DECIMAL32";
+    case cudf::type_id::DECIMAL64:
+      return "DECIMAL64";
+    case cudf::type_id::DECIMAL128:
+      return "DECIMAL128";
+    case cudf::type_id::STRUCT:
+      return "STRUCT";
+    default:
+      break;
+  }
+  return "UNKNOWN";
+}
+
+std::string int128ToString(__int128 value) {
+  if (value == 0) {
+    return "0";
+  }
+  bool const negative = value < 0;
+  unsigned __int128 u = 0;
+  if (negative) {
+    u = static_cast<unsigned __int128>(-(value + 1));
+    u += 1;
+  } else {
+    u = static_cast<unsigned __int128>(value);
+  }
+  std::string digits;
+  while (u > 0) {
+    auto digit = static_cast<int>(u % 10);
+    digits.push_back(static_cast<char>('0' + digit));
+    u /= 10;
+  }
+  if (negative) {
+    digits.push_back('-');
+  }
+  std::reverse(digits.begin(), digits.end());
+  return digits;
+}
+
+template <typename IntT>
+std::string formatScaledInteger(IntT value, int32_t scale) {
+  std::string digits;
+  if constexpr (std::is_same_v<IntT, __int128>) {
+    digits = int128ToString(value);
+  } else {
+    digits = std::to_string(value);
+  }
+  bool negative = false;
+  if (!digits.empty() && digits[0] == '-') {
+    negative = true;
+    digits = digits.substr(1);
+  }
+  if (scale >= 0) {
+    digits.append(static_cast<size_t>(scale), '0');
+  } else {
+    auto const fracDigits = static_cast<size_t>(-scale);
+    if (digits.size() <= fracDigits) {
+      auto const zeros = fracDigits - digits.size();
+      digits = "0." + std::string(zeros, '0') + digits;
+    } else {
+      digits.insert(digits.end() - static_cast<std::ptrdiff_t>(fracDigits), '.');
+    }
+  }
+  return negative ? "-" + digits : digits;
+}
+
+std::string bytesToHex(uint8_t const* data, int64_t size) {
+  std::ostringstream out;
+  out << "0x";
+  for (int64_t i = 0; i < size; ++i) {
+    out << std::hex << std::setw(2) << std::setfill('0')
+        << static_cast<int>(data[i]);
+  }
+  return out.str();
+}
+
+bool isValidAt(std::vector<uint8_t> const& mask, int64_t index) {
+  if (mask.empty()) {
+    return true;
+  }
+  auto const byteIndex = static_cast<size_t>(index / 8);
+  auto const bitIndex = static_cast<uint8_t>(index % 8);
+  if (byteIndex >= mask.size()) {
+    return false;
+  }
+  return (mask[byteIndex] & static_cast<uint8_t>(1u << bitIndex)) != 0;
+}
+
+std::string formatElementValue(
+    ColumnSpec const& spec,
+    uint8_t const* data) {
+  auto const typeId = static_cast<cudf::type_id>(spec.typeId);
+  switch (typeId) {
+    case cudf::type_id::INT8: {
+      int8_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::INT16: {
+      int16_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::INT32: {
+      int32_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::INT64: {
+      int64_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::UINT8: {
+      uint8_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::UINT16: {
+      uint16_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::UINT32: {
+      uint32_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::UINT64: {
+      uint64_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::FLOAT32: {
+      float value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      std::ostringstream out;
+      out << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
+      return out.str();
+    }
+    case cudf::type_id::FLOAT64: {
+      double value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      std::ostringstream out;
+      out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+      return out.str();
+    }
+    case cudf::type_id::BOOL8: {
+      uint8_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return value ? "true" : "false";
+    }
+    case cudf::type_id::TIMESTAMP_DAYS:
+    case cudf::type_id::DURATION_DAYS: {
+      int32_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+    case cudf::type_id::DURATION_SECONDS:
+    case cudf::type_id::DURATION_MILLISECONDS:
+    case cudf::type_id::DURATION_MICROSECONDS:
+    case cudf::type_id::DURATION_NANOSECONDS: {
+      int64_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return std::to_string(value);
+    }
+    case cudf::type_id::DECIMAL32: {
+      int32_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return formatScaledInteger(value, spec.scale) + " (raw=" +
+          std::to_string(value) + ", scale=" + std::to_string(spec.scale) + ")";
+    }
+    case cudf::type_id::DECIMAL64: {
+      int64_t value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return formatScaledInteger(value, spec.scale) + " (raw=" +
+          std::to_string(value) + ", scale=" + std::to_string(spec.scale) + ")";
+    }
+    case cudf::type_id::DECIMAL128: {
+      __int128 value;
+      if (spec.elementSize != static_cast<int64_t>(sizeof(value))) {
+        return bytesToHex(data, spec.elementSize);
+      }
+      std::memcpy(&value, data, sizeof(value));
+      return formatScaledInteger(value, spec.scale) + " (raw=" +
+          int128ToString(value) + ", scale=" + std::to_string(spec.scale) + ")";
+    }
+    default:
+      break;
+  }
+  return bytesToHex(data, spec.elementSize);
+}
+
+std::string formatSampleList(
+    ColumnSpec const& spec,
+    std::vector<uint8_t> const& data,
+    std::vector<uint8_t> const& mask,
+    std::vector<int64_t> const& indices) {
+  std::ostringstream out;
+  for (size_t i = 0; i < indices.size(); ++i) {
+    auto const index = indices[i];
+    if (i > 0) {
+      out << ", ";
+    }
+    out << index << "=";
+    if (!isValidAt(mask, index)) {
+      out << "NULL";
+      continue;
+    }
+    auto const offset = static_cast<size_t>(index) * static_cast<size_t>(spec.elementSize);
+    auto const* element = data.data() + offset;
+    out << formatElementValue(spec, element);
+  }
+  return out.str();
+}
+
+std::vector<int64_t> firstIndices(int64_t size) {
+  auto const count = std::min<int64_t>(kSampleCount, size);
+  std::vector<int64_t> indices;
+  indices.reserve(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    indices.push_back(i);
+  }
+  return indices;
+}
+
+std::vector<int64_t> lastIndices(int64_t size) {
+  auto const count = std::min<int64_t>(kSampleCount, size);
+  std::vector<int64_t> indices;
+  indices.reserve(static_cast<size_t>(count));
+  auto const start = std::max<int64_t>(0, size - count);
+  for (int64_t i = start; i < size; ++i) {
+    indices.push_back(i);
+  }
+  return indices;
+}
+
+std::vector<int64_t> randomIndices(
+    int64_t size,
+    std::mt19937& rng) {
+  auto const count = std::min<int64_t>(kSampleCount, size);
+  if (count <= 0) {
+    return {};
+  }
+  std::unordered_set<int64_t> selected;
+  std::uniform_int_distribution<int64_t> dist(0, size - 1);
+  while (static_cast<int64_t>(selected.size()) < count) {
+    selected.insert(dist(rng));
+  }
+  std::vector<int64_t> indices(selected.begin(), selected.end());
+  std::sort(indices.begin(), indices.end());
+  return indices;
+}
+
+void dumpInputSamples(
+    std::string const& label,
+    ColumnSpec const& spec,
+    std::vector<uint8_t> const& data,
+    std::vector<uint8_t> const& mask,
+    std::mt19937& rng) {
+  auto const typeId = static_cast<cudf::type_id>(spec.typeId);
+  std::cout << "[HashAggReplay] input=" << label
+            << " type=" << typeIdToString(typeId)
+            << " size=" << spec.size
+            << " elementSize=" << spec.elementSize
+            << " nullCount=" << spec.nullCount
+            << " scale=" << spec.scale
+            << " dataFile=" << spec.dataFile;
+  if (!spec.nullMaskFile.empty()) {
+    std::cout << " nullMaskFile=" << spec.nullMaskFile;
+  }
+  std::cout << std::endl;
+  auto const first = firstIndices(spec.size);
+  auto const last = lastIndices(spec.size);
+  auto const random = randomIndices(spec.size, rng);
+  std::cout << "[HashAggReplay] input=" << label << " first="
+            << formatSampleList(spec, data, mask, first) << std::endl;
+  std::cout << "[HashAggReplay] input=" << label << " last="
+            << formatSampleList(spec, data, mask, last) << std::endl;
+  std::cout << "[HashAggReplay] input=" << label << " random="
+            << formatSampleList(spec, data, mask, random) << std::endl;
+}
+
 ColumnSpec parseColumnSpec(
     std::unordered_map<std::string, std::string> const& manifest,
     std::string const& prefix) {
@@ -138,7 +576,10 @@ ColumnSpec parseColumnSpec(
 std::unique_ptr<cudf::column> makeColumnFromHost(
     std::filesystem::path const& dumpDir,
     ColumnSpec const& spec,
-    rmm::cuda_stream_view stream) {
+    rmm::cuda_stream_view stream,
+    std::string const& label,
+    bool dumpSamples,
+    std::mt19937& rng) {
   auto const size = static_cast<cudf::size_type>(spec.size);
   auto const type = cudf::data_type{
       static_cast<cudf::type_id>(spec.typeId), spec.scale};
@@ -153,6 +594,28 @@ std::unique_ptr<cudf::column> makeColumnFromHost(
         "data size mismatch for " + spec.dataFile + ": expected " +
         std::to_string(expectedBytes) + " got " + std::to_string(hostData.size()));
   }
+
+  std::vector<uint8_t> hostMask;
+  if (spec.nullCount > 0) {
+    if (spec.nullMaskFile.empty()) {
+      throw std::runtime_error(
+          "null_count > 0 but null mask file missing for " + spec.dataFile);
+    }
+    hostMask = readBinaryFile(dumpDir / spec.nullMaskFile);
+    auto const expectedMaskBytes =
+        static_cast<size_t>(cudf::bitmask_allocation_size_bytes(size));
+    if (hostMask.size() != expectedMaskBytes) {
+      throw std::runtime_error(
+          "null-mask size mismatch for " + spec.nullMaskFile + ": expected " +
+          std::to_string(expectedMaskBytes) + " got " +
+          std::to_string(hostMask.size()));
+    }
+  }
+
+  if (dumpSamples) {
+    dumpInputSamples(label, spec, hostData, hostMask, rng);
+  }
+
   if (expectedBytes > 0) {
     auto const copyStatus = cudaMemcpyAsync(
         col->mutable_view().data<uint8_t>(),
@@ -169,19 +632,8 @@ std::unique_ptr<cudf::column> makeColumnFromHost(
   }
 
   if (spec.nullCount > 0) {
-    if (spec.nullMaskFile.empty()) {
-      throw std::runtime_error(
-          "null_count > 0 but null mask file missing for " + spec.dataFile);
-    }
-    auto const hostMask = readBinaryFile(dumpDir / spec.nullMaskFile);
     auto const expectedMaskBytes =
         static_cast<size_t>(cudf::bitmask_allocation_size_bytes(size));
-    if (hostMask.size() != expectedMaskBytes) {
-      throw std::runtime_error(
-          "null-mask size mismatch for " + spec.nullMaskFile + ": expected " +
-          std::to_string(expectedMaskBytes) + " got " +
-          std::to_string(hostMask.size()));
-    }
     rmm::device_buffer maskBuffer(expectedMaskBytes, stream);
     if (expectedMaskBytes > 0) {
       auto const copyStatus = cudaMemcpyAsync(
@@ -228,35 +680,20 @@ std::unique_ptr<cudf::groupby_aggregation> makeGroupbyAggregation(
   }
 }
 
-std::filesystem::path parseManifestPath(int argc, char** argv) {
-  std::filesystem::path manifestPath;
-  for (int i = 1; i < argc; ++i) {
-    std::string arg{argv[i]};
-    if (arg == "--manifest" && i + 1 < argc) {
-      manifestPath = argv[++i];
-      continue;
-    }
-    if (arg == "--dump_dir" && i + 1 < argc) {
-      manifestPath = std::filesystem::path(argv[++i]) / "manifest.txt";
-      continue;
-    }
-  }
-  if (manifestPath.empty()) {
-    throw std::runtime_error(
-        "usage: velox_cudf_hashagg_replay --manifest <path/to/manifest.txt> "
-        "or --dump_dir <path/to/dump_dir>");
-  }
-  return manifestPath;
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
   try {
-    auto const manifestPath = parseManifestPath(argc, argv);
+    auto options = parseOptions(argc, argv);
+    if (options.showHelp) {
+      std::cout << usageString() << std::endl;
+      return 0;
+    }
+    auto const manifestPath = options.manifestPath;
     auto const dumpDir = manifestPath.parent_path();
     auto const manifest = parseManifest(manifestPath);
     auto const stream = cudf::get_default_stream();
+    std::mt19937 rng(0x5a5a5a5a);
 
     auto const keyCount = requireInt32(manifest, "key_count");
     auto const requestCount = requireInt32(manifest, "request_count");
@@ -269,7 +706,9 @@ int main(int argc, char** argv) {
     keyViews.reserve(keyCount);
     for (int32_t i = 0; i < keyCount; ++i) {
       auto spec = parseColumnSpec(manifest, "key." + std::to_string(i));
-      auto col = makeColumnFromHost(dumpDir, spec, stream);
+      auto col = makeColumnFromHost(
+          dumpDir, spec, stream, "key." + std::to_string(i),
+          options.dumpInputSamples, rng);
       keyViews.push_back(col->view());
       keyColumns.push_back(std::move(col));
     }
@@ -282,7 +721,9 @@ int main(int argc, char** argv) {
     for (int32_t i = 0; i < requestCount; ++i) {
       auto const prefix = "request." + std::to_string(i);
       auto spec = parseColumnSpec(manifest, prefix);
-      auto col = makeColumnFromHost(dumpDir, spec, stream);
+      auto col = makeColumnFromHost(
+          dumpDir, spec, stream, "request." + std::to_string(i),
+          options.dumpInputSamples, rng);
       requestValueColumns.push_back(std::move(col));
 
       cudf::groupby::aggregation_request request;
