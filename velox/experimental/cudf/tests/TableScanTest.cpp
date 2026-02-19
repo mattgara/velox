@@ -43,6 +43,7 @@
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_metadata.hpp>
 
 #include <fmt/ranges.h>
 
@@ -64,6 +65,19 @@ struct StatsFilterMetrics {
   cudf::size_type outputRows{0};
 };
 
+const cudf::io::parquet_column_schema* findParquetColumnByName(
+    const cudf::io::parquet_column_schema& node,
+    const std::string& name) {
+  if (node.name() == name && node.num_children() == 0) {
+    return &node;
+  }
+  for (const auto& child : node.children()) {
+    if (auto* found = findParquetColumnByName(child, name)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
 StatsFilterMetrics readParquetWithStatsFilter(
     const std::string& filePath,
     const RowTypePtr& rowType,
@@ -558,6 +572,84 @@ TEST_F(TableScanTest, filterPushdown) {
       filePaths,
       "SELECT count(*) FROM tmp");
 #endif
+}
+
+TEST_F(TableScanTest, decimalParquetPhysicalTypeInt64) {
+  auto rowType =
+      ROW({"c0", "c1"}, {DECIMAL(12, 2), DECIMAL(18, 2)});
+  auto vector = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({123, 500}, DECIMAL(12, 2)),
+       makeFlatVector<int64_t>({200, 700}, DECIMAL(18, 2))});
+
+  std::vector<RowVectorPtr> vectors = {vector};
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+
+  auto metadata = cudf::io::read_parquet_metadata(
+      cudf::io::source_info{filePath->getPath()});
+  auto const& parquetRoot = metadata.schema().root();
+
+  auto* c0 = findParquetColumnByName(parquetRoot, "c0");
+  auto* c1 = findParquetColumnByName(parquetRoot, "c1");
+  ASSERT_NE(c0, nullptr);
+  ASSERT_NE(c1, nullptr);
+  EXPECT_EQ(c0->type(), cudf::io::parquet::Type::INT64);
+  EXPECT_EQ(c1->type(), cudf::io::parquet::Type::INT64);
+
+  createDuckDbTable(vectors);
+  common::SubfieldFilters statsFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c0",
+              std::make_unique<common::BigintRange>(
+                  int64_t{100}, int64_t{400}, /*nullAllowed*/ false))
+          .add(
+              "c1",
+              common::createBigintValues(
+                  {int64_t{200}, int64_t{700}}, /*nullAllowed*/ false))
+          .build();
+
+  auto statsMetrics = readParquetWithStatsFilter(
+      filePath->getPath(), rowType, statsFilters, /*useJitFilter*/ true);
+  EXPECT_EQ(statsMetrics.inputRowGroups, 1);
+  ASSERT_TRUE(statsMetrics.rowGroupsAfterStats.has_value());
+  EXPECT_EQ(statsMetrics.rowGroupsAfterStats.value(), 1);
+  EXPECT_EQ(statsMetrics.outputRows, 1);
+
+  common::SubfieldFilters subfieldFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c0",
+              std::make_unique<common::BigintRange>(
+                  int64_t{100}, int64_t{400}, /*nullAllowed*/ false))
+          .add(
+              "c1",
+              common::createBigintValues(
+                  {int64_t{200}, int64_t{700}}, /*nullAllowed*/ false))
+          .build();
+
+  auto tableHandle = makeTableHandle(
+      "parquet_table", rowType, true, std::move(subfieldFilters), nullptr);
+  auto assignments =
+      facebook::velox::exec::test::HiveConnectorTestBase::allRegularColumns(
+          rowType);
+  auto plan = PlanBuilder()
+                  .startTableScan()
+                  .outputType(rowType)
+                  .tableHandle(tableHandle)
+                  .assignments(assignments)
+                  .endTableScan()
+                  .planNode();
+
+  assertQuery(
+      plan,
+      {filePath},
+      "SELECT c0, c1 FROM tmp "
+      "WHERE c0 BETWEEN CAST('1.00' AS DECIMAL(12, 2)) "
+      "AND CAST('4.00' AS DECIMAL(12, 2)) "
+      "AND c1 IN (CAST('2.00' AS DECIMAL(18, 2)), "
+      "CAST('7.00' AS DECIMAL(18, 2)))");
 }
 
 TEST_F(TableScanTest, decimalFilterPushdown) {
