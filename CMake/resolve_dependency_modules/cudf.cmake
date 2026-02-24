@@ -106,6 +106,52 @@ block(SCOPE_FOR VARIABLES)
 
   FetchContent_MakeAvailable(cudf)
 
+  # Apply cuDF patch for groupby shared memory alignment and verify it.
+  set(VELOX_CUDF_GROUPBY_PATCH_FILE
+      "${CMAKE_CURRENT_LIST_DIR}/cudf/groupby-alignment-16.patch")
+  set(_cudf_groupby_file
+      "${cudf_SOURCE_DIR}/cpp/src/groupby/hash/compute_shared_memory_aggs.cu")
+  set(_cudf_groupby_marker "constexpr ALIGNMENT = 16")
+
+  if(NOT EXISTS "${_cudf_groupby_file}")
+    message(FATAL_ERROR "cuDF groupby source not found at ${_cudf_groupby_file}")
+  endif()
+
+  file(READ "${_cudf_groupby_file}" _cudf_groupby_contents)
+  string(FIND "${_cudf_groupby_contents}" "${_cudf_groupby_marker}"
+         _cudf_groupby_marker_pos)
+
+  if(_cudf_groupby_marker_pos EQUAL -1)
+    if(NOT EXISTS "${VELOX_CUDF_GROUPBY_PATCH_FILE}")
+      message(FATAL_ERROR
+              "cuDF patch file not found at ${VELOX_CUDF_GROUPBY_PATCH_FILE}")
+    endif()
+
+    message(STATUS "[cudf] Applying cuDF patch: ${VELOX_CUDF_GROUPBY_PATCH_FILE}")
+    execute_process(
+      COMMAND patch -p1 -i "${VELOX_CUDF_GROUPBY_PATCH_FILE}"
+      WORKING_DIRECTORY "${cudf_SOURCE_DIR}"
+      RESULT_VARIABLE _cudf_groupby_patch_result
+      OUTPUT_VARIABLE _cudf_groupby_patch_out
+      ERROR_VARIABLE _cudf_groupby_patch_err
+    )
+    if(NOT _cudf_groupby_patch_result EQUAL 0)
+      message(FATAL_ERROR
+              "Failed to apply cuDF groupby patch.\n"
+              "Output: ${_cudf_groupby_patch_out}\n"
+              "Error: ${_cudf_groupby_patch_err}")
+    endif()
+
+    file(READ "${_cudf_groupby_file}" _cudf_groupby_contents_after)
+    string(FIND "${_cudf_groupby_contents_after}" "${_cudf_groupby_marker}"
+           _cudf_groupby_marker_pos)
+    if(_cudf_groupby_marker_pos EQUAL -1)
+      message(FATAL_ERROR
+              "cuDF groupby patch did not apply as expected. Marker not found: "
+              "${_cudf_groupby_marker}")
+    endif()
+  endif()
+
   # cudf sets all warnings as errors, and therefore fails to compile with velox
   # expanded set of warnings. We selectively disable problematic warnings just for
   # cudf
