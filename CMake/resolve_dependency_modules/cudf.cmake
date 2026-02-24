@@ -117,11 +117,20 @@ block(SCOPE_FOR VARIABLES)
     message(FATAL_ERROR "cuDF groupby source not found at ${_cudf_groupby_file}")
   endif()
 
+  message(
+    STATUS "[cudf] Checking groupby alignment patch marker in ${_cudf_groupby_file}"
+  )
   file(READ "${_cudf_groupby_file}" _cudf_groupby_contents)
   string(FIND "${_cudf_groupby_contents}" "${_cudf_groupby_marker}"
          _cudf_groupby_marker_pos)
 
   if(_cudf_groupby_marker_pos EQUAL -1)
+    find_program(VELOX_PATCH_EXECUTABLE patch)
+    if(NOT VELOX_PATCH_EXECUTABLE)
+      message(FATAL_ERROR
+              "patch not found in PATH, required to apply "
+              "${VELOX_CUDF_GROUPBY_PATCH_FILE}")
+    endif()
     if(NOT EXISTS "${VELOX_CUDF_GROUPBY_PATCH_FILE}")
       message(FATAL_ERROR
               "cuDF patch file not found at ${VELOX_CUDF_GROUPBY_PATCH_FILE}")
@@ -129,7 +138,7 @@ block(SCOPE_FOR VARIABLES)
 
     message(STATUS "[cudf] Applying cuDF patch: ${VELOX_CUDF_GROUPBY_PATCH_FILE}")
     execute_process(
-      COMMAND patch -p1 -i "${VELOX_CUDF_GROUPBY_PATCH_FILE}"
+      COMMAND "${VELOX_PATCH_EXECUTABLE}" -p1 -i "${VELOX_CUDF_GROUPBY_PATCH_FILE}"
       WORKING_DIRECTORY "${cudf_SOURCE_DIR}"
       RESULT_VARIABLE _cudf_groupby_patch_result
       OUTPUT_VARIABLE _cudf_groupby_patch_out
@@ -150,6 +159,9 @@ block(SCOPE_FOR VARIABLES)
               "cuDF groupby patch did not apply as expected. Marker not found: "
               "${_cudf_groupby_marker}")
     endif()
+    message(STATUS "[cudf] cuDF groupby patch applied and verified.")
+  else()
+    message(STATUS "[cudf] cuDF groupby patch already present.")
   endif()
 
   # cudf sets all warnings as errors, and therefore fails to compile with velox
