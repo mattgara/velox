@@ -218,9 +218,18 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
     if (hasCoalescedFiles) {
       // Multi-source coalesced read: a single chunked_parquet_reader sees
       // all files as multiple sources, reading row groups across them.
-      const auto effectiveTarget = (targetBytes > 0)
+      constexpr int64_t kPocPerNextTargetBytes = 256LL * 1024 * 1024;
+      constexpr int32_t kPocMaxNonEmptyChunksPerNext = 1;
+      const auto configuredTarget = (targetBytes > 0)
           ? targetBytes
           : std::numeric_limits<int64_t>::max();
+      // POC: yield after a small amount of coalesced scan work so downstream
+      // operators can start earlier instead of waiting for one large batch.
+      const auto effectiveTarget =
+          (configuredTarget < kPocPerNextTargetBytes)
+          ? configuredTarget
+          : kPocPerNextTargetBytes;
+      int32_t nonEmptyChunksRead = 0;
       auto coalesceLoopStartUs = getCurrentTimeMicro();
       while (splitReader_->has_next()) {
         auto tableWithMetadata = splitReader_->read_chunk();
@@ -249,7 +258,10 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             auto tableBytes = estimateTableBytes(tbl);
             accumulatedTables_.push_back(std::move(tbl));
             accumulatedBytes_ += tableBytes;
-            if (accumulatedBytes_ >= effectiveTarget) {
+            ++nonEmptyChunksRead;
+            if (
+                accumulatedBytes_ >= effectiveTarget ||
+                nonEmptyChunksRead >= kPocMaxNonEmptyChunksPerNext) {
               break;
             }
           }
