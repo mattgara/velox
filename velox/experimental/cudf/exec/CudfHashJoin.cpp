@@ -487,6 +487,21 @@ void CudfHashJoinProbe::addInput(RowVectorPtr input) {
     return;
   }
 
+  // Right/full outer join: bypass the GPU batch accumulator so that
+  // rightJoin runs synchronously in getOutput on every batch. The
+  // cross-driver flag-merge in noMoreInput's right-join branch reads peer
+  // rightMatchedFlags_ at allPeersFinished time, which only synchronizes CPU
+  // threads having reached noMoreInput — it does NOT wait for accumulator
+  // flushes. With accumulation, all drivers' rightJoin would run AFTER
+  // noMoreInput in their later getOutput calls, leaving the OR-combine to
+  // read all-zero flags.
+  if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
+    if (input->size() > 0) {
+      input_ = std::move(input);
+    }
+    return;
+  }
+
   if (input->size() > 0) {
     accumulatedProbeRows_ += input->size();
     accumulatedProbeBytes_ += cudfInput->estimateFlatSize();
