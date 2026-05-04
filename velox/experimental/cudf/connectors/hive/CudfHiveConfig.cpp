@@ -21,7 +21,9 @@
 
 #include <cudf/types.hpp>
 
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -128,6 +130,17 @@ bool CudfHiveConfig::useBufferedInput() const {
 
 bool CudfHiveConfig::useBufferedInputSession(
     const config::ConfigBase* session) const {
+  // CUDF_DISABLE_BUFFERED_INPUT=true forces use_buffered_input=false. When
+  // false, setupCudfDataSourceAndOptions hands libcudf a FILEPATH source_info
+  // (instead of wrapping in a BufferedInputDataSource), which routes through
+  // datasource::create(filepath) -> kvikio_source<FileHandle> for parallel
+  // POSIX/GDS reads. Provides a 30-40% speedup on TPC-H SF10 by engaging
+  // kvikio's parallel I/O. Workaround until a proper Spark/Gluten config is
+  // plumbed for this knob.
+  const char* envDisable = std::getenv("CUDF_DISABLE_BUFFERED_INPUT");
+  if (envDisable && std::string(envDisable) == "true") {
+    return false;
+  }
   return session->get<bool>(
       kUseBufferedInputSession, config_->get<bool>(kUseBufferedInput, true));
 }
