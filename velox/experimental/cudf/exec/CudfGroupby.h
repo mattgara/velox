@@ -20,6 +20,8 @@
 
 #include <cudf/groupby.hpp>
 
+#include <optional>
+
 namespace facebook::velox::cudf_velox {
 
 struct GroupbyAggregator {
@@ -37,6 +39,14 @@ struct GroupbyAggregator {
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+  // Returns the input column index that must be upcast from DECIMAL64 to
+  // DECIMAL128 before aggregation (raw decimal SUM/AVG, to avoid 64-bit
+  // overflow), or nullopt when no upcast is needed. The operator performs the
+  // cast once before building requests; see CudfGroupby::doGroupByAggregation.
+  virtual std::optional<uint32_t> decimal64UpcastInputIndex() const {
+    return std::nullopt;
+  }
 
   virtual ~GroupbyAggregator() = default;
 

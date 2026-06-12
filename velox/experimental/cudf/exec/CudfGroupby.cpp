@@ -184,14 +184,13 @@ void addDecimalRawPartialSingleSumRequest(
     uint32_t inputIndex,
     std::vector<cudf::groupby::aggregation_request>& requests,
     bool includeCountAggregation,
-    rmm::cuda_stream_view stream,
-    uint32_t& sumIdx,
-    std::unique_ptr<cudf::column>& castedInput) {
-  auto inputView = castDecimal64InputToDecimal128(
-      tbl.column(inputIndex), castedInput, stream);
+    uint32_t& sumIdx) {
+  // The DECIMAL64->DECIMAL128 upcast (to avoid 2^63 overflow) is applied once at
+  // the operator boundary in doGroupByAggregation, so tbl.column(inputIndex) is
+  // already DECIMAL128 here when needed.
   auto& request = requests.emplace_back();
   sumIdx = requests.size() - 1;
-  request.values = inputView;
+  request.values = tbl.column(inputIndex);
   request.aggregations.push_back(
       cudf::make_sum_aggregation<cudf::groupby_aggregation>());
   if (includeCountAggregation) {
@@ -233,10 +232,18 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
           inputIndex,
           requests,
           step == core::AggregationNode::Step::kPartial,
-          stream,
-          sumIdx_,
-          castedInput_);
+          sumIdx_);
     }
+  }
+
+  std::optional<uint32_t> decimal64UpcastInputIndex() const override {
+    // Raw SUM accumulates in the input width; the operator upcasts DECIMAL64 to
+    // DECIMAL128 first. Intermediate/final consume VARBINARY state (no upcast).
+    if (step == core::AggregationNode::Step::kPartial ||
+        step == core::AggregationNode::Step::kSingle) {
+      return inputIndex;
+    }
+    return std::nullopt;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
@@ -266,9 +273,6 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
-  std::unique_ptr<cudf::column> castedInput_;
 };
 
 struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
@@ -312,10 +316,18 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
           requests,
           step == core::AggregationNode::Step::kPartial ||
               step == core::AggregationNode::Step::kSingle,
-          stream,
-          sumIdx_,
-          castedInput_);
+          sumIdx_);
     }
+  }
+
+  std::optional<uint32_t> decimal64UpcastInputIndex() const override {
+    // Raw AVG sums in the input width; the operator upcasts DECIMAL64 to
+    // DECIMAL128 first. Intermediate/final consume VARBINARY state (no upcast).
+    if (step == core::AggregationNode::Step::kPartial ||
+        step == core::AggregationNode::Step::kSingle) {
+      return inputIndex;
+    }
+    return std::nullopt;
   }
 
   std::unique_ptr<cudf::column> makeOutputColumn(
@@ -352,9 +364,6 @@ struct GroupbyDecimalAvgAggregator : GroupbyAggregator {
   uint32_t countIdx_{0};
   std::unique_ptr<cudf::column> decodedSum_;
   std::unique_ptr<cudf::column> decodedCount_;
-  // Holds the DECIMAL64->DECIMAL128 cast of raw input (kPartial/kSingle), kept
-  // alive while the groupby request references its view.
-  std::unique_ptr<cudf::column> castedInput_;
 };
 
 struct GroupbyCountAggregator : GroupbyAggregator {
@@ -1129,8 +1138,28 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
     TypePtr const& outputType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
+  // Upcast raw DECIMAL64 aggregate inputs to DECIMAL128 once, before
+  // aggregating, so decimal SUM/AVG accumulate in 128 bits (avoids 2^63 wrap).
+  // Aggregators declare which input needs it via decimal64UpcastInputIndex();
+  // the cast is a no-op for non-DECIMAL64 columns (e.g. VARBINARY intermediate
+  // state). Casted columns are transient and kept alive for the aggregate()
+  // call. Grouping keys are never upcast (aggregate inputs occupy distinct
+  // channels), and output types come from makeOutputColumn, so casting inputs
+  // does not affect keys or the output schema.
+  std::vector<std::unique_ptr<cudf::column>> upcastHolders;
+  upcastHolders.reserve(aggregators.size());
+  std::vector<cudf::column_view> columns(tableView.begin(), tableView.end());
+  for (auto& aggregator : aggregators) {
+    if (auto idx = aggregator->decimal64UpcastInputIndex()) {
+      auto& holder = upcastHolders.emplace_back();
+      columns[*idx] =
+          castDecimal64InputToDecimal128(columns[*idx], holder, stream);
+    }
+  }
+  cudf::table_view castedView(columns);
+
   auto groupbyKeyView =
-      tableView.select(groupByKeys.begin(), groupByKeys.end());
+      castedView.select(groupByKeys.begin(), groupByKeys.end());
 
   // TODO: All other args to groupby are related to sort groupby. We don't
   // support optimizations related to it yet.
@@ -1141,7 +1170,7 @@ CudfVectorPtr CudfGroupby::doGroupByAggregation(
 
   std::vector<cudf::groupby::aggregation_request> requests;
   for (auto& aggregator : aggregators) {
-    aggregator->addGroupbyRequest(tableView, requests, stream);
+    aggregator->addGroupbyRequest(castedView, requests, stream);
   }
 
   auto [groupKeys, results] =
