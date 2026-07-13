@@ -10,7 +10,7 @@ int sumPositive(const std::vector<int>& values) {
   int total = 0;
   for (int value : values) {
     if (value > 0) {
-      total += value;
+      total = total + value;
     }
   }
   return total;
