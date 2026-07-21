@@ -48,6 +48,7 @@ configure_file(
 set(
   UCX_EXCHANGE_CUDA_SOURCES
   UcxCompression.cu
+  UcxColumnCodec.cu
   dietgpu/ans/GpuANSEncode.cu
   dietgpu/ans/GpuANSDecode.cu
   dietgpu/ans/GpuANSInfo.cu
@@ -58,7 +59,7 @@ set(
 # Vendored third-party CUDA code is not held to velox warning levels.
 set_source_files_properties(
   dietgpu/ans/GpuANSEncode.cu dietgpu/ans/GpuANSDecode.cu
-  dietgpu/ans/GpuANSInfo.cu UcxCompression.cu
+  dietgpu/ans/GpuANSInfo.cu UcxCompression.cu UcxColumnCodec.cu
   PROPERTIES COMPILE_OPTIONS "-w;--diag-suppress=68,186,554")
 
 add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES}
