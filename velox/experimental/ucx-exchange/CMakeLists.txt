@@ -42,9 +42,25 @@ configure_file(
   @ONLY
 )
 
-add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES})
+# GPU compression for the exchange payload: vendored DietGPU byte-rANS core
+# plus the whole-blob wrapper. Kept out of UCX_EXCHANGE_SOURCES so the VLOG
+# module list above stays .cpp-only.
+set(
+  UCX_EXCHANGE_CUDA_SOURCES
+  UcxCompression.cu
+  dietgpu/ans/GpuANSEncode.cu
+  dietgpu/ans/GpuANSDecode.cu
+  dietgpu/ans/GpuANSInfo.cu
+  dietgpu/utils/DeviceUtils.cpp
+  dietgpu/utils/StackDeviceMemory.cpp
+)
 
-target_include_directories(velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+add_library(velox_ucx_exchange OBJECT ${UCX_EXCHANGE_SOURCES}
+                                      ${UCX_EXCHANGE_CUDA_SOURCES})
+
+target_include_directories(
+  velox_ucx_exchange PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+                             ${CMAKE_CURRENT_SOURCE_DIR})
 
 find_package(ucx REQUIRED)
 
