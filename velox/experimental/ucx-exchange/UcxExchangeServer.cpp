@@ -353,7 +353,7 @@ void UcxExchangeServer::sendData() {
           for (auto segSize : compressed.segSizes) {
             metadataMsg->remainingBytes.push_back(segSize);
           }
-          VLOG(2) << "@" << partitionKey_.taskId << " compressed chunk "
+          VLOG(1) << "@" << partitionKey_.taskId << " compressed chunk "
                   << sequenceNumber_ << ": " << dataPtr_->gpu_data->size()
                   << " -> " << compressedData->size() << " bytes";
         }

@@ -626,7 +626,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
           ptr->dataBuf->data(), segSizes, uncompressedBytes, ptr->stream);
       ptr->dataBuf =
           std::make_unique<rmm::device_buffer>(std::move(decompressed));
-      VLOG(2) << toString() << " decompressed chunk " << sequenceNumber_ - 1
+      VLOG(1) << toString() << " decompressed chunk " << sequenceNumber_ - 1
               << ": " << ptr->metadata.dataSizeBytes << " -> "
               << uncompressedBytes << " bytes";
     }
