@@ -622,10 +622,21 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
       for (std::size_t i = 2; i < descriptor.size(); ++i) {
         segSizes.push_back(static_cast<uint32_t>(descriptor[i]));
       }
-      auto decompressed = decompressBlob(
-          ptr->dataBuf->data(), segSizes, uncompressedBytes, ptr->stream);
-      ptr->dataBuf =
-          std::make_unique<rmm::device_buffer>(std::move(decompressed));
+      try {
+        auto decompressed = decompressBlob(
+            ptr->dataBuf->data(), segSizes, uncompressedBytes, ptr->stream);
+        ptr->dataBuf =
+            std::make_unique<rmm::device_buffer>(std::move(decompressed));
+      } catch (const std::exception& e) {
+        // Never let a decode failure unwind the UCX progress thread.
+        VLOG(0) << toString() << " exchange decompression failed: " << e.what();
+        queue_->setError(
+            std::string("exchange decompression failed: ") + e.what());
+        deliverEndMarker();
+        setState(ReceiverState::Done);
+        communicator_->addToWorkQueue(getSelfPtr());
+        return;
+      }
       VLOG(1) << toString() << " decompressed chunk " << sequenceNumber_ - 1
               << ": " << ptr->metadata.dataSizeBytes << " -> "
               << uncompressedBytes << " bytes";

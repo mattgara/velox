@@ -142,6 +142,9 @@ CompressResult compressBlob(
         stream.value()));
     off += result.segSizes[i];
   }
+  // The compaction copies above are asynchronous and the consumer (UCXX
+  // tagSend) is not stream-aware: settle the buffer before handing it out.
+  UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   result.used = true;
   return result;
 }
