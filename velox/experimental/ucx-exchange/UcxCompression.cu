@@ -29,6 +29,11 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 
 constexpr int kProbBits = 10;
+constexpr bool kUseChecksum = false;
+
+inline std::size_t roundUp16(std::size_t v) {
+  return (v + 15) & ~static_cast<std::size_t>(15);
+}
 
 #define UCX_CUDA_CHECK(expr)                                        \
   do {                                                              \
@@ -101,7 +106,7 @@ CompressResult compressBlob(
 
   dietgpu::ansEncodeBatchPointer(
       stackMemory(),
-      dietgpu::ANSCodecConfig(kProbBits, /*useChecksum=*/true),
+      dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       numSegs,
       inPtrs.data(),
       inSizes.data(),
@@ -130,8 +135,13 @@ CompressResult compressBlob(
     return result; // did not pay; send uncompressed
   }
 
-  // Compact the strided segments into one contiguous buffer.
-  result.data = rmm::device_buffer(total, stream);
+  // Compact the strided segments into one contiguous buffer; each segment
+  // starts 16B-aligned (dietgpu decode requires aligned input pointers).
+  std::size_t paddedTotal = 0;
+  for (auto s : result.segSizes) {
+    paddedTotal += roundUp16(s);
+  }
+  result.data = rmm::device_buffer(paddedTotal, stream);
   std::size_t off = 0;
   for (uint32_t i = 0; i < numSegs; ++i) {
     UCX_CUDA_CHECK(cudaMemcpyAsync(
@@ -140,7 +150,7 @@ CompressResult compressBlob(
         result.segSizes[i],
         cudaMemcpyDeviceToDevice,
         stream.value()));
-    off += result.segSizes[i];
+    off += roundUp16(result.segSizes[i]);
   }
   // The compaction copies above are asynchronous and the consumer (UCXX
   // tagSend) is not stream-aware: settle the buffer before handing it out.
@@ -167,7 +177,7 @@ rmm::device_buffer decompressBlob(
   std::size_t outOff = 0;
   for (uint32_t i = 0; i < numSegs; ++i) {
     inPtrs[i] = static_cast<const uint8_t*>(src) + inOff;
-    inOff += segSizes[i];
+    inOff += roundUp16(segSizes[i]);
     outPtrs[i] = static_cast<uint8_t*>(out.data()) + outOff;
     const auto cap = static_cast<uint32_t>(
         std::min(kCompressSegmentBytes, uncompressedBytes - outOff));
@@ -180,7 +190,7 @@ rmm::device_buffer decompressBlob(
 
   auto status = dietgpu::ansDecodeBatchPointer(
       stackMemory(),
-      dietgpu::ANSCodecConfig(kProbBits, /*useChecksum=*/true),
+      dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       numSegs,
       inPtrs.data(),
       outPtrs.data(),

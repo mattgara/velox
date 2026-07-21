@@ -39,7 +39,20 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 
 constexpr int kProbBits = 10;
+// Racecar default: correctness is gated end-to-end by result validation;
+// frame checksums (two extra full passes) are a debug knob only.
+constexpr bool kUseChecksum = false;
 constexpr std::size_t kMinTypedElems = 4096;
+
+// DietGPU kernels use word loads; every device pointer handed to them must
+// be 16-byte aligned. Planes use an aligned stride; wire segments are placed
+// at 16-byte boundaries (true sizes travel in descriptors, walkers round).
+inline std::size_t roundUp16(std::size_t v) {
+  return (v + 15) & ~static_cast<std::size_t>(15);
+}
+inline uint32_t alignedStride(uint32_t n) {
+  return (n + 15u) & ~15u;
+}
 constexpr std::size_t kMinResidualBytes = 1u << 16;
 
 #define UCX_CUDA_CHECK(expr)                                       \
@@ -71,6 +84,7 @@ __global__ void subSplitKernel(
     int64_t base,
     uint8_t* planes,
     uint32_t n,
+    uint32_t stride,
     int width) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -79,7 +93,7 @@ __global__ void subSplitKernel(
   uint64_t adjusted = static_cast<uint64_t>(
       static_cast<int64_t>(values[i]) - base);
   for (int k = 0; k < width; ++k) {
-    planes[static_cast<uint64_t>(k) * n + i] =
+    planes[static_cast<uint64_t>(k) * stride + i] =
         static_cast<uint8_t>((adjusted >> (8 * k)) & 0xff);
   }
 }
@@ -91,6 +105,7 @@ __global__ void recombAddKernel(
     int64_t base,
     T* out,
     uint32_t n,
+    uint32_t stride,
     int width) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
@@ -98,7 +113,8 @@ __global__ void recombAddKernel(
   }
   uint64_t adjusted = 0;
   for (int k = 0; k < width; ++k) {
-    adjusted |= static_cast<uint64_t>(planes[static_cast<uint64_t>(k) * n + i])
+    adjusted |=
+        static_cast<uint64_t>(planes[static_cast<uint64_t>(k) * stride + i])
         << (8 * k);
   }
   out[i] = static_cast<T>(static_cast<int64_t>(adjusted) + base);
@@ -184,18 +200,20 @@ void collectTypedRegions(
 std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
     const uint8_t* planes,
     uint32_t n,
+    uint32_t stride,
     int width,
     rmm::cuda_stream_view stream) {
-  const uint32_t maxComp = dietgpu::getMaxCompressedSize(n);
+  const uint32_t maxComp =
+      alignedStride(dietgpu::getMaxCompressedSize(n));
   rmm::device_buffer scratch(static_cast<std::size_t>(width) * maxComp, stream);
   rmm::device_buffer sizesDev(width * sizeof(uint32_t), stream);
   dietgpu::ansEncodeBatchStride(
       columnCodecStack(),
-      dietgpu::ANSCodecConfig(kProbBits, /*useChecksum=*/true),
+      dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       width,
       planes,
       n,
-      n,
+      stride,
       nullptr,
       scratch.data(),
       maxComp,
@@ -212,7 +230,7 @@ std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
 
   std::size_t total = 0;
   for (auto s : sizes) {
-    total += s;
+    total += roundUp16(s);
   }
   rmm::device_buffer out(total, stream);
   std::size_t off = 0;
@@ -224,7 +242,7 @@ std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
         sizes[k],
         cudaMemcpyDeviceToDevice,
         stream.value()));
-    off += sizes[k];
+    off += roundUp16(sizes[k]);
   }
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   return {std::move(out), std::vector<int64_t>(sizes.begin(), sizes.end())};
@@ -237,19 +255,20 @@ rmm::device_buffer decodePlanes(
     uint32_t n,
     rmm::cuda_stream_view stream) {
   const auto width = segSizes.size();
-  rmm::device_buffer planes(static_cast<std::size_t>(width) * n, stream);
+  const uint32_t stride = alignedStride(n);
+  rmm::device_buffer planes(static_cast<std::size_t>(width) * stride, stream);
   std::vector<const void*> inPtrs(width);
   std::vector<void*> outPtrs(width);
   std::vector<uint32_t> outCaps(width, n);
   std::size_t off = 0;
   for (std::size_t k = 0; k < width; ++k) {
     inPtrs[k] = src + off;
-    off += segSizes[k];
-    outPtrs[k] = static_cast<uint8_t*>(planes.data()) + k * n;
+    off += roundUp16(segSizes[k]);
+    outPtrs[k] = static_cast<uint8_t*>(planes.data()) + k * stride;
   }
   auto status = dietgpu::ansDecodeBatchPointer(
       columnCodecStack(),
-      dietgpu::ANSCodecConfig(kProbBits, /*useChecksum=*/true),
+      dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       width,
       inPtrs.data(),
       outPtrs.data(),
@@ -313,8 +332,10 @@ void encodeTypedRegion(
   out.rawBytes = static_cast<int64_t>(region.elems) * region.width;
   out.elemWidth = region.width;
 
+  const uint32_t stride = alignedStride(n);
   rmm::device_buffer planes(
-      static_cast<std::size_t>(std::min(forWidth, deltaWidth)) * n, stream);
+      static_cast<std::size_t>(std::min(forWidth, deltaWidth)) * stride,
+      stream);
   if (deltaWidth < forWidth) {
     out.codec = RegionCodec::kDeltaFor;
     out.base = 0;
@@ -325,18 +346,36 @@ void encodeTypedRegion(
     UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
     out.first = static_cast<int64_t>(firstValue);
     subSplitKernel<int64_t><<<blocks, threads, 0, stream.value()>>>(
-        deltasPtr, 0, static_cast<uint8_t*>(planes.data()), n, deltaWidth);
+        deltasPtr,
+        0,
+        static_cast<uint8_t*>(planes.data()),
+        n,
+        stride,
+        deltaWidth);
     auto [payload, sizes] = encodePlanes(
-        static_cast<const uint8_t*>(planes.data()), n, deltaWidth, stream);
+        static_cast<const uint8_t*>(planes.data()),
+        n,
+        stride,
+        deltaWidth,
+        stream);
     out.segSizes = std::move(sizes);
     payloads.push_back(std::move(payload));
   } else {
     out.codec = RegionCodec::kFor;
     out.base = base;
     subSplitKernel<T><<<blocks, threads, 0, stream.value()>>>(
-        values, base, static_cast<uint8_t*>(planes.data()), n, forWidth);
+        values,
+        base,
+        static_cast<uint8_t*>(planes.data()),
+        n,
+        stride,
+        forWidth);
     auto [payload, sizes] = encodePlanes(
-        static_cast<const uint8_t*>(planes.data()), n, forWidth, stream);
+        static_cast<const uint8_t*>(planes.data()),
+        n,
+        stride,
+        forWidth,
+        stream);
     out.segSizes = std::move(sizes);
     payloads.push_back(std::move(payload));
   }
@@ -353,6 +392,7 @@ void decodeTypedRegion(
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
   auto planes = decodePlanes(src, region.segSizes, n, stream);
+  const uint32_t stride = alignedStride(n);
   T* out = reinterpret_cast<T*>(blobBase + region.blobOffset);
 
   if (region.codec == RegionCodec::kFor) {
@@ -361,6 +401,7 @@ void decodeTypedRegion(
         region.base,
         out,
         n,
+        stride,
         region.segSizes.size());
     return;
   }
@@ -372,6 +413,7 @@ void decodeTypedRegion(
       0,
       deltasPtr,
       n,
+      stride,
       region.segSizes.size());
   unZigzagKernel<<<blocks, threads, 0, stream.value()>>>(deltasPtr, n);
   std::size_t tempBytes = 0;
@@ -416,8 +458,16 @@ PackedCompressResult compressPacked(
     region.blobOffset = offset;
     region.rawBytes = bytes;
     if (bytes >= kMinResidualBytes) {
-      auto compressed =
-          compressBlob(blobBase + offset, bytes, stream, minGain, 1);
+      // Stage into a fresh (aligned) buffer: gap offsets inside the blob are
+      // arbitrary and dietgpu requires aligned input pointers.
+      rmm::device_buffer staged(bytes, stream);
+      UCX_CUDA_CHECK(cudaMemcpyAsync(
+          staged.data(),
+          blobBase + offset,
+          bytes,
+          cudaMemcpyDeviceToDevice,
+          stream.value()));
+      auto compressed = compressBlob(staged.data(), bytes, stream, minGain, 1);
       if (compressed.used) {
         region.codec = RegionCodec::kByteRans;
         region.segSizes.assign(
@@ -449,9 +499,10 @@ PackedCompressResult compressPacked(
 
   std::size_t total = 0;
   for (std::size_t i = 0; i < regions.size(); ++i) {
-    total += regions[i].codec == RegionCodec::kRaw
-        ? regions[i].rawBytes
-        : payloads[i].size();
+    total += roundUp16(
+        regions[i].codec == RegionCodec::kRaw
+            ? static_cast<std::size_t>(regions[i].rawBytes)
+            : payloads[i].size());
   }
   if (static_cast<double>(total) > (1.0 - minGain) * size) {
     return result;
@@ -470,7 +521,7 @@ PackedCompressResult compressPacked(
         bytes,
         cudaMemcpyDeviceToDevice,
         stream.value()));
-    off += bytes;
+    off += roundUp16(bytes);
   }
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   result.regions = std::move(regions);
@@ -489,7 +540,7 @@ rmm::device_buffer decompressPacked(
   std::size_t off = 0;
 
   for (const auto& region : regions) {
-    std::size_t encodedBytes = 0;
+    std::size_t encodedBytes = 0; // true wire footprint before padding
     switch (region.codec) {
       case RegionCodec::kRaw:
         encodedBytes = region.rawBytes;
@@ -502,7 +553,7 @@ rmm::device_buffer decompressPacked(
         break;
       case RegionCodec::kByteRans: {
         for (auto s : region.segSizes) {
-          encodedBytes += s;
+          encodedBytes += roundUp16(s);
         }
         std::vector<uint32_t> segSizes(
             region.segSizes.begin(), region.segSizes.end());
@@ -520,7 +571,7 @@ rmm::device_buffer decompressPacked(
       case RegionCodec::kFor:
       case RegionCodec::kDeltaFor: {
         for (auto s : region.segSizes) {
-          encodedBytes += s;
+          encodedBytes += roundUp16(s);
         }
         if (region.elemWidth == 8) {
           decodeTypedRegion<int64_t>(wire + off, region, blobBase, stream);
@@ -530,7 +581,7 @@ rmm::device_buffer decompressPacked(
         break;
       }
     }
-    off += encodedBytes;
+    off += roundUp16(encodedBytes);
   }
   return blob;
 }
