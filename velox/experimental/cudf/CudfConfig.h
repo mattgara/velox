@@ -56,6 +56,8 @@ struct CudfConfig {
       "cudf.intra_node_exchange"};
   static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
   static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
+  static constexpr const char* kUcxExchangeCompression{
+      "cudf.exchange_compression"};
   static constexpr const char* kUcxPartitionedOutputBatchRows{
       "cudf.partitioned_output_batch_rows"};
   /// Query session configs for the cuDF Operators.
@@ -92,6 +94,10 @@ struct CudfConfig {
 
   /// VLOG level for ucx-exchange source files.
   int32_t exchangeLogLevel{0};
+
+  /// GPU codec for the UCX exchange payload: "none" (default) or "ans"
+  /// (whole-blob DietGPU byte-rANS; skipped per chunk when it does not pay).
+  std::string exchangeCompression{"none"};
 
   /// Minimum number of rows to accumulate in UCX partitioned output before
   /// flushing. Small inputs are buffered and concatenated when this threshold

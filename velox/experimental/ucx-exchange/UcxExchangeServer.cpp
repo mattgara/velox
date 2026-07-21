@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <rmm/cuda_stream.hpp>
+
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/UcxCompression.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
@@ -66,6 +70,10 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  // Compressed payload when exchange compression kicked in; kept alive with
+  // the context until the DMA completes. When set, the send transfers this
+  // buffer instead of data->gpu_data.
+  std::shared_ptr<rmm::device_buffer> compressedData;
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -312,14 +320,47 @@ void UcxExchangeServer::sendData() {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
+    // Compressed payload for this chunk, when compression is enabled and
+    // pays. Wire descriptor rides in remainingBytes:
+    // [codecId, uncompressedBytes, segSize0, segSize1, ...].
+    std::shared_ptr<rmm::device_buffer> compressedData;
+
     if (dataPtr_) {
       // Copy metadata (not move) because in broadcast mode, the same
       // packed_columns may be shared across multiple destination queues.
       // Metadata is small (CPU-side), so copying is negligible.
       metadataMsg->cudfMetadata =
           std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
-      metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
       metadataMsg->remainingBytes = {};
+      if (cudf_velox::CudfConfig::getInstance().exchangeCompression == "ans" &&
+          dataPtr_->gpu_data->size() > 0) {
+        // Dedicated stream: the blob is already synchronized by the producer
+        // and compressBlob synchronizes before returning, so the compressed
+        // buffer is settled before the UCX hand-off below.
+        static rmm::cuda_stream compressionStream;
+        auto compressed = compressBlob(
+            dataPtr_->gpu_data->data(),
+            dataPtr_->gpu_data->size(),
+            compressionStream.view());
+        if (compressed.used) {
+          compressedData =
+              std::make_shared<rmm::device_buffer>(std::move(compressed.data));
+          metadataMsg->remainingBytes.reserve(2 + compressed.segSizes.size());
+          metadataMsg->remainingBytes.push_back(
+              static_cast<int64_t>(ExchangeCodec::kByteRans));
+          metadataMsg->remainingBytes.push_back(
+              static_cast<int64_t>(dataPtr_->gpu_data->size()));
+          for (auto segSize : compressed.segSizes) {
+            metadataMsg->remainingBytes.push_back(segSize);
+          }
+          VLOG(2) << "@" << partitionKey_.taskId << " compressed chunk "
+                  << sequenceNumber_ << ": " << dataPtr_->gpu_data->size()
+                  << " -> " << compressedData->size() << " bytes";
+        }
+      }
+      metadataMsg->dataSizeBytes = compressedData
+          ? compressedData->size()
+          : dataPtr_->gpu_data->size();
       metadataMsg->atEnd = false;
     } else {
       VLOG(3) << "@" << partitionKey_.taskId << " Final exchange for "
@@ -387,7 +428,8 @@ void UcxExchangeServer::sendData() {
     // send the data chunk (if any)
     if (dataPtr_) {
       sendStart_ = std::chrono::high_resolution_clock::now();
-      bytes_ = dataPtr_->gpu_data->size();
+      bytes_ = compressedData ? compressedData->size()
+                              : dataPtr_->gpu_data->size();
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Sending rmm::buffer: " << std::hex
@@ -412,10 +454,16 @@ void UcxExchangeServer::sendData() {
       // stays alive for UCP wireup replay.
       auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
+      dataCtx->compressedData = compressedData;
 
+      void* sendPtr = compressedData ? compressedData->data()
+                                     : dataCtx->data->gpu_data->data();
+      const std::size_t sendBytes = compressedData
+          ? compressedData->size()
+          : dataCtx->data->gpu_data->size();
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataCtx->data->gpu_data->data(),
-          dataCtx->data->gpu_data->size(),
+          sendPtr,
+          sendBytes,
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
@@ -424,6 +472,7 @@ void UcxExchangeServer::sendData() {
             // safe to free. The context shell stays alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             auto dataHolder = std::move(ctx->data);
+            auto compressedHolder = std::move(ctx->compressedData);
 
             if (auto self = weakData.lock()) {
               self->sendComplete(status, arg);

@@ -432,6 +432,9 @@ void CudfConfig::initialize(
     partitionedOutputBatchRows =
         folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
+  if (config.find(kUcxExchangeCompression) != config.end()) {
+    exchangeCompression = config[kUcxExchangeCompression];
+  }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }

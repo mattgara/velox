@@ -21,6 +21,7 @@
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/UcxCompression.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
@@ -604,6 +605,31 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
 
     metrics_.numPackedColumns_.addValue(1);
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+
+    // Decompress when the sender compressed this chunk. Descriptor layout:
+    // remainingBytes = [codecId, uncompressedBytes, segSize0, ...]. The
+    // decode runs on ptr->stream, which also carries the downstream
+    // CudfVector, so ordering is preserved without an extra sync; the
+    // compressed buffer's stream-ordered free is safe for the same reason.
+    if (ptr->metadata.remainingBytes.size() > 2 &&
+        ptr->metadata.remainingBytes[0] ==
+            static_cast<int64_t>(ExchangeCodec::kByteRans)) {
+      const auto& descriptor = ptr->metadata.remainingBytes;
+      const auto uncompressedBytes =
+          static_cast<std::size_t>(descriptor[1]);
+      std::vector<uint32_t> segSizes;
+      segSizes.reserve(descriptor.size() - 2);
+      for (std::size_t i = 2; i < descriptor.size(); ++i) {
+        segSizes.push_back(static_cast<uint32_t>(descriptor[i]));
+      }
+      auto decompressed = decompressBlob(
+          ptr->dataBuf->data(), segSizes, uncompressedBytes, ptr->stream);
+      ptr->dataBuf =
+          std::make_unique<rmm::device_buffer>(std::move(decompressed));
+      VLOG(2) << toString() << " decompressed chunk " << sequenceNumber_ - 1
+              << ": " << ptr->metadata.dataSizeBytes << " -> "
+              << uncompressedBytes << " bytes";
+    }
 
     // Create packed_columns from the received metadata and data buffer
     cudf::packed_columns packedCols(

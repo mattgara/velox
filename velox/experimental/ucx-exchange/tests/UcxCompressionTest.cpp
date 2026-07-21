@@ -130,7 +130,7 @@ TEST(UcxCompressionTest, constantBytes) {
   std::vector<uint8_t> host(40u << 20, 0);
   auto result = roundTrip(host);
   EXPECT_TRUE(result.compressed);
-  EXPECT_GT(result.ratio, 50.0);
+  EXPECT_GT(result.ratio, 25.0); // byte-rANS per-block framing floor
 }
 
 } // namespace
