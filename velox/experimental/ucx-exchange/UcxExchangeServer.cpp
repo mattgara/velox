@@ -16,6 +16,7 @@
 #include <rmm/cuda_stream.hpp>
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/ucx-exchange/UcxColumnCodec.h"
 #include "velox/experimental/ucx-exchange/UcxCompression.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
@@ -332,8 +333,28 @@ void UcxExchangeServer::sendData() {
       metadataMsg->cudfMetadata =
           std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
       metadataMsg->remainingBytes = {};
-      if (cudf_velox::CudfConfig::getInstance().exchangeCompression == "ans" &&
-          dataPtr_->gpu_data->size() > 0) {
+      const auto& compressionMode =
+          cudf_velox::CudfConfig::getInstance().exchangeCompression;
+      if (compressionMode == "column" && dataPtr_->gpu_data->size() > 0) {
+        static rmm::cuda_stream columnStream;
+        auto packed = compressPacked(
+            dataPtr_->metadata->data(),
+            dataPtr_->gpu_data->data(),
+            dataPtr_->gpu_data->size(),
+            columnStream.view());
+        if (packed.used) {
+          compressedData =
+              std::make_shared<rmm::device_buffer>(std::move(packed.data));
+          serializeRegions(
+              packed,
+              dataPtr_->gpu_data->size(),
+              metadataMsg->remainingBytes);
+          VLOG(1) << "@" << partitionKey_.taskId << " column-compressed chunk "
+                  << sequenceNumber_ << ": " << dataPtr_->gpu_data->size()
+                  << " -> " << compressedData->size() << " bytes ("
+                  << packed.regions.size() << " regions)";
+        }
+      } else if (compressionMode == "ans" && dataPtr_->gpu_data->size() > 0) {
         // Dedicated stream: the blob is already synchronized by the producer
         // and compressBlob synchronizes before returning, so the compressed
         // buffer is settled before the UCX hand-off below.

@@ -21,6 +21,7 @@
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/UcxColumnCodec.h"
 #include "velox/experimental/ucx-exchange/UcxCompression.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
@@ -612,6 +613,33 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     // CudfVector, so ordering is preserved without an extra sync; the
     // compressed buffer's stream-ordered free is safe for the same reason.
     if (ptr->metadata.remainingBytes.size() > 2 &&
+        ptr->metadata.remainingBytes[0] == kPerColumnMagic) {
+      std::vector<EncodedRegion> regions;
+      std::size_t uncompressedBytes = 0;
+      try {
+        if (!deserializeRegions(
+                ptr->metadata.remainingBytes, regions, uncompressedBytes)) {
+          throw std::runtime_error("bad per-column descriptor");
+        }
+        auto blob = decompressPacked(
+            ptr->dataBuf->data(), regions, uncompressedBytes, ptr->stream);
+        ptr->dataBuf = std::make_unique<rmm::device_buffer>(std::move(blob));
+        VLOG(1) << toString() << " column-decompressed chunk "
+                << sequenceNumber_ - 1 << ": "
+                << ptr->metadata.dataSizeBytes << " -> " << uncompressedBytes
+                << " bytes";
+      } catch (const std::exception& e) {
+        VLOG(0) << toString()
+                << " exchange column decompression failed: " << e.what();
+        queue_->setError(
+            std::string("exchange decompression failed: ") + e.what());
+        deliverEndMarker();
+        setState(ReceiverState::Done);
+        communicator_->addToWorkQueue(getSelfPtr());
+        return;
+      }
+    } else if (
+        ptr->metadata.remainingBytes.size() > 2 &&
         ptr->metadata.remainingBytes[0] ==
             static_cast<int64_t>(ExchangeCodec::kByteRans)) {
       const auto& descriptor = ptr->metadata.remainingBytes;
