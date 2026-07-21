@@ -19,7 +19,9 @@
 
 #include <cuda_runtime.h>
 
-#include "velox/common/base/Exceptions.h"
+#include <stdexcept>
+
+#include <fmt/format.h>
 #include "velox/experimental/ucx-exchange/dietgpu/ans/GpuANSCodec.h"
 #include "velox/experimental/ucx-exchange/dietgpu/utils/StackDeviceMemory.h"
 
@@ -28,14 +30,14 @@ namespace {
 
 constexpr int kProbBits = 10;
 
-#define UCX_CUDA_CHECK(expr)                          \
-  do {                                                \
-    cudaError_t err = (expr);                         \
-    VELOX_CHECK_EQ(                                   \
-        err,                                          \
-        cudaSuccess,                                  \
-        "CUDA error in ucx-exchange compression: {}", \
-        cudaGetErrorString(err));                     \
+#define UCX_CUDA_CHECK(expr)                                        \
+  do {                                                              \
+    cudaError_t err = (expr);                                       \
+    if (err != cudaSuccess) {                                       \
+      throw std::runtime_error(fmt::format(                         \
+          "CUDA error in ucx-exchange compression: {}",             \
+          cudaGetErrorString(err)));                                \
+    }                                                               \
   } while (0)
 
 // DietGPU scratch memory, sized so encode/decode of a full chunk batch does
@@ -150,7 +152,9 @@ rmm::device_buffer decompressBlob(
     std::size_t uncompressedBytes,
     rmm::cuda_stream_view stream) {
   const uint32_t numSegs = segSizes.size();
-  VELOX_CHECK_GT(numSegs, 0, "decompressBlob: empty segment list");
+  if (numSegs == 0) {
+    throw std::runtime_error("decompressBlob: empty segment list");
+  }
   rmm::device_buffer out(uncompressedBytes, stream);
 
   std::vector<const void*> inPtrs(numSegs);
@@ -167,8 +171,9 @@ rmm::device_buffer decompressBlob(
     outCaps[i] = cap;
     outOff += cap;
   }
-  VELOX_CHECK_EQ(
-      outOff, uncompressedBytes, "decompressBlob: segment/output mismatch");
+  if (outOff != uncompressedBytes) {
+    throw std::runtime_error("decompressBlob: segment/output mismatch");
+  }
 
   auto status = dietgpu::ansDecodeBatchPointer(
       stackMemory(),
@@ -180,9 +185,10 @@ rmm::device_buffer decompressBlob(
       /*outSuccess_dev=*/nullptr,
       /*outSize_dev=*/nullptr,
       stream.value());
-  VELOX_CHECK(
-      status.error == dietgpu::ANSDecodeError::None,
-      "ucx-exchange rANS decode failed (checksum or corrupt frame)");
+  if (status.error != dietgpu::ANSDecodeError::None) {
+    throw std::runtime_error(
+        "ucx-exchange rANS decode failed (checksum or corrupt frame)");
+  }
   return out;
 }
 

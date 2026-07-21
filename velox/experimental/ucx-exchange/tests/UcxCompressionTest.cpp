@@ -19,6 +19,7 @@
 #include <random>
 
 #include <cuda_runtime.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <rmm/cuda_stream.hpp>
 
