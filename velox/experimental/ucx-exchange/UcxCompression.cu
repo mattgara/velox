@@ -74,6 +74,11 @@ std::vector<std::pair<const uint8_t*, uint32_t>> segments(
 
 } // namespace
 
+std::mutex& codecMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
 CompressResult compressBlob(
     const void* src,
     std::size_t size,
@@ -84,6 +89,7 @@ CompressResult compressBlob(
   if (size < minBytes) {
     return result;
   }
+  std::lock_guard<std::mutex> codecLock(codecMutex());
   const auto segs = segments(src, size);
   const uint32_t numSegs = segs.size();
 
@@ -168,6 +174,7 @@ rmm::device_buffer decompressBlob(
   if (numSegs == 0) {
     throw std::runtime_error("decompressBlob: empty segment list");
   }
+  std::lock_guard<std::mutex> codecLock(codecMutex());
   rmm::device_buffer out(uncompressedBytes, stream);
 
   std::vector<const void*> inPtrs(numSegs);
@@ -202,6 +209,8 @@ rmm::device_buffer decompressBlob(
     throw std::runtime_error(
         "ucx-exchange rANS decode failed (checksum or corrupt frame)");
   }
+  // Drain the shared stack arena before the next codec user (see codecMutex).
+  UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   return out;
 }
 

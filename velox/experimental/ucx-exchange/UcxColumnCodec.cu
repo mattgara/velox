@@ -17,6 +17,7 @@
 #include "velox/experimental/ucx-exchange/UcxCompression.h"
 
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 
 #include <cub/device/device_scan.cuh>
@@ -203,6 +204,8 @@ std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
     uint32_t stride,
     int width,
     rmm::cuda_stream_view stream) {
+  // Exclusive use of the shared DietGPU stack arena (see codecMutex()).
+  std::lock_guard<std::mutex> codecLock(codecMutex());
   const uint32_t maxComp =
       alignedStride(dietgpu::getMaxCompressedSize(n));
   rmm::device_buffer scratch(static_cast<std::size_t>(width) * maxComp, stream);
@@ -256,6 +259,7 @@ rmm::device_buffer decodePlanes(
     rmm::cuda_stream_view stream) {
   const auto width = segSizes.size();
   const uint32_t stride = alignedStride(n);
+  std::lock_guard<std::mutex> codecLock(codecMutex());
   rmm::device_buffer planes(static_cast<std::size_t>(width) * stride, stream);
   std::vector<const void*> inPtrs(width);
   std::vector<void*> outPtrs(width);
@@ -279,6 +283,8 @@ rmm::device_buffer decodePlanes(
   if (status.error != dietgpu::ANSDecodeError::None) {
     throw std::runtime_error("ucx-exchange column codec: plane decode failed");
   }
+  // Drain the arena before the next codec user.
+  UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   return planes;
 }
 

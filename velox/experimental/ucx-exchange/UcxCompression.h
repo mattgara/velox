@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -59,6 +60,12 @@ CompressResult compressBlob(
 /// Decompresses a kByteRans blob (concatenated segments of `segSizes`
 /// compressed bytes each, `uncompressedBytes` total output) into a new
 /// device buffer on `stream`. Byte-exact; throws on decode failure.
+/// Serializes all codec work in this process. DietGPU StackDeviceMemory is
+/// a stream-ordered stack allocator; concurrent encode/decode on different
+/// streams interleave allocations and corrupt scratch. Every codec entry
+/// point must hold this mutex and synchronize its stream before releasing.
+std::mutex& codecMutex();
+
 rmm::device_buffer decompressBlob(
     const void* src,
     const std::vector<uint32_t>& segSizes,
