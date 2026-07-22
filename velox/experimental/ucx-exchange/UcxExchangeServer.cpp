@@ -353,7 +353,8 @@ void UcxExchangeServer::sendData() {
           const double encSeconds = std::chrono::duration<double>(
               std::chrono::steady_clock::now() - encodeStart).count();
           VLOG(1) << "@" << partitionKey_.taskId << " encodeGBps="
-                  << dataPtr_->gpu_data->size() / encSeconds / 1e9;
+                  << dataPtr_->gpu_data->size() / encSeconds / 1e9
+                  << " bytes=" << dataPtr_->gpu_data->size();
           compressedData =
               std::make_shared<rmm::device_buffer>(std::move(packed.data));
           serializeRegions(

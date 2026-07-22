@@ -166,6 +166,25 @@ __global__ void finalizeDeltaKernel(
   out[i] = static_cast<T>(summed[i] + first);
 }
 
+// Pinned host staging for tiny D2H readbacks (pageable D2H pays ~50-100us
+// staging latency per copy; pinned is ~5us). One slot set per thread.
+struct PinnedStage {
+  int64_t* values; // [0]=min/base, [1]=max
+  uint32_t* sizes; // up to 64 plane/segment sizes
+  PinnedStage() {
+    UCX_CUDA_CHECK(cudaHostAlloc(
+        reinterpret_cast<void**>(&values), 2 * sizeof(int64_t),
+        cudaHostAllocDefault));
+    UCX_CUDA_CHECK(cudaHostAlloc(
+        reinterpret_cast<void**>(&sizes), 64 * sizeof(uint32_t),
+        cudaHostAllocDefault));
+  }
+};
+PinnedStage& pinnedStage() {
+  static thread_local PinnedStage stage;
+  return stage;
+}
+
 int planesForRange(uint64_t range) {
   int width = 1;
   while ((range >> (8 * width)) != 0 && width < 8) {
@@ -228,14 +247,15 @@ std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
       maxComp,
       static_cast<uint32_t*>(sizesDev.data()),
       stream.value());
-  std::vector<uint32_t> sizes(width);
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      sizes.data(),
+      pinnedStage().sizes,
       sizesDev.data(),
       width * sizeof(uint32_t),
       cudaMemcpyDeviceToHost,
       stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+  std::vector<uint32_t> sizes(
+      pinnedStage().sizes, pinnedStage().sizes + width);
 
   std::size_t total = 0;
   for (auto s : sizes) {
@@ -311,18 +331,18 @@ void encodeTypedRegion(
   auto valuesPtr = thrust::device_pointer_cast(values);
   auto valueMinMax = thrust::minmax_element(
       thrust::cuda::par.on(stream.value()), valuesPtr, valuesPtr + n);
-  T hostMin;
-  T hostMax;
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      &hostMin, valueMinMax.first.get(), sizeof(T),
+      pinnedStage().values, valueMinMax.first.get(), sizeof(T),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      &hostMax, valueMinMax.second.get(), sizeof(T),
+      pinnedStage().values + 1, valueMinMax.second.get(), sizeof(T),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
-  const int64_t base = static_cast<int64_t>(hostMin);
+  const int64_t base = static_cast<int64_t>(
+      *reinterpret_cast<T*>(pinnedStage().values));
   const uint64_t forRange = static_cast<uint64_t>(
-      static_cast<int64_t>(hostMax) - base);
+      static_cast<int64_t>(*reinterpret_cast<T*>(pinnedStage().values + 1)) -
+      base);
   const int forWidth = planesForRange(forRange);
 
   int deltaWidth = 9; // sentinel: > any forWidth when forOnly
@@ -451,7 +471,7 @@ PackedCompressResult compressPackedFor(
     rmm::cuda_stream_view stream) {
   PackedCompressResult result;
   const std::size_t typedBytes = size & ~static_cast<std::size_t>(7);
-  if (typedBytes < (1u << 16)) {
+  if (typedBytes < (16u << 20)) { // floor: small chunks ship raw
     return result;
   }
   std::vector<rmm::device_buffer> payloads;
