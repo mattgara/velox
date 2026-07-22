@@ -45,18 +45,22 @@ inline std::size_t roundUp16(std::size_t v) {
     }                                                               \
   } while (0)
 
-// DietGPU scratch memory, sized so encode/decode of a full chunk batch does
-// not fall back to cudaMalloc (see StackDeviceMemory warnings).
-dietgpu::StackDeviceMemory& stackMemory() {
-  static std::once_flag flag;
-  static std::unique_ptr<dietgpu::StackDeviceMemory> mem;
-  std::call_once(flag, [] {
-    int device = 0;
-    UCX_CUDA_CHECK(cudaGetDevice(&device));
-    mem = std::make_unique<dietgpu::StackDeviceMemory>(
-        device, 768u << 20 /* 768 MiB scratch */);
-  });
-  return *mem;
+// Per-call DietGPU scratch arena backed by rmm (stream-ordered alloc/free):
+// no shared state between concurrent codec calls on different streams.
+constexpr std::size_t kArenaBytes = 256u << 20;
+
+struct CallArena {
+  rmm::device_buffer buffer;
+  dietgpu::StackDeviceMemory stack;
+  CallArena(rmm::cuda_stream_view stream, int device)
+      : buffer(kArenaBytes, stream),
+        stack(device, buffer.data(), kArenaBytes) {}
+};
+
+int currentDevice() {
+  int device = 0;
+  UCX_CUDA_CHECK(cudaGetDevice(&device));
+  return device;
 }
 
 std::vector<std::pair<const uint8_t*, uint32_t>> segments(
@@ -89,9 +93,9 @@ CompressResult compressBlob(
   if (size < minBytes) {
     return result;
   }
-  std::lock_guard<std::mutex> codecLock(codecMutex());
-  const auto segs = segments(src, size);
+    const auto segs = segments(src, size);
   const uint32_t numSegs = segs.size();
+  CallArena arena(stream, currentDevice());
 
   // Strided scratch output: maxCompressedSize per segment.
   const uint32_t maxCompSeg =
@@ -111,7 +115,7 @@ CompressResult compressBlob(
   }
 
   dietgpu::ansEncodeBatchPointer(
-      stackMemory(),
+      arena.stack,
       dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       numSegs,
       inPtrs.data(),
@@ -174,7 +178,7 @@ rmm::device_buffer decompressBlob(
   if (numSegs == 0) {
     throw std::runtime_error("decompressBlob: empty segment list");
   }
-  std::lock_guard<std::mutex> codecLock(codecMutex());
+    CallArena arena(stream, currentDevice());
   rmm::device_buffer out(uncompressedBytes, stream);
 
   std::vector<const void*> inPtrs(numSegs);
@@ -196,7 +200,7 @@ rmm::device_buffer decompressBlob(
   }
 
   auto status = dietgpu::ansDecodeBatchPointer(
-      stackMemory(),
+      arena.stack,
       dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       numSegs,
       inPtrs.data(),
@@ -209,7 +213,7 @@ rmm::device_buffer decompressBlob(
     throw std::runtime_error(
         "ucx-exchange rANS decode failed (checksum or corrupt frame)");
   }
-  // Drain the shared stack arena before the next codec user (see codecMutex).
+  // Settle before the arena (stream-ordered) frees and the caller consumes.
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   return out;
 }

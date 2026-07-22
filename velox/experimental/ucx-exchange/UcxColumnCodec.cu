@@ -66,17 +66,24 @@ constexpr std::size_t kMinResidualBytes = 1u << 16;
     }                                                              \
   } while (0)
 
-// Defined in UcxCompression.cu; reuse its process-wide scratch.
-dietgpu::StackDeviceMemory& columnCodecStack() {
-  static std::unique_ptr<dietgpu::StackDeviceMemory> mem;
-  static std::once_flag flag;
-  std::call_once(flag, [] {
-    int device = 0;
-    UCX_CUDA_CHECK(cudaGetDevice(&device));
-    mem = std::make_unique<dietgpu::StackDeviceMemory>(device, 512u << 20);
-  });
-  return *mem;
-}
+// Per-call DietGPU scratch arena backed by rmm (stream-ordered): safe under
+// concurrent encode/decode on different streams, no shared state.
+constexpr std::size_t kPlaneArenaBytes = 256u << 20;
+
+struct PlaneArena {
+  rmm::device_buffer buffer;
+  dietgpu::StackDeviceMemory stack;
+  explicit PlaneArena(rmm::cuda_stream_view stream)
+      : buffer(kPlaneArenaBytes, stream),
+        stack(
+            [] {
+              int device = 0;
+              cudaGetDevice(&device);
+              return device;
+            }(),
+            buffer.data(),
+            kPlaneArenaBytes) {}
+};
 
 // Subtracts base and splits into w byte planes (SoA, plane-major).
 template <typename T>
@@ -204,14 +211,13 @@ std::pair<rmm::device_buffer, std::vector<int64_t>> encodePlanes(
     uint32_t stride,
     int width,
     rmm::cuda_stream_view stream) {
-  // Exclusive use of the shared DietGPU stack arena (see codecMutex()).
-  std::lock_guard<std::mutex> codecLock(codecMutex());
   const uint32_t maxComp =
       alignedStride(dietgpu::getMaxCompressedSize(n));
+  PlaneArena arena(stream);
   rmm::device_buffer scratch(static_cast<std::size_t>(width) * maxComp, stream);
   rmm::device_buffer sizesDev(width * sizeof(uint32_t), stream);
   dietgpu::ansEncodeBatchStride(
-      columnCodecStack(),
+      arena.stack,
       dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       width,
       planes,
@@ -259,8 +265,8 @@ rmm::device_buffer decodePlanes(
     rmm::cuda_stream_view stream) {
   const auto width = segSizes.size();
   const uint32_t stride = alignedStride(n);
-  std::lock_guard<std::mutex> codecLock(codecMutex());
   rmm::device_buffer planes(static_cast<std::size_t>(width) * stride, stream);
+  PlaneArena arena(stream);
   std::vector<const void*> inPtrs(width);
   std::vector<void*> outPtrs(width);
   std::vector<uint32_t> outCaps(width, n);
@@ -271,7 +277,7 @@ rmm::device_buffer decodePlanes(
     outPtrs[k] = static_cast<uint8_t*>(planes.data()) + k * stride;
   }
   auto status = dietgpu::ansDecodeBatchPointer(
-      columnCodecStack(),
+      arena.stack,
       dietgpu::ANSCodecConfig(kProbBits, kUseChecksum),
       width,
       inPtrs.data(),
@@ -283,7 +289,7 @@ rmm::device_buffer decodePlanes(
   if (status.error != dietgpu::ANSDecodeError::None) {
     throw std::runtime_error("ucx-exchange column codec: plane decode failed");
   }
-  // Drain the arena before the next codec user.
+  // Settle before the arena (stream-ordered) frees and callers consume planes.
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   return planes;
 }
