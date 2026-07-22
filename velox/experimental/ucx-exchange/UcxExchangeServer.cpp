@@ -335,14 +335,25 @@ void UcxExchangeServer::sendData() {
       metadataMsg->remainingBytes = {};
       const auto& compressionMode =
           cudf_velox::CudfConfig::getInstance().exchangeCompression;
-      if (compressionMode == "column" && dataPtr_->gpu_data->size() > 0) {
+      if ((compressionMode == "column" || compressionMode == "for") &&
+          dataPtr_->gpu_data->size() > 0) {
         static rmm::cuda_stream columnStream;
-        auto packed = compressPacked(
+        auto encodeStart = std::chrono::steady_clock::now();
+        auto packed = compressionMode == "for"
+            ? compressPackedFor(
+                  dataPtr_->gpu_data->data(),
+                  dataPtr_->gpu_data->size(),
+                  columnStream.view())
+            : compressPacked(
             dataPtr_->metadata->data(),
             dataPtr_->gpu_data->data(),
             dataPtr_->gpu_data->size(),
             columnStream.view());
         if (packed.used) {
+          const double encSeconds = std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - encodeStart).count();
+          VLOG(1) << "@" << partitionKey_.taskId << " encodeGBps="
+                  << dataPtr_->gpu_data->size() / encSeconds / 1e9;
           compressedData =
               std::make_shared<rmm::device_buffer>(std::move(packed.data));
           serializeRegions(

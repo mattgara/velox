@@ -69,6 +69,13 @@ struct PackedCompressResult {
 /// cudf::pack outputs (host metadata, device blob of `size` bytes).
 /// Returns used=false when the encoded total does not undercut `size` by
 /// at least minGain.
+/// Stripped fixed-codec mode ("for"): whole blob as one int64 FOR region,
+/// no metadata walk, no probe. Decoded by the standard region decoder.
+PackedCompressResult compressPackedFor(
+    const void* gpuData,
+    std::size_t size,
+    rmm::cuda_stream_view stream);
+
 PackedCompressResult compressPacked(
     const uint8_t* metadata,
     const void* gpuData,

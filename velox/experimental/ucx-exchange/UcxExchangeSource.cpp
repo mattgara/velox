@@ -621,8 +621,14 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
                 ptr->metadata.remainingBytes, regions, uncompressedBytes)) {
           throw std::runtime_error("bad per-column descriptor");
         }
+        auto decodeStart = std::chrono::steady_clock::now();
         auto blob = decompressPacked(
             ptr->dataBuf->data(), regions, uncompressedBytes, ptr->stream);
+        VLOG(1) << toString() << " decodeGBps="
+                << uncompressedBytes /
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - decodeStart).count() /
+                1e9;
         ptr->dataBuf = std::make_unique<rmm::device_buffer>(std::move(blob));
         VLOG(1) << toString() << " column-decompressed chunk "
                 << sequenceNumber_ - 1 << ": "

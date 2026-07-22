@@ -300,7 +300,8 @@ void encodeTypedRegion(
     const TypedRegion& region,
     rmm::cuda_stream_view stream,
     std::vector<EncodedRegion>& regions,
-    std::vector<rmm::device_buffer>& payloads) {
+    std::vector<rmm::device_buffer>& payloads,
+    bool forOnly = false) {
   const T* values = reinterpret_cast<const T*>(blobBase + region.offset);
   const uint32_t n = region.elems;
   const int threads = 256;
@@ -324,9 +325,12 @@ void encodeTypedRegion(
       static_cast<int64_t>(hostMax) - base);
   const int forWidth = planesForRange(forRange);
 
-  // Zigzag deltas + their max (min is >= 0 by construction).
-  rmm::device_buffer deltas(static_cast<std::size_t>(n) * 8, stream);
+  int deltaWidth = 9; // sentinel: > any forWidth when forOnly
+  rmm::device_buffer deltas(
+      forOnly ? 0 : static_cast<std::size_t>(n) * 8, stream);
   auto* deltasPtr = static_cast<int64_t*>(deltas.data());
+  if (!forOnly) {
+  // Zigzag deltas + their max (min is >= 0 by construction).
   zigzagDeltaKernel<T>
       <<<blocks, threads, 0, stream.value()>>>(values, deltasPtr, n);
   auto deltaThrust = thrust::device_pointer_cast(deltasPtr);
@@ -337,7 +341,8 @@ void encodeTypedRegion(
       &deltaMax, deltaMaxIt.get(), sizeof(int64_t),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
-  const int deltaWidth = planesForRange(static_cast<uint64_t>(deltaMax));
+  deltaWidth = planesForRange(static_cast<uint64_t>(deltaMax));
+  }
 
   EncodedRegion out;
   out.blobOffset = region.offset;
@@ -439,6 +444,56 @@ void decodeTypedRegion(
 }
 
 } // namespace
+
+PackedCompressResult compressPackedFor(
+    const void* gpuData,
+    std::size_t size,
+    rmm::cuda_stream_view stream) {
+  PackedCompressResult result;
+  const std::size_t typedBytes = size & ~static_cast<std::size_t>(7);
+  if (typedBytes < (1u << 16)) {
+    return result;
+  }
+  std::vector<rmm::device_buffer> payloads;
+  TypedRegion whole{0, typedBytes / 8, 8};
+  encodeTypedRegion<int64_t>(
+      static_cast<const uint8_t*>(gpuData), whole, stream, result.regions,
+      payloads, /*forOnly=*/true);
+  if (typedBytes < size) {
+    EncodedRegion tail;
+    tail.blobOffset = typedBytes;
+    tail.rawBytes = size - typedBytes;
+    tail.codec = RegionCodec::kRaw;
+    payloads.emplace_back();
+    result.regions.push_back(std::move(tail));
+  }
+  std::size_t total = 0;
+  for (std::size_t i = 0; i < result.regions.size(); ++i) {
+    total += roundUp16(result.regions[i].codec == RegionCodec::kRaw
+        ? static_cast<std::size_t>(result.regions[i].rawBytes)
+        : payloads[i].size());
+  }
+  if (static_cast<double>(total) > 0.98 * size) {
+    result.regions.clear();
+    return result;
+  }
+  result.data = rmm::device_buffer(total, stream);
+  std::size_t off = 0;
+  for (std::size_t i = 0; i < result.regions.size(); ++i) {
+    const bool raw = result.regions[i].codec == RegionCodec::kRaw;
+    const auto bytes = raw ? static_cast<std::size_t>(result.regions[i].rawBytes)
+                           : payloads[i].size();
+    UCX_CUDA_CHECK(cudaMemcpyAsync(
+        static_cast<uint8_t*>(result.data.data()) + off,
+        raw ? static_cast<const uint8_t*>(gpuData) + result.regions[i].blobOffset
+            : static_cast<const uint8_t*>(payloads[i].data()),
+        bytes, cudaMemcpyDeviceToDevice, stream.value()));
+    off += roundUp16(bytes);
+  }
+  UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
+  result.used = true;
+  return result;
+}
 
 PackedCompressResult compressPacked(
     const uint8_t* metadata,
