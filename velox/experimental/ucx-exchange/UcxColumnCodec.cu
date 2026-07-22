@@ -20,6 +20,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include <cub/device/device_reduce.cuh>
 #include <cub/device/device_scan.cuh>
 #include <cuda_runtime.h>
 #include <fmt/format.h>
@@ -327,15 +328,19 @@ void encodeTypedRegion(
   const int threads = 256;
   const int blocks = (n + threads - 1) / threads;
 
-  // Value min/max.
-  auto valuesPtr = thrust::device_pointer_cast(values);
-  auto valueMinMax = thrust::minmax_element(
-      thrust::cuda::par.on(stream.value()), valuesPtr, valuesPtr + n);
+  // Value min/max via cub on rmm temp: stream-ordered, no cudaMalloc device
+  // sync (thrust's internal temp allocation stalls against ALL streams).
+  rmm::device_buffer minMaxOut(2 * sizeof(T), stream);
+  T* minOut = static_cast<T*>(minMaxOut.data());
+  std::size_t tempBytes = 0;
+  cub::DeviceReduce::Min(nullptr, tempBytes, values, minOut, n, stream.value());
+  rmm::device_buffer temp(tempBytes, stream);
+  cub::DeviceReduce::Min(
+      temp.data(), tempBytes, values, minOut, n, stream.value());
+  cub::DeviceReduce::Max(
+      temp.data(), tempBytes, values, minOut + 1, n, stream.value());
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      pinnedStage().values, valueMinMax.first.get(), sizeof(T),
-      cudaMemcpyDeviceToHost, stream.value()));
-  UCX_CUDA_CHECK(cudaMemcpyAsync(
-      pinnedStage().values + 1, valueMinMax.second.get(), sizeof(T),
+      pinnedStage().values, minOut, 2 * sizeof(T),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   const int64_t base = static_cast<int64_t>(
@@ -353,12 +358,18 @@ void encodeTypedRegion(
   // Zigzag deltas + their max (min is >= 0 by construction).
   zigzagDeltaKernel<T>
       <<<blocks, threads, 0, stream.value()>>>(values, deltasPtr, n);
-  auto deltaThrust = thrust::device_pointer_cast(deltasPtr);
-  auto deltaMaxIt = thrust::max_element(
-      thrust::cuda::par.on(stream.value()), deltaThrust, deltaThrust + n);
+  rmm::device_buffer deltaMaxDev(sizeof(int64_t), stream);
+  std::size_t dTempBytes = 0;
+  cub::DeviceReduce::Max(
+      nullptr, dTempBytes, deltasPtr,
+      static_cast<int64_t*>(deltaMaxDev.data()), n, stream.value());
+  rmm::device_buffer dTemp(dTempBytes, stream);
+  cub::DeviceReduce::Max(
+      dTemp.data(), dTempBytes, deltasPtr,
+      static_cast<int64_t*>(deltaMaxDev.data()), n, stream.value());
   int64_t deltaMax;
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      &deltaMax, deltaMaxIt.get(), sizeof(int64_t),
+      &deltaMax, deltaMaxDev.data(), sizeof(int64_t),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   deltaWidth = planesForRange(static_cast<uint64_t>(deltaMax));
