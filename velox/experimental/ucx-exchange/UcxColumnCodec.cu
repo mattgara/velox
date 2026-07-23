@@ -332,21 +332,34 @@ void encodeTypedRegion(
   // sync (thrust's internal temp allocation stalls against ALL streams).
   rmm::device_buffer minMaxOut(2 * sizeof(T), stream);
   T* minOut = static_cast<T*>(minMaxOut.data());
-  std::size_t tempBytes = 0;
-  cub::DeviceReduce::Min(nullptr, tempBytes, values, minOut, n, stream.value());
-  rmm::device_buffer temp(tempBytes, stream);
-  cub::DeviceReduce::Min(
-      temp.data(), tempBytes, values, minOut, n, stream.value());
-  cub::DeviceReduce::Max(
-      temp.data(), tempBytes, values, minOut + 1, n, stream.value());
+  T* maxOut = minOut + 1;
+  std::size_t minTempBytes = 0;
+  std::size_t maxTempBytes = 0;
+  UCX_CUDA_CHECK(cub::DeviceReduce::Min(
+      nullptr, minTempBytes, values, minOut, n, stream.value()));
+  UCX_CUDA_CHECK(cub::DeviceReduce::Max(
+      nullptr, maxTempBytes, values, maxOut, n, stream.value()));
+  rmm::device_buffer temp(std::max(minTempBytes, maxTempBytes), stream);
+  UCX_CUDA_CHECK(cub::DeviceReduce::Min(
+      temp.data(), minTempBytes, values, minOut, n, stream.value()));
+  UCX_CUDA_CHECK(cub::DeviceReduce::Max(
+      temp.data(), maxTempBytes, values, maxOut, n, stream.value()));
+
+  // Keep each typed result in its own 64-bit pinned slot. A contiguous
+  // 2*sizeof(T) copy places int32 max at byte offset 4, while values + 1 is
+  // byte offset 8, causing stale max reads and invalid codec-width choices.
+  auto& stage = pinnedStage();
   UCX_CUDA_CHECK(cudaMemcpyAsync(
-      pinnedStage().values, minOut, 2 * sizeof(T),
+      stage.values, minOut, sizeof(T),
+      cudaMemcpyDeviceToHost, stream.value()));
+  UCX_CUDA_CHECK(cudaMemcpyAsync(
+      stage.values + 1, maxOut, sizeof(T),
       cudaMemcpyDeviceToHost, stream.value()));
   UCX_CUDA_CHECK(cudaStreamSynchronize(stream.value()));
   const int64_t base = static_cast<int64_t>(
-      *reinterpret_cast<T*>(pinnedStage().values));
+      *reinterpret_cast<T*>(stage.values));
   const uint64_t forRange = static_cast<uint64_t>(
-      static_cast<int64_t>(*reinterpret_cast<T*>(pinnedStage().values + 1)) -
+      static_cast<int64_t>(*reinterpret_cast<T*>(stage.values + 1)) -
       base);
   const int forWidth = planesForRange(forRange);
 
