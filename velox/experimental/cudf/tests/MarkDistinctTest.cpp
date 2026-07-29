@@ -279,3 +279,48 @@ TEST_F(CudfMarkDistinctTest, emptyBatch) {
   EXPECT_FALSE(markers->valueAt(2)); // 2: duplicate
   EXPECT_TRUE(markers->valueAt(3)); // 3: first
 }
+
+// Minimal form of the TPC-DS Q28 failure from #18149.
+//
+// A MarkDistinct-only plan converts every output batch back to Velox and
+// synchronizes its CUDA stream. Q28 instead follows MarkDistinct with masked
+// aggregation, which keeps the pipeline on the GPU. Filter(marker) followed by
+// count(c0) is equivalent for these non-null inputs and likewise keeps
+// successive batches asynchronous. Each CudfFromVelox output is assigned a
+// stream from the global stream pool, so this exercises one CudfMarkDistinct
+// instance with changing input streams.
+//
+// The two batches are [0, 1] and [1, 2]. The second batch both probes the
+// persistent filtered_join and replaces seenKeys_/seenFilter_ on a new stream.
+TEST_F(CudfMarkDistinctTest, q28CrossStreamDistinctCount) {
+  constexpr vector_size_t kBatchRows = 2;
+  constexpr int32_t kNumBatches = 2;
+  constexpr int64_t kNewKeysPerBatch = kBatchRows / 2;
+  constexpr int64_t kExpectedDistinct =
+      kBatchRows + (kNumBatches - 1) * kNewKeysPerBatch;
+
+  std::vector<RowVectorPtr> batches;
+  batches.reserve(kNumBatches);
+  for (int32_t batch = 0; batch < kNumBatches; ++batch) {
+    batches.push_back(
+        makeRowVector({makeFlatVector<int64_t>(kBatchRows, [batch](auto row) {
+          return batch * kNewKeysPerBatch + row;
+        })}));
+  }
+
+  auto plan = PlanBuilder()
+                  .values(batches)
+                  .markDistinct("marker", {"c0"})
+                  .filter("marker")
+                  .singleAggregation({}, {"count(c0) AS distinct_count"})
+                  .planNode();
+
+  auto result = AssertQueryBuilder(plan)
+                    .config("velox.cudf.gpu_batch_size_rows", "2")
+                    .copyResults(pool());
+
+  ASSERT_EQ(1, result->size());
+  EXPECT_EQ(
+      kExpectedDistinct,
+      result->childAt(0)->asFlatVector<int64_t>()->valueAt(0));
+}
