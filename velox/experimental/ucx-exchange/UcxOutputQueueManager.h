@@ -20,7 +20,9 @@
 #include <velox/exec/Task.h>
 #include <functional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 namespace facebook::velox::ucx_exchange {
@@ -110,6 +112,20 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
   /// source's destructive move would corrupt data for other servers).
   bool canUseIntraNode(std::string_view taskId);
 
+  /// Invokes 'callback' once task initialization has published the final
+  /// output kind. The callback receives true for non-broadcast queues and
+  /// false for broadcast or removed tasks. If initialization has already
+  /// completed, the callback is invoked synchronously.
+  ///
+  /// This closes the handshake race where a same-process exchange source can
+  /// connect before initializeTask(): callers must wait for the final output
+  /// kind instead of permanently treating an uninitialized placeholder as a
+  /// remote UCX transfer.
+  using IntraNodeEligibilityCallback = std::function<void(bool)>;
+  void whenIntraNodeEligibilityKnown(
+      std::string_view taskId,
+      IntraNodeEligibilityCallback callback);
+
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.
   void removeTask(const std::string& taskId) override;
@@ -140,6 +156,12 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
       std::unordered_map<std::string, std::shared_ptr<UcxOutputQueue>>,
       std::mutex>
       queues_;
+
+  // Accessed only while holding queues_' mutex. Keeping the readiness waiters
+  // under the same lock as queues_ makes the check-and-subscribe operation
+  // atomic with initializeTask().
+  std::unordered_map<std::string, std::vector<IntraNodeEligibilityCallback>>
+      intraNodeEligibilityWaiters_;
 
   // Tasks that have been removed via removeTask(). Prevents getData() from
   // re-creating placeholder queues for tasks that are already dead, which

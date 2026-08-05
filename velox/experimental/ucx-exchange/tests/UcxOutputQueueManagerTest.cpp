@@ -670,3 +670,55 @@ TEST_F(UcxOutputQueueManagerTest, broadcastEndMarkerToLateDestination) {
   EXPECT_TRUE(queueManager_->isFinished(taskId));
   queueManager_->removeTask(taskId);
 }
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    intraNodeEligibilityWaitsForPartitionedInitialization) {
+  const std::string taskId = "intraNodeEligibilityPartitioned";
+  queueManager_->removeTask(taskId);
+
+  bool callbackCalled = false;
+  bool canUseIntraNode = false;
+  queueManager_->whenIntraNodeEligibilityKnown(taskId, [&](bool enabled) {
+    callbackCalled = true;
+    canUseIntraNode = enabled;
+  });
+
+  EXPECT_FALSE(callbackCalled);
+  initializeTask(
+      taskId,
+      2 /* numDestinations */,
+      1 /* numDrivers */,
+      false /* cleanup */,
+      core::PartitionedOutputNode::Kind::kPartitioned);
+  EXPECT_TRUE(callbackCalled);
+  EXPECT_TRUE(canUseIntraNode);
+
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    intraNodeEligibilityWaitsForBroadcastInitialization) {
+  const std::string taskId = "intraNodeEligibilityBroadcast";
+  queueManager_->removeTask(taskId);
+
+  bool callbackCalled = false;
+  bool canUseIntraNode = true;
+  queueManager_->whenIntraNodeEligibilityKnown(taskId, [&](bool enabled) {
+    callbackCalled = true;
+    canUseIntraNode = enabled;
+  });
+
+  EXPECT_FALSE(callbackCalled);
+  initializeTask(
+      taskId,
+      2 /* numDestinations */,
+      1 /* numDrivers */,
+      false /* cleanup */,
+      core::PartitionedOutputNode::Kind::kBroadcast);
+  EXPECT_TRUE(callbackCalled);
+  EXPECT_FALSE(canUseIntraNode);
+
+  queueManager_->removeTask(taskId);
+}

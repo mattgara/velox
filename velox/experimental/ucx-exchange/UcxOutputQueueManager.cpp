@@ -40,6 +40,7 @@ void UcxOutputQueueManager::initializeTask(
     int numDrivers,
     const std::string& /*transportOptions*/) {
   const auto& taskId = task->taskId();
+  std::vector<IntraNodeEligibilityCallback> eligibilityWaiters;
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskId);
     if (it == queues.end()) {
@@ -52,13 +53,26 @@ void UcxOutputQueueManager::initializeTask(
             taskId);
       }
     }
+
+    auto waiters = intraNodeEligibilityWaiters_.find(taskId);
+    if (waiters != intraNodeEligibilityWaiters_.end()) {
+      eligibilityWaiters = std::move(waiters->second);
+      intraNodeEligibilityWaiters_.erase(waiters);
+    }
   });
+
   // Clear any stale "removed" state so that getData() calls after this
   // initializeTask() create proper placeholder queues if needed.
   removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
   // Clear any stale "cancelled" state in the intra-node registry so
   // that the cancelledTasks_ set doesn't grow unboundedly across queries.
   IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
+
+  const bool canUseIntraNode =
+      kind != core::PartitionedOutputNode::Kind::kBroadcast;
+  for (auto& waiter : eligibilityWaiters) {
+    waiter(canUseIntraNode);
+  }
 }
 
 bool UcxOutputQueueManager::updateOutputBuffers(
@@ -151,10 +165,42 @@ bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
       queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
 }
 
+void UcxOutputQueueManager::whenIntraNodeEligibilityKnown(
+    std::string_view taskId,
+    IntraNodeEligibilityCallback callback) {
+  VELOX_CHECK(
+      static_cast<bool>(callback),
+      "Intra-node eligibility callback must be set");
+
+  const std::string taskIdStr{taskId};
+  bool eligibilityKnown = false;
+  bool canUseIntraNode = false;
+  queues_.withLock([&](auto& queues) {
+    auto it = queues.find(taskIdStr);
+    if (it != queues.end() && it->second->isInitialized()) {
+      eligibilityKnown = true;
+      canUseIntraNode =
+          it->second->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+      return;
+    }
+    intraNodeEligibilityWaiters_[taskIdStr].push_back(std::move(callback));
+  });
+
+  if (eligibilityKnown) {
+    callback(canUseIntraNode);
+  }
+}
+
 void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   std::string taskIdStr{taskId};
+  std::vector<IntraNodeEligibilityCallback> eligibilityWaiters;
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
+        auto waiters = intraNodeEligibilityWaiters_.find(taskIdStr);
+        if (waiters != intraNodeEligibilityWaiters_.end()) {
+          eligibilityWaiters = std::move(waiters->second);
+          intraNodeEligibilityWaiters_.erase(waiters);
+        }
         auto it = queues.find(taskIdStr);
         if (it == queues.end()) {
           // Already removed. Clear any stale "removed" state so the task ID
@@ -172,6 +218,9 @@ void UcxOutputQueueManager::removeTask(const std::string& taskId) {
             [&](auto& removed) { removed.insert(taskIdStr); });
         return taskQueue;
       });
+  for (auto& waiter : eligibilityWaiters) {
+    waiter(false);
+  }
   VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
           << " queueExists=" << (queue != nullptr);
   if (queue != nullptr) {

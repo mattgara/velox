@@ -243,7 +243,7 @@ struct UcxExchangeServer::SharedCompressionWork {
 
 void UcxExchangeServer::setState(ServerState newState) {
   auto oldState = state_.exchange(newState, std::memory_order_seq_cst);
-  VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
+  VLOG(2) << (isIntraNodeTransfer() ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_ << "] "
           << toName(oldState) << " -> " << toName(newState);
 }
@@ -253,19 +253,13 @@ UcxExchangeServer::UcxExchangeServer(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
     const PartitionKey& key,
-    bool isIntraNodeTransfer)
+    bool intraNodeCandidate)
     : CommElement(communicator, endpointRef),
       partitionKey_(key),
       partitionKeyHash_(fnv1a_32(partitionKey_.toString())),
-      isIntraNodeTransfer_(isIntraNodeTransfer),
+      intraNodeCandidate_(intraNodeCandidate),
       queueMgr_(UcxOutputQueueManager::getInstanceRef()) {
   setState(ServerState::Created);
-
-  if (isIntraNodeTransfer_) {
-    VLOG(3) << "@" << partitionKey_.taskId
-            << " Detected same-node source (intra-node transfer) for "
-            << partitionKey_.toString();
-  }
 }
 
 // static
@@ -273,10 +267,48 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::create(
     const std::shared_ptr<Communicator> communicator,
     std::shared_ptr<EndpointRef> endpointRef,
     const PartitionKey& key,
-    bool isIntraNodeTransfer) {
+    bool intraNodeCandidate) {
   auto ptr = std::shared_ptr<UcxExchangeServer>(new UcxExchangeServer(
-      communicator, endpointRef, key, isIntraNodeTransfer));
+      communicator, endpointRef, key, intraNodeCandidate));
   return ptr;
+}
+
+void UcxExchangeServer::resolveIntraNodeRoute(bool taskCanUseIntraNode) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  isIntraNodeTransfer_.store(
+      intraNodeCandidate_ && taskCanUseIntraNode, std::memory_order_release);
+  intraNodeRouteResolved_.store(true, std::memory_order_release);
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeServer::sendHandshakeResponse() {
+  auto response = std::make_shared<HandshakeResponse>();
+  response->isIntraNodeTransfer = isIntraNodeTransfer();
+  const uint64_t responseTag = getHandshakeResponseTag(partitionKeyHash_);
+
+  VLOG(2) << "[HANDSHAKE-ROUTE] task=" << partitionKey_.taskId
+          << " destination=" << partitionKey_.destination
+          << " intraNodeCandidate=" << intraNodeCandidate_
+          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer;
+
+  endpointRef_->endpoint_->tagSend(
+      response.get(),
+      sizeof(*response),
+      ucxx::Tag{responseTag},
+      false,
+      [response, keyStr = partitionKey_.toString()](
+          ucs_status_t status, std::shared_ptr<void> /*arg*/) {
+        if (status == UCS_OK) {
+          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr;
+        } else {
+          VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
+                  << ucs_status_string(status);
+        }
+      },
+      response);
 }
 
 void UcxExchangeServer::process() {
@@ -286,6 +318,13 @@ void UcxExchangeServer::process() {
   }
   switch (state_) {
     case ServerState::Created:
+      // A same-process source may connect before initializeTask() publishes
+      // whether the output is partitioned or broadcast. Stay dormant until
+      // the queue manager resolves that mode, then send one definitive route.
+      if (!intraNodeRouteResolved_.load(std::memory_order_acquire)) {
+        break;
+      }
+      sendHandshakeResponse();
       setState(ServerState::ReadyToTransfer);
       communicator_->addToWorkQueue(getSelfPtr());
       break;
@@ -514,7 +553,7 @@ UcxExchangeServer::acquireSharedCompressionWork(
 }
 
 bool UcxExchangeServer::shouldPipelineCompression() {
-  if (!codecPipelineEnabled() || isIntraNodeTransfer_ || !dataPtr_ ||
+  if (!codecPipelineEnabled() || isIntraNodeTransfer() || !dataPtr_ ||
       !dataPtr_->gpu_data || dataPtr_->gpu_data->size() == 0 ||
       !meetsCompressionMinimum(dataPtr_->gpu_data->size())) {
     return false;
@@ -692,14 +731,14 @@ void UcxExchangeServer::onCompressionComplete(
 void UcxExchangeServer::sendData() {
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
-  VLOG(2) << (isIntraNodeTransfer_ ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
+  VLOG(2) << (isIntraNodeTransfer() ? "[INTRA]" : "[REMOTE]") << " [ExSrv "
           << partitionKey_.toString() << " seq=" << sequenceNumber_
           << "] sendData hasData=" << (dataPtr_ != nullptr)
           << (dataPtr_ && dataPtr_->gpu_data
                   ? " size=" + std::to_string(dataPtr_->gpu_data->size())
                   : "");
 
-  if (isIntraNodeTransfer_) {
+  if (isIntraNodeTransfer()) {
     // INTRA-NODE TRANSFER PATH: Use registry for all communication, no UCXX
     // needed
     sendStart_ = std::chrono::high_resolution_clock::now();
