@@ -81,7 +81,7 @@ class UcxExchangeServer
 
   /// Resolves the route after the producer task's output kind is known.
   /// Safe to call from the task initialization thread.
-  void resolveIntraNodeRoute(bool taskCanUseIntraNode);
+  void resolveIntraNodeRoute(bool taskCanUseIntraNode, bool copyIntraNodeData);
 
   /// @brief Returns true if this server uses the in-process data registry.
   bool isIntraNodeTransfer() const {
@@ -173,6 +173,10 @@ class UcxExchangeServer
   /// Final route. When true, data is passed via IntraNodeTransferRegistry
   /// instead of UCXX.
   std::atomic<bool> isIntraNodeTransfer_{false};
+
+  /// True when each in-process consumer must take a D2D copy because the
+  /// registry payload is shared by multiple broadcast destinations.
+  std::atomic<bool> copyIntraNodeData_{false};
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};

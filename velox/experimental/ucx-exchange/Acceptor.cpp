@@ -80,13 +80,15 @@ void Acceptor::cStyleAMCallback(
   if (intraNodeCandidate) {
     std::weak_ptr<UcxExchangeServer> weakServer = exchangeServer;
     UcxOutputQueueManager::getInstanceRef()->whenIntraNodeEligibilityKnown(
-        key.taskId, [weakServer](bool taskCanUseIntraNode) {
+        key.taskId,
+        [weakServer](bool taskCanUseIntraNode, bool copyIntraNodeData) {
           if (auto server = weakServer.lock()) {
-            server->resolveIntraNodeRoute(taskCanUseIntraNode);
+            server->resolveIntraNodeRoute(
+                taskCanUseIntraNode, copyIntraNodeData);
           }
         });
   } else {
-    exchangeServer->resolveIntraNodeRoute(false);
+    exchangeServer->resolveIntraNodeRoute(false, false);
   }
 }
 

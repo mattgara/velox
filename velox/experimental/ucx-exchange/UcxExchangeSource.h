@@ -294,6 +294,10 @@ class UcxExchangeSource
   /// When true, intra-node transfer optimizations bypass UCXX transfers.
   bool isIntraNodeTransfer_{false};
 
+  /// True for shared broadcast payloads, which cannot be destructively moved
+  /// into one consumer and therefore require a per-consumer D2D copy.
+  bool copyIntraNodeData_{false};
+
   // Backpressure: when queue exceeds kBackpressureHighWaterMark, the source
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.

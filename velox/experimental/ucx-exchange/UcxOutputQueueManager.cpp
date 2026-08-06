@@ -68,10 +68,10 @@ void UcxOutputQueueManager::initializeTask(
   // that the cancelledTasks_ set doesn't grow unboundedly across queries.
   IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
 
-  const bool canUseIntraNode =
-      kind != core::PartitionedOutputNode::Kind::kBroadcast;
+  const bool copyIntraNodeData =
+      kind == core::PartitionedOutputNode::Kind::kBroadcast;
   for (auto& waiter : eligibilityWaiters) {
-    waiter(canUseIntraNode);
+    waiter(true, copyIntraNodeData);
   }
 }
 
@@ -161,8 +161,7 @@ void UcxOutputQueueManager::getData(
 
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
   auto queue = getQueueIfExists(taskId);
-  return queue && queue->isInitialized() &&
-      queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+  return queue && queue->isInitialized();
 }
 
 void UcxOutputQueueManager::whenIntraNodeEligibilityKnown(
@@ -174,20 +173,22 @@ void UcxOutputQueueManager::whenIntraNodeEligibilityKnown(
 
   const std::string taskIdStr{taskId};
   bool eligibilityKnown = false;
+  bool copyIntraNodeData = false;
   bool canUseIntraNode = false;
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskIdStr);
     if (it != queues.end() && it->second->isInitialized()) {
       eligibilityKnown = true;
-      canUseIntraNode =
-          it->second->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+      canUseIntraNode = true;
+      copyIntraNodeData =
+          it->second->kind() == core::PartitionedOutputNode::Kind::kBroadcast;
       return;
     }
     intraNodeEligibilityWaiters_[taskIdStr].push_back(std::move(callback));
   });
 
   if (eligibilityKnown) {
-    callback(canUseIntraNode);
+    callback(canUseIntraNode, copyIntraNodeData);
   }
 }
 
@@ -219,7 +220,7 @@ void UcxOutputQueueManager::removeTask(const std::string& taskId) {
         return taskQueue;
       });
   for (auto& waiter : eligibilityWaiters) {
-    waiter(false);
+    waiter(false, false);
   }
   VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
           << " queueExists=" << (queue != nullptr);

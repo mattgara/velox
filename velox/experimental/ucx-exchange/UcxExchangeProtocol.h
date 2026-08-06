@@ -88,9 +88,14 @@ struct HandshakeResponse {
   /// True if server and source are on the same node (same Communicator).
   /// When true, source should use IntraNodeTransferRegistry instead of UCXX.
   bool isIntraNodeTransfer{false};
+  /// True when the shared registry payload must be copied rather than moved.
+  /// Broadcast destinations share one payload; partitioned destinations do not.
+  bool copyIntraNodeData{false};
   /// Padding for alignment
-  uint8_t padding[7]{};
+  uint8_t padding[6]{};
 };
+
+static_assert(sizeof(HandshakeResponse) == 8);
 
 constexpr uint32_t kMagicNumber = 0x12345678;
 /// Maximum metadata buffer size for receiving. This should be large enough

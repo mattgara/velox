@@ -273,13 +273,16 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::create(
   return ptr;
 }
 
-void UcxExchangeServer::resolveIntraNodeRoute(bool taskCanUseIntraNode) {
+void UcxExchangeServer::resolveIntraNodeRoute(
+    bool taskCanUseIntraNode, bool copyIntraNodeData) {
   if (closed_.load(std::memory_order_acquire)) {
     return;
   }
 
-  isIntraNodeTransfer_.store(
-      intraNodeCandidate_ && taskCanUseIntraNode, std::memory_order_release);
+  const bool useIntraNode = intraNodeCandidate_ && taskCanUseIntraNode;
+  isIntraNodeTransfer_.store(useIntraNode, std::memory_order_release);
+  copyIntraNodeData_.store(
+      useIntraNode && copyIntraNodeData, std::memory_order_release);
   intraNodeRouteResolved_.store(true, std::memory_order_release);
   communicator_->addToWorkQueue(getSelfPtr());
 }
@@ -287,12 +290,15 @@ void UcxExchangeServer::resolveIntraNodeRoute(bool taskCanUseIntraNode) {
 void UcxExchangeServer::sendHandshakeResponse() {
   auto response = std::make_shared<HandshakeResponse>();
   response->isIntraNodeTransfer = isIntraNodeTransfer();
+  response->copyIntraNodeData =
+      copyIntraNodeData_.load(std::memory_order_acquire);
   const uint64_t responseTag = getHandshakeResponseTag(partitionKeyHash_);
 
   VLOG(2) << "[HANDSHAKE-ROUTE] task=" << partitionKey_.taskId
           << " destination=" << partitionKey_.destination
           << " intraNodeCandidate=" << intraNodeCandidate_
-          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer;
+          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
+          << " copyIntraNodeData=" << response->copyIntraNodeData;
 
   endpointRef_->endpoint_->tagSend(
       response.get(),

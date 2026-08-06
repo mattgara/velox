@@ -679,10 +679,13 @@ TEST_F(
 
   bool callbackCalled = false;
   bool canUseIntraNode = false;
-  queueManager_->whenIntraNodeEligibilityKnown(taskId, [&](bool enabled) {
-    callbackCalled = true;
-    canUseIntraNode = enabled;
-  });
+  bool copyIntraNodeData = true;
+  queueManager_->whenIntraNodeEligibilityKnown(
+      taskId, [&](bool enabled, bool copyData) {
+        callbackCalled = true;
+        canUseIntraNode = enabled;
+        copyIntraNodeData = copyData;
+      });
 
   EXPECT_FALSE(callbackCalled);
   initializeTask(
@@ -693,22 +696,26 @@ TEST_F(
       core::PartitionedOutputNode::Kind::kPartitioned);
   EXPECT_TRUE(callbackCalled);
   EXPECT_TRUE(canUseIntraNode);
+  EXPECT_FALSE(copyIntraNodeData);
 
   queueManager_->removeTask(taskId);
 }
 
 TEST_F(
     UcxOutputQueueManagerTest,
-    intraNodeEligibilityWaitsForBroadcastInitialization) {
+    intraNodeEligibilityAllowsBroadcastAfterInitialization) {
   const std::string taskId = "intraNodeEligibilityBroadcast";
   queueManager_->removeTask(taskId);
 
   bool callbackCalled = false;
-  bool canUseIntraNode = true;
-  queueManager_->whenIntraNodeEligibilityKnown(taskId, [&](bool enabled) {
-    callbackCalled = true;
-    canUseIntraNode = enabled;
-  });
+  bool canUseIntraNode = false;
+  bool copyIntraNodeData = false;
+  queueManager_->whenIntraNodeEligibilityKnown(
+      taskId, [&](bool enabled, bool copyData) {
+        callbackCalled = true;
+        canUseIntraNode = enabled;
+        copyIntraNodeData = copyData;
+      });
 
   EXPECT_FALSE(callbackCalled);
   initializeTask(
@@ -718,7 +725,8 @@ TEST_F(
       false /* cleanup */,
       core::PartitionedOutputNode::Kind::kBroadcast);
   EXPECT_TRUE(callbackCalled);
-  EXPECT_FALSE(canUseIntraNode);
+  EXPECT_TRUE(canUseIntraNode);
+  EXPECT_TRUE(copyIntraNodeData);
 
   queueManager_->removeTask(taskId);
 }

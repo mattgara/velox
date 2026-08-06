@@ -17,6 +17,7 @@
 #include <thread>
 
 #include <cudf/contiguous_split.hpp>
+#include <cudf/utilities/error.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/CudfConfig.h"
@@ -848,9 +849,11 @@ void UcxExchangeSource::onHandshakeResponse(
       std::static_pointer_cast<HandshakeResponse>(arg);
 
   isIntraNodeTransfer_ = response->isIntraNodeTransfer;
+  copyIntraNodeData_ = response->copyIntraNodeData;
 
   VLOG(3) << toString() << " + onHandshakeResponse isIntraNodeTransfer="
-          << isIntraNodeTransfer_;
+          << isIntraNodeTransfer_
+          << " copyIntraNodeData=" << copyIntraNodeData_;
 
   setStateIf(
       ReceiverState::WaitingForHandshakeResponse,
@@ -930,22 +933,45 @@ void UcxExchangeSource::onIntraNodeData(
   metrics_.numPackedColumns_.addValue(1);
   metrics_.totalBytes_.addValue(data->gpu_data->size());
 
-  // Convert packed_columns to PackedTableWithStream for the queue.
-  // Create packed_columns from the shared data.
-  cudf::packed_columns packedCols(
-      std::move(data->metadata), std::move(data->gpu_data));
+  // Partitioned output has one consumer, so retain the existing zero-copy move.
+  // Broadcast destinations share one packed_columns object; clone its small
+  // host metadata and copy its device payload directly on the consumer stream.
+  // This replaces UCX's same-process D2H+H2D staging with one D2D copy without
+  // changing the existing packed-table/CudfVector ownership model.
+  auto stream =
+      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+  std::unique_ptr<std::vector<uint8_t>> metadata;
+  std::unique_ptr<rmm::device_buffer> gpuData;
+  if (copyIntraNodeData_) {
+    metadata = std::make_unique<std::vector<uint8_t>>(*data->metadata);
+    gpuData = std::make_unique<rmm::device_buffer>(
+        data->gpu_data->size(),
+        stream,
+        cudf::get_current_device_resource_ref());
+    if (data->gpu_data->size() > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          gpuData->data(),
+          data->gpu_data->data(),
+          data->gpu_data->size(),
+          cudaMemcpyDeviceToDevice,
+          stream.value()));
+    }
+    VLOG(2) << toString() << " Intra-node D2D copy for seq=" << sequenceNumber_
+            << " size=" << data->gpu_data->size();
+  } else {
+    metadata = std::move(data->metadata);
+    gpuData = std::move(data->gpu_data);
+    VLOG(2) << toString() << " Intra-node zero-copy move for seq="
+            << sequenceNumber_ << " size=" << gpuData->size();
+  }
+
+  cudf::packed_columns packedCols(std::move(metadata), std::move(gpuData));
 
   // Unpack to get the table_view and create a packed_table
   cudf::table_view tableView = cudf::unpack(packedCols);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedCols)});
 
-  // Get a stream from the pool so downstream cuDF operations on this data
-  // run on a dedicated stream, not the default stream. The producer already
-  // synchronized before enqueuing, so the GPU data is ready. This matches
-  // the inter-node (UCX) receive path which also allocates a pool stream.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
   auto tableWithStream =
       std::make_unique<PackedTableWithStream>(std::move(packedTable), stream);
 

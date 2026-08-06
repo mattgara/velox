@@ -106,22 +106,22 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
       UcxDataAvailableCallback notify);
 
   /// Returns true if the given task can use intra-node transfer.
-  /// Returns false if the task is not yet initialized (placeholder queue
-  /// from early sink connections) or if the task uses broadcast mode
-  /// (broadcast shares packed_columns across destinations — the intra-node
-  /// source's destructive move would corrupt data for other servers).
+  /// Returns false if the task is not yet initialized (placeholder queue from
+  /// early sink connections).
   bool canUseIntraNode(std::string_view taskId);
 
   /// Invokes 'callback' once task initialization has published the final
-  /// output kind. The callback receives true for non-broadcast queues and
-  /// false for broadcast or removed tasks. If initialization has already
-  /// completed, the callback is invoked synchronously.
+  /// output kind. The callback receives whether intra-node transfer is enabled
+  /// and whether each consumer must copy the shared payload. Broadcast output
+  /// requires a copy; partitioned output retains its zero-copy move. A removed
+  /// task receives (false, false). If initialization has already completed,
+  /// the callback is invoked synchronously.
   ///
   /// This closes the handshake race where a same-process exchange source can
   /// connect before initializeTask(): callers must wait for the final output
   /// kind instead of permanently treating an uninitialized placeholder as a
   /// remote UCX transfer.
-  using IntraNodeEligibilityCallback = std::function<void(bool)>;
+  using IntraNodeEligibilityCallback = std::function<void(bool, bool)>;
   void whenIntraNodeEligibilityKnown(
       std::string_view taskId,
       IntraNodeEligibilityCallback callback);
