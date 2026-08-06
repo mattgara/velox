@@ -935,11 +935,14 @@ void UcxExchangeSource::onIntraNodeData(
 
   // Partitioned output has one consumer, so retain the existing zero-copy move.
   // Broadcast destinations share one packed_columns object; clone its small
-  // host metadata and copy its device payload directly on the consumer stream.
+  // host metadata and copy its payload directly on its allocation stream.
   // This replaces UCX's same-process D2H+H2D staging with one D2D copy without
   // changing the existing packed-table/CudfVector ownership model.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+  // Keep all intra-process work on the packed buffer's allocation stream.
+  // Using an unrelated pool stream can let the source be deallocated while a
+  // broadcast D2D copy is still reading it, and associates partitioned
+  // zero-copy data with the wrong stream for downstream work.
+  auto stream = data->gpu_data->stream();
   std::unique_ptr<std::vector<uint8_t>> metadata;
   std::unique_ptr<rmm::device_buffer> gpuData;
   if (copyIntraNodeData_) {
