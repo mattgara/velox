@@ -16,6 +16,7 @@
 #pragma once
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "velox/core/PlanNode.h"
@@ -48,6 +49,16 @@ struct PlanFragment {
 
   /// Contains leaf plan nodes that need to be executed in the grouped mode.
   std::unordered_set<PlanNodeId> groupedExecutionLeafNodeIds;
+
+  /// Physical transport for each Exchange input. Unannotated exchanges use
+  /// the standard in-memory/HTTP path.
+  std::unordered_map<PlanNodeId, std::string> inputTransportTypes;
+
+  std::string_view inputTransportType(const PlanNodeId& planNodeId) const {
+    const auto it = inputTransportTypes.find(planNodeId);
+    return it == inputTransportTypes.end() ? TransportKind::kHttp
+                                           : std::string_view{it->second};
+  }
 
   /// Identifies this task among all tasks running the same query stage.
   /// Supplied by the consumer at task creation time. AssignUniqueId packs it
