@@ -431,9 +431,9 @@ function install_hdfs_deps {
   # Dependencies for Hadoop testing
   wget_and_untar https://dlcdn.apache.org/hadoop/common/hadoop-"${HADOOP_VERSION}"/hadoop-"${HADOOP_VERSION}".tar.gz hadoop
   cp -a "${DEPENDENCY_DIR}"/hadoop "$INSTALL_PREFIX"
-  wget "${WGET_OPTS[@]}" -P "$INSTALL_PREFIX"/hadoop/share/hadoop/common/lib/ https://repo1.maven.org/maven2/junit/junit/4.11/junit-4.11.jar
+  wget "${WGET_OPTS[@]}" -P "$INSTALL_PREFIX"/hadoop/share/hadoop/common/lib/ https://maven.aliyun.com/repository/central/junit/junit/4.11/junit-4.11.jar
   # Needed for HADOOP 3.3.6 minicluster. Can remove after updating to 3.4.2.
-  wget "${WGET_OPTS[@]}" -P "$INSTALL_PREFIX"/hadoop/share/hadoop/mapreduce/ https://repo1.maven.org/maven2/org/mockito/mockito-core/2.23.4/mockito-core-2.23.4.jar
+  wget "${WGET_OPTS[@]}" -P "$INSTALL_PREFIX"/hadoop/share/hadoop/mapreduce/ https://maven.aliyun.com/repository/central/org/mockito/mockito-core/2.23.4/mockito-core-2.23.4.jar
 }
 
 function install_uv {
