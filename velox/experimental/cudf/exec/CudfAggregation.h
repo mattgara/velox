@@ -61,6 +61,9 @@ struct ResolvedAggregateInfo {
   uint32_t inputIndex;
   VectorPtr constant;
   TypePtr resultType;
+  // Original raw input type remains available on intermediate/final steps and
+  // carries decimal precision that is absent from a cuDF column_view.
+  TypePtr rawInputType;
   std::optional<CountInputKind> countInputKind;
   // True if the aggregate was declared on a decimal raw input in the plan.
   // Routing keys off the function family, not the physical batch type (which is

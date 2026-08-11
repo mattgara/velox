@@ -49,7 +49,19 @@ struct CudfConfig {
       "cudf.batch_size_max_threshold"};
   static constexpr const char* kCudfConcatOptimizationEnabled{
       "cudf.concat_optimization_enabled"};
+  static constexpr const char* kCudfDeferFinalDecimalSumAggregation{
+      "cudf.defer_final_decimal_sum_aggregation"};
+  static constexpr const char* kCudfDecimalGroupbyNarrowAccumulation{
+      "cudf.decimal_groupby_narrow_accumulation"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
+  static constexpr const char* kUcxExchange{"cudf.exchange"};
+  static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
+  static constexpr const char* kUcxIntraNodeExchange{
+      "cudf.intra_node_exchange"};
+  static constexpr const char* kUcxxBlockingPolling{"ucxx.blocking_polling"};
+  static constexpr const char* kUcxExchangeLogLevel{"cudf.exchange_log_level"};
+  static constexpr const char* kUcxPartitionedOutputBatchRows{
+      "cudf.partitioned_output_batch_rows"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -70,12 +82,34 @@ struct CudfConfig {
   /// Allow fallback to CPU operators if GPU operator replacement fails.
   bool allowCpuFallback{true};
 
+  /// Enable GPU exchange operators (UcxExchange / UcxPartitionedOutput).
+  bool exchange{false};
+
+  /// Whether to enable error handling in UCXX endpoints.
+  bool ucxxErrorHandling{true};
+
+  /// Whether intra-node exchange optimization is enabled.
+  bool intraNodeExchange{false};
+
+  /// Whether to use blocking polling in UCXX.
+  bool ucxxBlockingPolling{true};
+
+  /// VLOG level for ucx-exchange source files.
+  int32_t exchangeLogLevel{0};
+
+  /// Minimum number of rows to accumulate in UCX partitioned output before
+  /// flushing. Small inputs are buffered and concatenated when this threshold
+  /// is reached, avoiding pathologically small exchange chunks. Set to 0 to
+  /// disable accumulation.
+  int64_t partitionedOutputBatchRows{10'000};
+
   /// Memory resource for cuDF.
-  /// Possible values are (cuda, pool, async, arena, managed, managed_pool).
+  /// Possible values are (cuda, pool, async, async_preallocated, arena,
+  /// managed, managed_pool).
   std::string memoryResource{"async"};
 
-  /// The initial percent of GPU memory to allocate for pool or arena memory
-  /// resources.
+  /// The initial percent of GPU memory to allocate for pool, arena, or
+  /// async_preallocated memory resources.
   int32_t memoryPercent{50};
 
   /// Memory resource for output vectors. When set to a value different from
@@ -115,6 +149,16 @@ struct CudfConfig {
   /// This batch size is determined by batchSizeMinThreshold and
   /// batchSizeMaxThreshold
   bool concatOptimizationEnabled{false};
+
+  /// Buffer partial decimal SUM states and perform final aggregation once at
+  /// end of input. This avoids repeatedly hashing a growing final-groupby
+  /// table, but can retain substantial device memory, so it is opt-in until a
+  /// bounded compaction policy is available.
+  bool deferFinalDecimalSumAggregation{false};
+
+  /// Allow raw DECIMAL64 groupby SUM/AVG requests to accumulate in 64 bits
+  /// when a conservative batch bound proves that no group can overflow.
+  bool decimalGroupbyNarrowAccumulation{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

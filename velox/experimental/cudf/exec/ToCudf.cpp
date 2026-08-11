@@ -33,6 +33,7 @@
 
 #include "folly/Conv.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/Values.h"
 
@@ -176,7 +177,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     bool isPureCpuOperator = true;
 
     if (adapter) {
-      keepOperator = adapter->keepOperator();
+      keepOperator = adapter->keepOperator(oper, planNode, ctx);
       if (keepOperator == 0) {
         if (planNode && thisOpProps.canRunOnGPU) {
           auto replacements =
@@ -227,12 +228,19 @@ bool CompileState::compile(bool allowCpuFallback) {
               << "] = " << thisOpProps.producesGpuOutput
               << ", planNode = " << bool(planNode);
     }
+    // LocalMerge coordinates CPU CallbackSink pipelines. Preserve the exact
+    // unsupported-operator properties that establish the GPU/CPU boundaries,
+    // but treat this known CPU boundary as intentional rather than fallback.
+    const bool isIntentionalCpuBoundary =
+        dynamic_cast<const exec::LocalMerge*>(oper) != nullptr;
     if (!allowCpuFallback) {
       // condition is if GPU replacement success or if CPU operators itself is
       // GPU compatible. or if specific CPU operator is allowed even when
       // fallback is disabled.
-      VELOX_CHECK(!isPureCpuOperator, "Replacement with cuDF operator failed");
-    } else if (isPureCpuOperator) {
+      VELOX_CHECK(
+          !isPureCpuOperator || isIntentionalCpuBoundary,
+          "Replacement with cuDF operator failed");
+    } else if (isPureCpuOperator && !isIntentionalCpuBoundary) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
       LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
@@ -397,6 +405,14 @@ void CudfConfig::initialize(
     concatOptimizationEnabled =
         folly::to<bool>(config[kCudfConcatOptimizationEnabled]);
   }
+  if (config.find(kCudfDeferFinalDecimalSumAggregation) != config.end()) {
+    deferFinalDecimalSumAggregation =
+        folly::to<bool>(config[kCudfDeferFinalDecimalSumAggregation]);
+  }
+  if (config.find(kCudfDecimalGroupbyNarrowAccumulation) != config.end()) {
+    decimalGroupbyNarrowAccumulation =
+        folly::to<bool>(config[kCudfDecimalGroupbyNarrowAccumulation]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }
@@ -412,6 +428,25 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfAllowCpuFallback) != config.end()) {
     allowCpuFallback = folly::to<bool>(config[kCudfAllowCpuFallback]);
+  }
+  if (config.find(kUcxExchange) != config.end()) {
+    exchange = folly::to<bool>(config[kUcxExchange]);
+  }
+  if (config.find(kUcxxErrorHandling) != config.end()) {
+    ucxxErrorHandling = folly::to<bool>(config[kUcxxErrorHandling]);
+  }
+  if (config.find(kUcxIntraNodeExchange) != config.end()) {
+    intraNodeExchange = folly::to<bool>(config[kUcxIntraNodeExchange]);
+  }
+  if (config.find(kUcxxBlockingPolling) != config.end()) {
+    ucxxBlockingPolling = folly::to<bool>(config[kUcxxBlockingPolling]);
+  }
+  if (config.find(kUcxExchangeLogLevel) != config.end()) {
+    exchangeLogLevel = folly::to<int32_t>(config[kUcxExchangeLogLevel]);
+  }
+  if (config.find(kUcxPartitionedOutputBatchRows) != config.end()) {
+    partitionedOutputBatchRows =
+        folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);

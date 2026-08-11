@@ -1498,13 +1498,13 @@ Note: These configurations are experimental and subject to change.
    * - cudf.memory_resource
      - string
      - async
-     - The memory resource to use for cuDF. Possible values are (cuda, pool, async, arena, managed, managed_pool, prefetch_managed, prefetch_managed_pool).
+     - The memory resource to use for cuDF. Possible values are (cuda, pool, async, async_preallocated, arena, managed, managed_pool, prefetch_managed, prefetch_managed_pool).
        The prefetch options enable automatic prefetching for better GPU memory performance: prefetch_managed uses CUDA unified memory with prefetching,
        prefetch_managed_pool uses a pooled version of CUDA unified memory with prefetching.
    * - cudf.memory_percent
      - integer
      - 50
-     - The initial percent of GPU memory to allocate for pool or arena memory resources.
+     - The initial percent of GPU memory to allocate for pool, arena, or async_preallocated memory resources.
    * - cudf.function_name_prefix
      - string
      - ""

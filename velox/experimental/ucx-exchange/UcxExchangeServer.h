@@ -17,6 +17,7 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <folly/Synchronized.h>
+#include <rmm/device_buffer.hpp>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
@@ -25,7 +26,8 @@
 #include <future>
 #include <memory>
 #include <tuple>
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
+#include "velox/common/EnumDefine.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
@@ -53,13 +55,14 @@ class UcxExchangeServer
   /// @param communicator The Communicator instance.
   /// @param endpointRef The endpoint reference for UCXX communication.
   /// @param key The partition key identifying the data to serve.
-  /// @param isIntraNodeTransfer True if the source is on the same node,
-  ///        determined by checking if the peer's IP is in the local IP set.
+  /// @param intraNodeCandidate True if the source is in this worker process.
+  ///        The final route is resolved after the producer task publishes its
+  ///        output kind.
   static std::shared_ptr<UcxExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
       const PartitionKey& key,
-      bool isIntraNodeTransfer);
+      bool intraNodeCandidate);
 
   void process() override;
 
@@ -71,9 +74,13 @@ class UcxExchangeServer
     return partitionKey_;
   }
 
-  /// @brief Returns true if this server detected same-node with the source.
+  /// Resolves the route after the producer task's output kind is known.
+  /// Safe to call from the task initialization thread.
+  void resolveIntraNodeRoute(bool taskCanUseIntraNode, bool copyIntraNodeData);
+
+  /// @brief Returns true if this server uses the in-process data registry.
   bool isIntraNodeTransfer() const {
-    return isIntraNodeTransfer_;
+    return isIntraNodeTransfer_.load(std::memory_order_acquire);
   }
 
  private:
@@ -81,7 +88,10 @@ class UcxExchangeServer
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
       const PartitionKey& key,
-      bool isIntraNodeTransfer);
+      bool intraNodeCandidate);
+
+  /// Sends the route selected after task initialization to the source.
+  void sendHandshakeResponse();
 
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
@@ -110,10 +120,21 @@ class UcxExchangeServer
   const uint32_t
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
-  /// True if server and source are on the same node (determined by checking
-  /// if peer's actual IP is in the local IP set). When true, data is passed
-  /// via IntraNodeTransferRegistry instead of UCXX transfer.
-  bool isIntraNodeTransfer_{false};
+  /// True when the handshake identified the source as belonging to this
+  /// exact worker process. The output kind is not necessarily known yet.
+  const bool intraNodeCandidate_{false};
+
+  /// Published by resolveIntraNodeRoute() before the communicator processes
+  /// the Created state and sends the handshake response.
+  std::atomic<bool> intraNodeRouteResolved_{false};
+
+  /// Final route. When true, data is passed via IntraNodeTransferRegistry
+  /// instead of UCXX.
+  std::atomic<bool> isIntraNodeTransfer_{false};
+
+  /// True when each in-process consumer must take a D2D copy because the
+  /// registry payload is shared by multiple broadcast destinations.
+  std::atomic<bool> copyIntraNodeData_{false};
 
   std::atomic<ServerState> state_;
   std::shared_ptr<cudf::packed_columns> dataPtr_{nullptr};

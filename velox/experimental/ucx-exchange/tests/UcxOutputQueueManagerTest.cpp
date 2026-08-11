@@ -47,7 +47,7 @@ class UcxOutputQueueManagerTest : public testing::Test {
   }
 
   std::shared_ptr<Task> initializeTask(
-      std::string_view taskId,
+      const std::string& taskId,
       int numDestinations,
       int numDrivers,
       bool cleanup = true,
@@ -226,6 +226,27 @@ class UcxOutputQueueManagerTest : public testing::Test {
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::shared_ptr<UcxOutputQueueManager> queueManager_;
 };
+
+TEST_F(UcxOutputQueueManagerTest, updateNumDrivers) {
+  const std::string taskId = "update-drivers";
+
+  EXPECT_FALSE(queueManager_->updateNumDrivers(taskId, 2));
+
+  auto task =
+      initializeTask(taskId, 1 /* numDestinations */, 1 /* numDrivers */);
+  EXPECT_TRUE(queueManager_->updateNumDrivers(taskId, 2));
+
+  bool receivedEndMarker = false;
+  registerForEndMarker(taskId, 0, receivedEndMarker);
+  noMoreData(taskId);
+  EXPECT_FALSE(receivedEndMarker);
+  noMoreData(taskId);
+  EXPECT_TRUE(receivedEndMarker);
+  deleteResults(taskId, 0);
+
+  queueManager_->removeTask(taskId);
+  EXPECT_TRUE(task->isFinished());
+}
 
 TEST_F(UcxOutputQueueManagerTest, basicPartitioned) {
   vector_size_t size = 100;
@@ -668,5 +689,65 @@ TEST_F(UcxOutputQueueManagerTest, broadcastEndMarkerToLateDestination) {
   fetchEndMarker(taskId, 1);
 
   EXPECT_TRUE(queueManager_->isFinished(taskId));
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    intraNodeEligibilityWaitsForPartitionedInitialization) {
+  const std::string taskId = "intraNodeEligibilityPartitioned";
+  queueManager_->removeTask(taskId);
+
+  bool callbackCalled = false;
+  bool canUseIntraNode = false;
+  bool copyIntraNodeData = true;
+  queueManager_->whenIntraNodeEligibilityKnown(
+      taskId, [&](bool enabled, bool copyData) {
+        callbackCalled = true;
+        canUseIntraNode = enabled;
+        copyIntraNodeData = copyData;
+      });
+
+  EXPECT_FALSE(callbackCalled);
+  initializeTask(
+      taskId,
+      2 /* numDestinations */,
+      1 /* numDrivers */,
+      false /* cleanup */,
+      core::PartitionedOutputNode::Kind::kPartitioned);
+  EXPECT_TRUE(callbackCalled);
+  EXPECT_TRUE(canUseIntraNode);
+  EXPECT_FALSE(copyIntraNodeData);
+
+  queueManager_->removeTask(taskId);
+}
+
+TEST_F(
+    UcxOutputQueueManagerTest,
+    intraNodeEligibilityAllowsBroadcastAfterInitialization) {
+  const std::string taskId = "intraNodeEligibilityBroadcast";
+  queueManager_->removeTask(taskId);
+
+  bool callbackCalled = false;
+  bool canUseIntraNode = false;
+  bool copyIntraNodeData = false;
+  queueManager_->whenIntraNodeEligibilityKnown(
+      taskId, [&](bool enabled, bool copyData) {
+        callbackCalled = true;
+        canUseIntraNode = enabled;
+        copyIntraNodeData = copyData;
+      });
+
+  EXPECT_FALSE(callbackCalled);
+  initializeTask(
+      taskId,
+      2 /* numDestinations */,
+      1 /* numDrivers */,
+      false /* cleanup */,
+      core::PartitionedOutputNode::Kind::kBroadcast);
+  EXPECT_TRUE(callbackCalled);
+  EXPECT_TRUE(canUseIntraNode);
+  EXPECT_TRUE(copyIntraNodeData);
+
   queueManager_->removeTask(taskId);
 }

@@ -38,7 +38,8 @@ class UcxPartitionedOutput : public exec::Operator,
       int32_t operatorId,
       exec::DriverCtx* ctx,
       const std::shared_ptr<const core::PartitionedOutputNode>& planNode,
-      bool eagerFlush);
+      const std::shared_ptr<UcxOutputQueueManager>& queueManager =
+          UcxOutputQueueManager::getInstanceRef());
 
   void addInput(RowVectorPtr input) override;
 

@@ -16,15 +16,18 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <velox/exec/OutputBufferManager.h>
 #include <velox/exec/Task.h>
 #include <functional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "velox/experimental/ucx-exchange/UcxQueues.h"
 
 namespace facebook::velox::ucx_exchange {
 
-class UcxOutputQueueManager {
+class UcxOutputQueueManager : public exec::OutputBufferManager {
  public:
   /// Factory method to retrieve a reference to the output queue manager.
   static std::shared_ptr<UcxOutputQueueManager> getInstanceRef();
@@ -48,15 +51,15 @@ class UcxOutputQueueManager {
       std::shared_ptr<exec::Task> task,
       core::PartitionedOutputNode::Kind kind,
       int numDestinations,
-      int numDrivers);
+      int numDrivers) override;
 
   /// @brief Updates the number of destination buffers for a task.
   /// For broadcast mode, new destinations are backfilled with previously
   /// broadcast data.
-  void updateOutputBuffers(
-      std::string_view taskId,
+  bool updateOutputBuffers(
+      const std::string& taskId,
       int numBuffers,
-      bool noMoreBuffers);
+      bool noMoreBuffers) override;
 
   /// @brief Enqueues a cudf packed column into the queue.
   /// @param taskId The unique task Id.
@@ -102,19 +105,43 @@ class UcxOutputQueueManager {
       UcxDataAvailableCallback notify);
 
   /// Returns true if the given task can use intra-node transfer.
-  /// Returns false if the task is not yet initialized (placeholder queue
-  /// from early sink connections) or if the task uses broadcast mode
-  /// (broadcast shares packed_columns across destinations — the intra-node
-  /// source's destructive move would corrupt data for other servers).
+  /// Returns false if the task is not yet initialized (placeholder queue from
+  /// early sink connections).
   bool canUseIntraNode(std::string_view taskId);
+
+  /// Invokes 'callback' once task initialization has published the final
+  /// output kind. The callback receives whether intra-node transfer is enabled
+  /// and whether each consumer must copy the shared payload. Broadcast output
+  /// requires a copy; partitioned output retains its zero-copy move. A removed
+  /// task receives (false, false). If initialization has already completed,
+  /// the callback is invoked synchronously.
+  ///
+  /// This closes the handshake race where a same-process exchange source can
+  /// connect before initializeTask(): callers must wait for the final output
+  /// kind instead of permanently treating an uninitialized placeholder as a
+  /// remote UCX transfer.
+  using IntraNodeEligibilityCallback = std::function<void(bool, bool)>;
+  void whenIntraNodeEligibilityKnown(
+      std::string_view taskId,
+      IntraNodeEligibilityCallback callback);
 
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.
-  void removeTask(std::string_view taskId);
+  void removeTask(const std::string& taskId) override;
 
   /// @brief Returns the queue statistics of the queue associated with the given
   /// task. Returns nullopt when the specified output queue doesn't exist.
-  std::optional<exec::OutputBuffer::Stats> stats(std::string_view taskId);
+  std::optional<exec::OutputBufferStats> stats(
+      const std::string& taskId) override;
+
+  bool updateNumDrivers(const std::string& taskId, uint32_t newNumDrivers)
+      override;
+
+  std::optional<double> getUtilization(const std::string& taskId) override;
+
+  std::optional<bool> isOverutilized(const std::string& taskId) override;
+
+  std::string toString(const std::string& taskId) override;
 
  private:
   // Retrieves the queue for a task if it exists.
@@ -128,6 +155,12 @@ class UcxOutputQueueManager {
       std::unordered_map<std::string, std::shared_ptr<UcxOutputQueue>>,
       std::mutex>
       queues_;
+
+  // Accessed only while holding queues_' mutex. Keeping the readiness waiters
+  // under the same lock as queues_ makes the check-and-subscribe operation
+  // atomic with initializeTask().
+  std::unordered_map<std::string, std::vector<IntraNodeEligibilityCallback>>
+      intraNodeEligibilityWaiters_;
 
   // Tasks that have been removed via removeTask(). Prevents getData() from
   // re-creating placeholder queues for tasks that are already dead, which

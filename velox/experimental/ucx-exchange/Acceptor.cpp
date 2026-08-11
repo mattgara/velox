@@ -59,27 +59,14 @@ void Acceptor::cStyleAMCallback(
   //
   // Previous approach used IP comparison (getLocalIpAddresses), which fails
   // when multiple Docker containers share the same host IP address.
-  bool isIntraNodeTransfer =
+  const bool intraNodeCandidate =
       cudf_velox::CudfConfig::getInstance().intraNodeExchange &&
       (handshakePtr->workerId == communicator->getWorkerId());
-
-  // Disable intra-node when the task is not yet initialized (placeholder
-  // queue from sinks connecting before initializeTask) or when the task
-  // uses broadcast mode (all destination servers share the same
-  // packed_columns — the intra-node source's destructive move would
-  // corrupt it for other servers).
-  if (isIntraNodeTransfer) {
-    if (!UcxOutputQueueManager::getInstanceRef()->canUseIntraNode(key.taskId)) {
-      VLOG(2) << "[ACCEPTOR] Disabling intra-node for task " << key.taskId
-              << " (not initialized or broadcast)";
-      isIntraNodeTransfer = false;
-    }
-  }
 
   std::string peerIp = epRef->getPeerIp();
 
   auto exchangeServer =
-      UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
+      UcxExchangeServer::create(communicator, epRef, key, intraNodeCandidate);
 
   // Add this exchangeServer to the endpoint reference.
   epRef->addCommElem(exchangeServer);
@@ -88,37 +75,21 @@ void Acceptor::cStyleAMCallback(
   communicator->registerCommElement(exchangeServer);
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
           << " peerIp=" << peerIp
-          << " isIntraNodeTransfer=" << isIntraNodeTransfer;
+          << " intraNodeCandidate=" << intraNodeCandidate;
 
-  // Send HandshakeResponse back to the source to inform about intra-node
-  // transfer. This allows the source to bypass UCXX for all subsequent data
-  // transfers.
-  auto response = std::make_shared<HandshakeResponse>();
-  response->isIntraNodeTransfer = exchangeServer->isIntraNodeTransfer();
-
-  uint32_t keyHash = fnv1a_32(key.toString());
-  uint64_t responseTag = getHandshakeResponseTag(keyHash);
-
-  VLOG(3) << "Sending HandshakeResponse to " << key.toString()
-          << " isIntraNodeTransfer=" << response->isIntraNodeTransfer
-          << " tag=" << std::hex << responseTag;
-
-  // Fire-and-forget: we don't need to track this request completion
-  epRef->endpoint_->tagSend(
-      response.get(),
-      sizeof(*response),
-      ucxx::Tag{responseTag},
-      false,
-      [response, keyStr = key.toString()](
-          ucs_status_t status, std::shared_ptr<void> arg) {
-        if (status == UCS_OK) {
-          VLOG(3) << "HandshakeResponse sent successfully to " << keyStr;
-        } else {
-          VLOG(0) << "Failed to send HandshakeResponse to " << keyStr << ": "
-                  << ucs_status_string(status);
-        }
-      },
-      response);
+  if (intraNodeCandidate) {
+    std::weak_ptr<UcxExchangeServer> weakServer = exchangeServer;
+    UcxOutputQueueManager::getInstanceRef()->whenIntraNodeEligibilityKnown(
+        key.taskId,
+        [weakServer](bool taskCanUseIntraNode, bool copyIntraNodeData) {
+          if (auto server = weakServer.lock()) {
+            server->resolveIntraNodeRoute(
+                taskCanUseIntraNode, copyIntraNodeData);
+          }
+        });
+  } else {
+    exchangeServer->resolveIntraNodeRoute(false, false);
+  }
 }
 
 // Add endpoint reference to ucp_cp -> epRef map.

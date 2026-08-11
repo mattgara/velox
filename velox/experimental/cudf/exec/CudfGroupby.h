@@ -20,7 +20,31 @@
 
 #include <cudf/groupby.hpp>
 
+#include <unordered_map>
+
 namespace facebook::velox::cudf_velox {
+
+// Per-table state shared while groupby aggregation requests are assembled.
+// Aggregate inputs may appear more than once (for example SUM(x), AVG(x));
+// keeping widened decimal inputs here avoids repeating an identical cast.
+struct GroupbyRequestContext {
+  std::unordered_map<const void*, std::unique_ptr<cudf::column>>
+      decimal128Inputs;
+  std::unordered_map<const void*, std::unique_ptr<cudf::column>>
+      decimal64Inputs;
+  std::unordered_map<const void*, bool> decimal64SumSafe;
+  std::unordered_map<const void*, bool> decimal128SumSafe;
+  int64_t decimal64NarrowRequests{0};
+  int64_t decimal64WideRequests{0};
+  int64_t decimal64SafetyProbes{0};
+  int64_t decimal128NarrowRequests{0};
+  int64_t decimal128WideRequests{0};
+  int64_t decimal128SafetyProbes{0};
+  int64_t decimal128Casts{0};
+  int64_t decimal128CastReuses{0};
+  int64_t decimal64Casts{0};
+  int64_t decimal64CastReuses{0};
+};
 
 struct GroupbyAggregator {
   core::AggregationNode::Step step;
@@ -31,12 +55,18 @@ struct GroupbyAggregator {
   virtual void addGroupbyRequest(
       cudf::table_view const& tbl,
       std::vector<cudf::groupby::aggregation_request>& requests,
-      rmm::cuda_stream_view stream) = 0;
+      rmm::cuda_stream_view stream,
+      GroupbyRequestContext& context) = 0;
 
   virtual std::unique_ptr<cudf::column> makeOutputColumn(
       std::vector<cudf::groupby::aggregation_result>& results,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+  /// Returns true when final aggregation can be deferred until end of input.
+  virtual bool supportsDeferredFinalAggregation() const {
+    return false;
+  }
 
   virtual ~GroupbyAggregator() = default;
 
@@ -128,6 +158,9 @@ class CudfGroupby : public CudfOperatorBase {
   const bool isSingleStep_;
   // Streaming aggregation is disabled if companion aggregates are present.
   bool streamingEnabled_{true};
+  // Decimal final SUM can be computed in one pass after buffering all partial
+  // states, avoiding repeated re-hashing of the growing intermediate table.
+  bool deferFinalAggregation_{false};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;
 

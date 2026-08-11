@@ -27,7 +27,9 @@ TEST(ConfigTest, CudfConfig) {
       {CudfConfig::kCudfMemoryResource, "arena"},
       {CudfConfig::kCudfMemoryPercent, "25"},
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"},
+      {CudfConfig::kCudfDeferFinalDecimalSumAggregation, "true"},
+      {CudfConfig::kCudfDecimalGroupbyNarrowAccumulation, "true"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -37,5 +39,7 @@ TEST(ConfigTest, CudfConfig) {
   ASSERT_EQ(config.memoryPercent, 25);
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.allowCpuFallback, false);
+  ASSERT_TRUE(config.deferFinalDecimalSumAggregation);
+  ASSERT_TRUE(config.decimalGroupbyNarrowAccumulation);
 }
 } // namespace facebook::velox::cudf_velox::test

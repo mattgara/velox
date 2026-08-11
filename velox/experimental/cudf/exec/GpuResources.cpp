@@ -48,6 +48,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
         rmm::percent_of_free_device_memory(percent));
   } else if (mode == "async") {
     return rmm::mr::cuda_async_memory_resource{};
+  } else if (mode == "async_preallocated") {
+    return rmm::mr::cuda_async_memory_resource{
+        rmm::percent_of_free_device_memory(percent)};
   } else if (mode == "arena") {
     return rmm::mr::arena_memory_resource(
         rmm::mr::cuda_memory_resource{},
@@ -77,8 +80,9 @@ cuda::mr::any_resource<cuda::mr::device_accessible> createMemoryResource(
   }
   VELOX_FAIL(
       "Unknown memory resource mode: " + std::string(mode) +
-      "\nExpecting: cuda, pool, async, arena, managed, prefetch_managed, " +
-      "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
+      "\nExpecting: cuda, pool, async, async_preallocated, arena, managed, " +
+      "prefetch_managed, managed_pool, prefetch_managed_pool, managed_async, " +
+      "prefetch_managed_async");
 }
 
 cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {

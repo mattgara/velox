@@ -39,6 +39,7 @@ void UcxOutputQueueManager::initializeTask(
     int numDestinations,
     int numDrivers) {
   const auto& taskId = task->taskId();
+  std::vector<IntraNodeEligibilityCallback> eligibilityWaiters;
   queues_.withLock([&](auto& queues) {
     auto it = queues.find(taskId);
     if (it == queues.end()) {
@@ -51,20 +52,37 @@ void UcxOutputQueueManager::initializeTask(
             taskId);
       }
     }
+
+    auto waiters = intraNodeEligibilityWaiters_.find(taskId);
+    if (waiters != intraNodeEligibilityWaiters_.end()) {
+      eligibilityWaiters = std::move(waiters->second);
+      intraNodeEligibilityWaiters_.erase(waiters);
+    }
   });
+
   // Clear any stale "removed" state so that getData() calls after this
   // initializeTask() create proper placeholder queues if needed.
   removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
   // Clear any stale "cancelled" state in the intra-node registry so
   // that the cancelledTasks_ set doesn't grow unboundedly across queries.
   IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
+
+  const bool copyIntraNodeData =
+      kind == core::PartitionedOutputNode::Kind::kBroadcast;
+  for (auto& waiter : eligibilityWaiters) {
+    waiter(true, copyIntraNodeData);
+  }
 }
 
-void UcxOutputQueueManager::updateOutputBuffers(
-    std::string_view taskId,
+bool UcxOutputQueueManager::updateOutputBuffers(
+    const std::string& taskId,
     int numBuffers,
     bool noMoreBuffers) {
-  getQueue(taskId)->updateOutputBuffers(numBuffers, noMoreBuffers);
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->updateOutputBuffers(numBuffers, noMoreBuffers);
+    return true;
+  }
+  return false;
 }
 
 void UcxOutputQueueManager::enqueue(
@@ -142,14 +160,47 @@ void UcxOutputQueueManager::getData(
 
 bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
   auto queue = getQueueIfExists(taskId);
-  return queue && queue->isInitialized() &&
-      queue->kind() != core::PartitionedOutputNode::Kind::kBroadcast;
+  return queue && queue->isInitialized();
 }
 
-void UcxOutputQueueManager::removeTask(std::string_view taskId) {
+void UcxOutputQueueManager::whenIntraNodeEligibilityKnown(
+    std::string_view taskId,
+    IntraNodeEligibilityCallback callback) {
+  VELOX_CHECK(
+      static_cast<bool>(callback),
+      "Intra-node eligibility callback must be set");
+
+  const std::string taskIdStr{taskId};
+  bool eligibilityKnown = false;
+  bool copyIntraNodeData = false;
+  bool canUseIntraNode = false;
+  queues_.withLock([&](auto& queues) {
+    auto it = queues.find(taskIdStr);
+    if (it != queues.end() && it->second->isInitialized()) {
+      eligibilityKnown = true;
+      canUseIntraNode = true;
+      copyIntraNodeData =
+          it->second->kind() == core::PartitionedOutputNode::Kind::kBroadcast;
+      return;
+    }
+    intraNodeEligibilityWaiters_[taskIdStr].push_back(std::move(callback));
+  });
+
+  if (eligibilityKnown) {
+    callback(canUseIntraNode, copyIntraNodeData);
+  }
+}
+
+void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   std::string taskIdStr{taskId};
+  std::vector<IntraNodeEligibilityCallback> eligibilityWaiters;
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
+        auto waiters = intraNodeEligibilityWaiters_.find(taskIdStr);
+        if (waiters != intraNodeEligibilityWaiters_.end()) {
+          eligibilityWaiters = std::move(waiters->second);
+          intraNodeEligibilityWaiters_.erase(waiters);
+        }
         auto it = queues.find(taskIdStr);
         if (it == queues.end()) {
           // Already removed. Clear any stale "removed" state so the task ID
@@ -167,6 +218,9 @@ void UcxOutputQueueManager::removeTask(std::string_view taskId) {
             [&](auto& removed) { removed.insert(taskIdStr); });
         return taskQueue;
       });
+  for (auto& waiter : eligibilityWaiters) {
+    waiter(false, false);
+  }
   VLOG(2) << "[QUEUE-MGR] removeTask=" << taskId
           << " queueExists=" << (queue != nullptr);
   if (queue != nullptr) {
@@ -197,13 +251,41 @@ std::shared_ptr<UcxOutputQueue> UcxOutputQueueManager::getQueue(
   });
 }
 
-std::optional<exec::OutputBuffer::Stats> UcxOutputQueueManager::stats(
-    std::string_view taskId) {
+std::optional<exec::OutputBufferStats> UcxOutputQueueManager::stats(
+    const std::string& taskId) {
   auto queue = getQueueIfExists(taskId);
   if (queue != nullptr) {
     return queue->stats();
   }
   return std::nullopt;
+}
+
+bool UcxOutputQueueManager::updateNumDrivers(
+    const std::string& taskId,
+    uint32_t newNumDrivers) {
+  if (auto queue = getQueueIfExists(taskId)) {
+    queue->updateNumDrivers(newNumDrivers);
+    return true;
+  }
+  return false;
+}
+
+std::optional<double> UcxOutputQueueManager::getUtilization(
+    const std::string& /*taskId*/) {
+  return std::nullopt;
+}
+
+std::optional<bool> UcxOutputQueueManager::isOverutilized(
+    const std::string& /*taskId*/) {
+  return std::nullopt;
+}
+
+std::string UcxOutputQueueManager::toString(const std::string& taskId) {
+  auto queue = getQueueIfExists(taskId);
+  if (queue != nullptr) {
+    return "UcxOutputQueue[" + taskId + "]";
+  }
+  return "UcxOutputQueue[" + taskId + " not found]";
 }
 
 } // namespace facebook::velox::ucx_exchange

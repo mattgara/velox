@@ -993,25 +993,79 @@ TEST_P(UcxExchangeTest, intraNodeTaskRemovalLivelock) {
   // If we get here, the source correctly detected the cancelled task.
 }
 
-// Regression test for broadcast + intra-node SIGSEGV.
-// Before the fix in Acceptor.cpp, broadcast tasks using intra-node transfer
-// would crash because the intra-node source destructively moves gpu_data from
-// a shared packed_columns object, corrupting it for other servers.
-// The fix disables intra-node at handshake time for broadcast tasks, falling
-// back to UCXX. This test verifies that broadcast with intra-node enabled
-// completes without crash and delivers correct data.
-TEST_P(UcxExchangeTest, broadcastIntraNodeFallback) {
+// Regression test that keeps the established partitioned intra-node path on
+// its zero-copy move while broadcast adds a distinct copy mode.
+TEST_P(UcxExchangeTest, partitionedIntraNodeZeroCopy) {
+  ExchangeTestParams p = GetParam();
+  if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
+      p.numChunks != 100 || p.numUpstreamTasks != 1 ||
+      p.tableType != TableType::NARROW) {
+    GTEST_SKIP() << "partitionedIntraNodeZeroCopy: runs only once";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const bool origIntraNode = config.intraNodeExchange;
+  config.intraNodeExchange = true;
+
+  const std::string taskPrefix = getUniqueTaskPrefix();
+  const std::string srcTaskId = taskPrefix + "partitionedIntraNodeSrc";
+  constexpr int kNumChunks = 5;
+  constexpr int kNumRowsPerChunk = 1000;
+
+  auto srcTask = createSourceTask(srcTaskId, pool_, UcxTestData::kTestRowType);
+  queueManager_->initializeTask(
+      srcTask,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      /*numDrivers=*/1);
+
+  core::PlanNodeId exchangeNodeId;
+  auto sinkTask = createExchangeTask(
+      taskPrefix + "partitionedIntraNodeSink",
+      UcxTestData::kTestRowType,
+      /*partitionId=*/0,
+      exchangeNodeId);
+  auto sinkDriver =
+      std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1);
+  std::vector<exec::Split> splits;
+  splits.emplace_back(remoteSplit(srcTaskId, /*partitionId=*/0));
+  sinkDriver->addSplits(splits);
+
+  auto sourceMock = std::make_shared<UcxPartitionedOutputMock>(
+      srcTaskId,
+      /*numDrivers=*/1,
+      /*numPartitions=*/1,
+      kNumChunks,
+      kNumRowsPerChunk);
+  sourceMock->run();
+  sinkDriver->run();
+  sourceMock->joinThreads();
+  sinkDriver->joinThreads();
+
+  EXPECT_EQ(
+      sinkDriver->numRows(),
+      static_cast<size_t>(kNumChunks) * kNumRowsPerChunk);
+  EXPECT_TRUE(sinkDriver->dataIsValid());
+
+  queueManager_->removeTask(srcTaskId);
+  config.intraNodeExchange = origIntraNode;
+}
+
+// Regression test for the broadcast + intra-node ownership bug. Every local
+// destination receives a D2D copy without destructively moving buffers from
+// the shared packed_columns object.
+TEST_P(UcxExchangeTest, broadcastIntraNodeD2D) {
   // This test doesn't use parameters — run only for the first param set.
   {
     ExchangeTestParams p = GetParam();
     if (p.numSrcDrivers != 1 || p.numDstDrivers != 1 || p.numPartitions != 1 ||
         p.numChunks != 100 || p.numUpstreamTasks != 1 ||
         p.tableType != TableType::NARROW) {
-      GTEST_SKIP() << "broadcastIntraNodeFallback: runs only once";
+      GTEST_SKIP() << "broadcastIntraNodeD2D: runs only once";
     }
   }
 
-  // Enable intra-node exchange so the Acceptor's broadcast guard is exercised.
+  // Enable intra-node exchange so broadcast uses the direct registry path.
   auto& config = cudf_velox::CudfConfig::getInstance();
   const bool origIntraNode = config.intraNodeExchange;
   config.intraNodeExchange = true;
@@ -1084,11 +1138,9 @@ TEST_P(UcxExchangeTest, broadcastIntraNodeFallback) {
 // Regression test for broadcast + intra-node placeholder race condition.
 // When sinks connect BEFORE initializeTask() is called, the Acceptor creates
 // a placeholder UcxOutputQueue. If initializeTask() later upgrades that
-// placeholder to broadcast mode, the intra-node flag may be incorrectly set
-// because the broadcast guard in Acceptor only runs at handshake time — but
-// the placeholder was already created with intra-node enabled.
-// Without a fix, this causes a SIGSEGV when the intra-node source
-// destructively moves gpu_data from the shared packed_columns object.
+// placeholder to broadcast mode, eligibility must wait for initialization and
+// then select the direct registry path. Each destination must receive its own
+// D2D-owned packed buffer without corrupting the shared source object.
 TEST_P(UcxExchangeTest, broadcastIntraNodePlaceholderRace) {
   // This test doesn't use parameters — run only for the first param set.
   {
@@ -1420,7 +1472,7 @@ TEST_P(UcxExchangeTest, batchAccumulationTest) {
 
     // Pass custom threshold via QueryConfig.
     std::unordered_map<std::string, std::string> extraConfig{
-        {core::QueryConfig::kUcxPartitionedOutputBatchRows,
+        {cudf_velox::CudfConfig::kUcxPartitionedOutputBatchRows,
          std::to_string(customThreshold)}};
 
     auto srcTask = createPartitionedOutputTask(
