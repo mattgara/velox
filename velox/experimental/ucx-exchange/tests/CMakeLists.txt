@@ -15,6 +15,8 @@
 add_executable(
   ucx_exchange_test
   UcxCompressionTest.cpp
+  UcxFloat64CodecTest.cpp
+  UcxFloat64AlpCodecTest.cpp
   UcxCompressionCostModelTest.cpp
   UcxTransferShaperTest.cpp
   UcxOutputQueueManagerTest.cpp

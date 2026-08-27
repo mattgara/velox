@@ -115,7 +115,8 @@ void logPackedCompressionAttempt(
   const auto regions = stats.raw.regions + stats.byteRans.regions +
       stats.frameOfReference.regions + stats.deltaFrameOfReference.regions +
       stats.dictionaryPfor.regions + stats.frequencyPfor.regions +
-      stats.deltaFrequencyPfor.regions;
+      stats.deltaFrequencyPfor.regions + stats.float64Alp.regions +
+      stats.float64ExponentRans.regions;
   const auto wireBytes = accepted ? stats.candidateBytes : stats.inputBytes;
   VLOG(1) << "[UCX-CODEC-ATTEMPT] worker=" << workerId << " task=" << taskId
           << " destination=" << destination << " seq=" << sequenceNumber
@@ -146,6 +147,16 @@ void logPackedCompressionAttempt(
           << " deltaFreqPforInputBytes=" << stats.deltaFrequencyPfor.inputBytes
           << " deltaFreqPforCandidateBytes="
           << stats.deltaFrequencyPfor.candidateBytes
+          << " float64AlpRegions=" << stats.float64Alp.regions
+          << " float64AlpInputBytes=" << stats.float64Alp.inputBytes
+          << " float64AlpCandidateBytes="
+          << stats.float64Alp.candidateBytes
+          << " float64ExponentRansRegions="
+          << stats.float64ExponentRans.regions
+          << " float64ExponentRansInputBytes="
+          << stats.float64ExponentRans.inputBytes
+          << " float64ExponentRansCandidateBytes="
+          << stats.float64ExponentRans.candidateBytes
           << " residualRansAttempts=" << stats.residualRansAttempts
           << " residualRansAccepted=" << stats.residualRansAccepted
           << " residualRansInputBytes=" << stats.residualRansInputBytes

@@ -15,6 +15,8 @@
  */
 #include "velox/experimental/ucx-exchange/UcxColumnCodec.h"
 #include "velox/experimental/ucx-exchange/UcxCompression.h"
+#include "velox/experimental/ucx-exchange/UcxFloat64AlpCodec.h"
+#include "velox/experimental/ucx-exchange/UcxFloat64Codec.h"
 
 #include <algorithm>
 #include <limits>
@@ -63,6 +65,7 @@ constexpr double kFreqPforMinTop256Mass = 0.50;
 constexpr double kFreqPforSelectionRatio = 0.90;
 // Three uint16 dictionary entries fit in a positive int64 descriptor word.
 constexpr std::size_t kDictionaryCodesPerWord = 3;
+constexpr std::size_t kMinFloat64CodecElems = 1u << 20;
 
 // DietGPU kernels use word loads; every device pointer handed to them must
 // be 16-byte aligned. Planes use an aligned stride; wire segments are placed
@@ -97,6 +100,12 @@ void recordRegionStats(
       break;
     case RegionCodec::kDeltaFreqPfor:
       target = &stats.deltaFrequencyPfor;
+      break;
+    case RegionCodec::kFloat64Alp:
+      target = &stats.float64Alp;
+      break;
+    case RegionCodec::kFloat64ExponentRans:
+      target = &stats.float64ExponentRans;
       break;
     default:
       throw std::runtime_error(
@@ -1124,6 +1133,55 @@ rmm::device_buffer decodePlanes(
   return planes;
 }
 
+void encodeFloat64Region(
+    const uint8_t* blobBase,
+    const TypedRegion& region,
+    rmm::cuda_stream_view stream,
+    std::vector<EncodedRegion>& regions,
+    std::vector<rmm::device_buffer>& payloads) {
+  const auto* values =
+      reinterpret_cast<const double*>(blobBase + region.offset);
+  const uint32_t numValues = region.elems;
+  const std::size_t rawBytes =
+      static_cast<std::size_t>(numValues) * sizeof(double);
+
+  EncodedRegion output;
+  output.blobOffset = region.offset;
+  output.rawBytes = rawBytes;
+  output.elemWidth = sizeof(double);
+
+  {
+    auto alp = compressFloat64Alp(values, numValues, stream);
+    if (alp.used) {
+      output.codec = RegionCodec::kFloat64Alp;
+      output.base = alp.base;
+      output.exceptionCount = alp.exceptionCount;
+      output.alpExponent = alp.exponentIndex;
+      output.alpFactor = alp.factorIndex;
+      output.alpBitWidth = alp.bitWidth;
+      payloads.push_back(std::move(alp.data));
+      regions.push_back(std::move(output));
+      return;
+    }
+  }
+
+  constexpr uint32_t kExponentPlanes = 2;
+  auto exponent = compressFloat64(values, numValues, kExponentPlanes, stream);
+  if (static_cast<double>(exponent.candidateBytes) <= 0.98 * rawBytes) {
+    output.codec = RegionCodec::kFloat64ExponentRans;
+    output.segSizes.assign(
+        exponent.exponentSegmentSizes.begin(),
+        exponent.exponentSegmentSizes.end());
+    payloads.push_back(std::move(exponent.data));
+    regions.push_back(std::move(output));
+    return;
+  }
+
+  output.codec = RegionCodec::kRaw;
+  payloads.emplace_back();
+  regions.push_back(std::move(output));
+}
+
 template <typename T>
 void encodeTypedRegion(
     const uint8_t* blobBase,
@@ -1672,7 +1730,12 @@ PackedCompressResult compressPacked(
       continue; // overlap safety; leave to residual coverage of earlier pass
     }
     addResidual(cursor, region.offset - cursor);
-    if (region.width == 8) {
+    const bool useFloat64Codec = enableAdvancedCodecs &&
+        region.typeId == static_cast<int32_t>(cudf::type_id::FLOAT64) &&
+        region.elems >= kMinFloat64CodecElems;
+    if (useFloat64Codec) {
+      encodeFloat64Region(blobBase, region, stream, regions, payloads);
+    } else if (region.width == 8) {
       encodeTypedRegion<int64_t>(
           blobBase,
           region,
@@ -1770,6 +1833,50 @@ rmm::device_buffer decompressPacked(
             region.rawBytes,
             cudaMemcpyDeviceToDevice,
             stream.value()));
+        break;
+      }
+      case RegionCodec::kFloat64Alp: {
+        const auto numValues = static_cast<uint32_t>(
+            region.rawBytes / static_cast<int64_t>(sizeof(double)));
+        const std::size_t groups =
+            (static_cast<std::size_t>(numValues) + 31) / 32;
+        encodedBytes =
+            roundUp16(groups * region.alpBitWidth * sizeof(uint32_t));
+        encodedBytes += roundUp16(
+            static_cast<std::size_t>(region.exceptionCount) * sizeof(uint32_t));
+        encodedBytes += roundUp16(
+            static_cast<std::size_t>(region.exceptionCount) * sizeof(uint64_t));
+        decompressFloat64AlpPayloadInto(
+            wire + off,
+            encodedBytes,
+            numValues,
+            region.exceptionCount,
+            region.alpExponent,
+            region.alpFactor,
+            region.alpBitWidth,
+            region.base,
+            reinterpret_cast<double*>(blobBase + region.blobOffset),
+            stream);
+        break;
+      }
+      case RegionCodec::kFloat64ExponentRans: {
+        const auto numValues = static_cast<uint32_t>(
+            region.rawBytes / static_cast<int64_t>(sizeof(double)));
+        for (const auto size : region.segSizes) {
+          encodedBytes += roundUp16(size);
+        }
+        encodedBytes += (sizeof(double) - region.segSizes.size()) *
+            alignedStride(numValues);
+        std::vector<uint32_t> segmentSizes(
+            region.segSizes.begin(), region.segSizes.end());
+        decompressFloat64PayloadInto(
+            wire + off,
+            encodedBytes,
+            segmentSizes,
+            static_cast<uint32_t>(segmentSizes.size()),
+            numValues,
+            reinterpret_cast<double*>(blobBase + region.blobOffset),
+            stream);
         break;
       }
       case RegionCodec::kDictPfor: {
@@ -1874,6 +1981,11 @@ void serializeRegions(
         region.codec == RegionCodec::kDeltaFreqPfor) {
       out.push_back(static_cast<int64_t>(region.dictionarySize));
       out.push_back(static_cast<int64_t>(region.exceptionCount));
+    } else if (region.codec == RegionCodec::kFloat64Alp) {
+      out.push_back(static_cast<int64_t>(region.alpExponent));
+      out.push_back(static_cast<int64_t>(region.alpFactor));
+      out.push_back(static_cast<int64_t>(region.alpBitWidth));
+      out.push_back(static_cast<int64_t>(region.exceptionCount));
     }
   }
 }
@@ -1899,7 +2011,7 @@ bool deserializeRegions(
     region.rawBytes = in[pos++];
     const auto codecValue = in[pos++];
     if (codecValue < static_cast<int64_t>(RegionCodec::kRaw) ||
-        codecValue > static_cast<int64_t>(RegionCodec::kDeltaFreqPfor)) {
+        codecValue > static_cast<int64_t>(RegionCodec::kFloat64ExponentRans)) {
       return false;
     }
     region.codec = static_cast<RegionCodec>(codecValue);
@@ -1956,6 +2068,31 @@ bool deserializeRegions(
       }
       region.dictionarySize = static_cast<uint32_t>(in[pos++]);
       region.exceptionCount = static_cast<uint32_t>(in[pos++]);
+    } else if (region.codec == RegionCodec::kFloat64Alp) {
+      if (pos + 4 > in.size() || numSegs != 0 || region.elemWidth != 8 ||
+          region.rawBytes % static_cast<int64_t>(sizeof(double)) != 0 ||
+          in[pos] < 0 || in[pos] >= 19 || in[pos + 1] < 0 ||
+          in[pos + 1] > in[pos] || in[pos + 2] < 0 || in[pos + 2] > 64 ||
+          in[pos + 3] < 0 ||
+          static_cast<uint64_t>(in[pos + 3]) >
+              static_cast<uint64_t>(
+                  region.rawBytes / static_cast<int64_t>(sizeof(double)))) {
+        return false;
+      }
+      region.alpExponent = static_cast<uint32_t>(in[pos++]);
+      region.alpFactor = static_cast<uint32_t>(in[pos++]);
+      region.alpBitWidth = static_cast<uint32_t>(in[pos++]);
+      region.exceptionCount = static_cast<uint32_t>(in[pos++]);
+    } else if (region.codec == RegionCodec::kFloat64ExponentRans) {
+      if ((numSegs != 1 && numSegs != 2) || region.elemWidth != 8 ||
+          region.rawBytes % static_cast<int64_t>(sizeof(double)) != 0 ||
+          std::any_of(
+              region.segSizes.begin(), region.segSizes.end(), [](int64_t size) {
+                return static_cast<uint64_t>(size) >
+                    std::numeric_limits<uint32_t>::max();
+              })) {
+        return false;
+      }
     }
     regions.push_back(std::move(region));
   }
