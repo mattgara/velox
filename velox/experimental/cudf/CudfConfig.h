@@ -68,6 +68,10 @@ struct CudfConfig {
       "cudf.exchange_compression_min_bytes"};
   static constexpr const char* kUcxExchangeCompressionSafetyMargin{
       "cudf.exchange_compression_safety_margin"};
+  static constexpr const char* kUcxExchangeSimulatedCudaIpcBandwidth{
+      "cudf.exchange_simulated_cuda_ipc_gbytes_per_second"};
+  static constexpr const char* kUcxExchangeSimulatedCudaIpcLatencyUs{
+      "cudf.exchange_simulated_cuda_ipc_latency_us"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -134,6 +138,14 @@ struct CudfConfig {
   /// factor before adaptive compression is selected. Values above one reserve
   /// headroom for the codec's opportunity cost on concurrent query kernels.
   double exchangeCompressionSafetyMargin{1.10};
+
+  /// Disabled when zero. When positive, keep cross-worker CUDA-IPC transfers
+  /// GPU-direct but delay their completion to this aggregate decimal GB/s per
+  /// worker and direction. This is an experimental single-host RDMA/EFA approximation.
+  double exchangeSimulatedCudaIpcGBytesPerSecond{0.0};
+
+  /// Fixed one-way completion latency for the simulated CUDA-IPC link.
+  int64_t exchangeSimulatedCudaIpcLatencyUs{0};
 
   /// Memory resource for cuDF.
   /// Possible values are (cuda, pool, async, arena, managed, managed_pool).

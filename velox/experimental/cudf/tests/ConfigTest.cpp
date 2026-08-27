@@ -41,7 +41,9 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kUcxExchangeCompressionPipeline, "true"},
       {CudfConfig::kUcxExchangeCompressionPipelineThreads, "2"},
       {CudfConfig::kUcxExchangeCompressionMinBytes, "268435456"},
-      {CudfConfig::kUcxExchangeCompressionSafetyMargin, "1.5"}};
+      {CudfConfig::kUcxExchangeCompressionSafetyMargin, "1.5"},
+      {CudfConfig::kUcxExchangeSimulatedCudaIpcBandwidth, "12.5"},
+      {CudfConfig::kUcxExchangeSimulatedCudaIpcLatencyUs, "7"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -62,6 +64,8 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.exchangeCompressionPipelineThreads, 2);
   ASSERT_EQ(config.exchangeCompressionMinBytes, 268435456);
   ASSERT_DOUBLE_EQ(config.exchangeCompressionSafetyMargin, 1.5);
+  ASSERT_DOUBLE_EQ(config.exchangeSimulatedCudaIpcGBytesPerSecond, 12.5);
+  ASSERT_EQ(config.exchangeSimulatedCudaIpcLatencyUs, 7);
 }
 
 TEST(ConfigTest, ucxTransportRegistration) {

@@ -25,6 +25,7 @@
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/WorkQueue.h"
+#include "velox/experimental/ucx-exchange/UcxTransferShaper.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -140,6 +141,23 @@ class Communicator {
     return workerId_;
   }
 
+  /// Reserves aggregate outbound serialization capacity on the experimental
+  /// CUDA-IPC link model.
+  UcxTransferShaper::TimePoint reserveShapedSend(std::size_t bytes);
+
+  /// Defers a send completion without blocking UCX progress.
+  void scheduleShapedSendCompletion(
+      UcxTransferShaper::TimePoint deadline,
+      UcxTransferShaper::Callback callback);
+
+  /// Reserves aggregate inbound serialization capacity independently.
+  UcxTransferShaper::TimePoint reserveShapedReceive(std::size_t bytes);
+
+  /// Defers consumer visibility without blocking UCX progress.
+  void scheduleShapedReceiveCompletion(
+      UcxTransferShaper::TimePoint deadline,
+      UcxTransferShaper::Callback callback);
+
   /// Looks up the EndpointRef associated with a raw UCP endpoint handle.
   /// Used by the Acceptor's active-message callback to resolve the endpoint
   /// that received a handshake request.
@@ -213,6 +231,10 @@ class Communicator {
   // Generated once at initialization. Used by the Acceptor to determine
   // if a connecting source is in the same process (intra-node transfer).
   uint64_t workerId_{0};
+
+  /// Present only when the disabled-by-default CUDA-IPC link model is enabled.
+  std::unique_ptr<UcxTransferShaper> outboundTransferShaper_;
+  std::unique_ptr<UcxTransferShaper> inboundTransferShaper_;
 
   // Queue of endpoints that need cleanup, populated by callbacks.
   // UCX callbacks cannot call progress functions (like closeBlocking),

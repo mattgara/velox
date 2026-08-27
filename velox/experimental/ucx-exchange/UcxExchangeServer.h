@@ -118,6 +118,10 @@ class UcxExchangeServer
   /// Unknown transports fail closed and are queried again on a later chunk.
   bool endpointAllowsCompression();
 
+  /// Returns true only for cross-worker CUDA-IPC endpoints when the
+  /// disabled-by-default link model is configured.
+  bool shouldShapeCudaIpc();
+
   /// Returns the one adaptive decision for the current chunk. Both the
   /// pipeline and synchronous paths reuse it so a raw decision is not counted
   /// twice by the periodic-probe policy.

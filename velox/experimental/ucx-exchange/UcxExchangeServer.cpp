@@ -198,6 +198,7 @@ struct DataSendContext {
   // the context until the DMA completes. When set, the send transfers this
   // buffer instead of data->gpu_data.
   std::shared_ptr<rmm::device_buffer> compressedData;
+  std::optional<UcxTransferShaper::TimePoint> shapedCompletion;
 };
 
 struct UcxExchangeServer::SharedCompressionWork {
@@ -487,12 +488,27 @@ bool UcxExchangeServer::endpointAllowsCompression() {
   if (!cudaIpcTransport_) {
     cudaIpcTransport_ = endpointRef_->usesTransport("cuda_ipc");
   }
-  const bool allowed = cudaIpcTransport_.has_value() && !*cudaIpcTransport_;
+  const bool shapedCudaIpc =
+      cudf_velox::CudfConfig::getInstance()
+          .exchangeSimulatedCudaIpcGBytesPerSecond > 0.0;
+  const bool allowed = cudaIpcTransport_.has_value() &&
+      (!*cudaIpcTransport_ || shapedCudaIpc);
   VLOG(1) << "[UCX-COMPRESSION-TRANSPORT] cudaIpcKnown="
           << cudaIpcTransport_.has_value()
           << " cudaIpc=" << cudaIpcTransport_.value_or(true)
-          << " allowed=" << allowed;
+          << " shapedCudaIpc=" << shapedCudaIpc << " allowed=" << allowed;
   return allowed;
+}
+
+bool UcxExchangeServer::shouldShapeCudaIpc() {
+  if (cudf_velox::CudfConfig::getInstance()
+          .exchangeSimulatedCudaIpcGBytesPerSecond <= 0.0) {
+    return false;
+  }
+  if (!cudaIpcTransport_) {
+    cudaIpcTransport_ = endpointRef_->usesTransport("cuda_ipc");
+  }
+  return cudaIpcTransport_.value_or(false);
 }
 
 const UcxCompressionCostModel::Decision&
@@ -1060,24 +1076,41 @@ void UcxExchangeServer::sendData() {
       const std::size_t sendBytes = compressedData
           ? compressedData->size()
           : dataCtx->data->gpu_data->size();
+      if (shouldShapeCudaIpc()) {
+        dataCtx->shapedCompletion =
+            communicator_->reserveShapedSend(sendBytes);
+        VLOG(1) << "[UCX-SHAPER-RESERVE] worker="
+                << communicator_->getWorkerId() << " task="
+                << partitionKey_.taskId << " destination="
+                << partitionKey_.destination << " seq=" << sequenceNumber_
+                << " wireBytes=" << sendBytes;
+      }
       dataRequest_ = endpointRef_->endpoint_->tagSend(
           sendPtr,
           sendBytes,
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-            // Release the GPU data buffer from the context. The DMA has
-            // completed by the time this callback fires, so the buffer is
-            // safe to free. The context shell stays alive with the Request.
-            auto ctx = std::static_pointer_cast<DataSendContext>(arg);
-            auto dataHolder = std::move(ctx->data);
-            auto compressedHolder = std::move(ctx->compressedData);
+            auto finish = [weakData, status, arg]() mutable {
+              // Release the GPU buffers only at simulated completion so the
+              // normal exchange backpressure observes the shaped link.
+              auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+              auto dataHolder = std::move(ctx->data);
+              auto compressedHolder = std::move(ctx->compressedData);
+              if (auto self = weakData.lock()) {
+                self->sendComplete(status, arg);
+              }
+            };
 
-            if (auto self = weakData.lock()) {
-              self->sendComplete(status, arg);
+            auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+            if (ctx->shapedCompletion) {
+              if (auto self = weakData.lock()) {
+                self->communicator_->scheduleShapedSendCompletion(
+                    *ctx->shapedCompletion, std::move(finish));
+                return;
+              }
             }
-            // dataHolder is destroyed here, releasing the GPU buffer if
-            // sendComplete() already reset the server's dataPtr_.
+            finish();
           },
           dataCtx);
     } else {

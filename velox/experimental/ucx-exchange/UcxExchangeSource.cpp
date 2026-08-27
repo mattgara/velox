@@ -49,6 +49,8 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::WaitingForMetadata,
            "WaitingForMetadata"},
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
+          {UcxExchangeSource::ReceiverState::WaitingForShapedData,
+           "WaitingForShapedData"},
           {UcxExchangeSource::ReceiverState::WaitingForDecompression,
            "WaitingForDecompression"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
@@ -196,6 +198,9 @@ void UcxExchangeSource::process() {
       break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
+      break;
+    case ReceiverState::WaitingForShapedData:
+      // The shaper timer publishes completion from its own callback.
       break;
     case ReceiverState::WaitingForDecompression:
       // Completion is published by the codec executor.
@@ -589,20 +594,71 @@ void UcxExchangeSource::onMetadata(
   }
 }
 
-void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
-  // Check if close() was called - avoid processing if we're shutting down
+bool UcxExchangeSource::shouldShapeCudaIpc() {
+  if (isIntraNodeTransfer_ ||
+      cudf_velox::CudfConfig::getInstance()
+              .exchangeSimulatedCudaIpcGBytesPerSecond <=
+          0.0) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(endpointRef_);
+  if (!cudaIpcTransport_) {
+    cudaIpcTransport_ = endpointRef_->usesTransport("cuda_ipc");
+  }
+  return cudaIpcTransport_.value_or(false);
+}
+
+void UcxExchangeSource::onData(
+    ucs_status_t status,
+    std::shared_ptr<void> arg) {
+  if (closed_.load(std::memory_order_acquire) || status != UCS_OK ||
+      getState() != ReceiverState::WaitingForData || !shouldShapeCudaIpc()) {
+    onDataReady(status, std::move(arg), ReceiverState::WaitingForData);
+    return;
+  }
+
+  auto data = std::static_pointer_cast<DataAndMetadata>(arg);
+  const auto deadline = communicator_->reserveShapedReceive(
+      static_cast<std::size_t>(data->metadata.dataSizeBytes));
+  if (!setStateIf(
+          ReceiverState::WaitingForData,
+          ReceiverState::WaitingForShapedData)) {
+    return;
+  }
+  VLOG(1) << "[UCX-SHAPER-RECEIVE] task=" << partitionKey_.taskId
+          << " destination=" << partitionKey_.destination
+          << " seq=" << sequenceNumber_
+          << " wireBytes=" << data->metadata.dataSizeBytes;
+
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  communicator_->scheduleShapedReceiveCompletion(
+      deadline, [weak, status, arg = std::move(arg)]() mutable {
+        if (auto self = weak.lock()) {
+          self->onDataReady(
+              status,
+              std::move(arg),
+              ReceiverState::WaitingForShapedData);
+        }
+      });
+}
+
+void UcxExchangeSource::onDataReady(
+    ucs_status_t status,
+    std::shared_ptr<void> arg,
+    ReceiverState expectedState) {
+  // Check if close() was called - avoid processing if we are shutting down.
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onData called after close, ignoring";
+    VLOG(3) << toString() << " onDataReady called after close, ignoring";
     deliverEndMarker();
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
-  if (getState() != ReceiverState::WaitingForData) {
-    VLOG(2) << toString() << " onData called in state " << toName(getState())
-            << ", ignoring (possible UCXX replay)";
+  if (getState() != expectedState) {
+    VLOG(2) << toString() << " onDataReady called in state "
+            << toName(getState()) << ", ignoring (possible UCXX replay)";
     return;
   }
-  VLOG(3) << toString() << " + onData " << ucs_status_string(status);
+  VLOG(3) << toString() << " + onDataReady " << ucs_status_string(status);
 
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
@@ -616,7 +672,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     deliverEndMarker();
     setState(ReceiverState::Done);
   } else {
-    VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
+    VLOG(3) << toString() << "+ onDataReady " << ucs_status_string(status)
             << " got chunk: " << sequenceNumber_;
 
     this->sequenceNumber_++;
@@ -628,9 +684,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
     if (shouldPipelineDecompression(*ptr)) {
-      if (!setStateIf(
-              ReceiverState::WaitingForData,
-              ReceiverState::WaitingForDecompression)) {
+      if (!setStateIf(expectedState, ReceiverState::WaitingForDecompression)) {
         return;
       }
       startDecompression(std::move(ptr));
@@ -643,7 +697,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
       failDecompression(e.what());
       return;
     }
-    setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+    setStateIf(expectedState, ReceiverState::ReadyToReceive);
   }
   communicator_->addToWorkQueue(getSelfPtr());
 }

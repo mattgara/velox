@@ -113,6 +113,19 @@ void Communicator::run() {
           << CudfConfig::getInstance().ucxxBlockingPolling << std::endl;
 
   running_.store(true);
+  const auto& config = CudfConfig::getInstance();
+  if (config.exchangeSimulatedCudaIpcGBytesPerSecond > 0.0) {
+    outboundTransferShaper_ = std::make_unique<UcxTransferShaper>(
+        config.exchangeSimulatedCudaIpcGBytesPerSecond,
+        std::chrono::microseconds(config.exchangeSimulatedCudaIpcLatencyUs));
+    inboundTransferShaper_ = std::make_unique<UcxTransferShaper>(
+        config.exchangeSimulatedCudaIpcGBytesPerSecond,
+        std::chrono::microseconds(config.exchangeSimulatedCudaIpcLatencyUs));
+    LOG(INFO) << "[UCX-SHAPER] CUDA-IPC bandwidth="
+              << config.exchangeSimulatedCudaIpcGBytesPerSecond
+              << " GB/s latency=" << config.exchangeSimulatedCudaIpcLatencyUs
+              << " us";
+  }
   // Force CUDA context creation.
   auto cudaStatus = cudaFree(0);
   VELOX_CHECK(
@@ -280,6 +293,32 @@ void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
   }
   workQueue_.push(comms);
   signalWorker();
+}
+
+UcxTransferShaper::TimePoint Communicator::reserveShapedSend(
+    std::size_t bytes) {
+  VELOX_CHECK_NOT_NULL(outboundTransferShaper_);
+  return outboundTransferShaper_->reserve(bytes);
+}
+
+void Communicator::scheduleShapedSendCompletion(
+    UcxTransferShaper::TimePoint deadline,
+    UcxTransferShaper::Callback callback) {
+  VELOX_CHECK_NOT_NULL(outboundTransferShaper_);
+  outboundTransferShaper_->scheduleAt(deadline, std::move(callback));
+}
+
+UcxTransferShaper::TimePoint Communicator::reserveShapedReceive(
+    std::size_t bytes) {
+  VELOX_CHECK_NOT_NULL(inboundTransferShaper_);
+  return inboundTransferShaper_->reserve(bytes);
+}
+
+void Communicator::scheduleShapedReceiveCompletion(
+    UcxTransferShaper::TimePoint deadline,
+    UcxTransferShaper::Callback callback) {
+  VELOX_CHECK_NOT_NULL(inboundTransferShaper_);
+  inboundTransferShaper_->scheduleAt(deadline, std::move(callback));
 }
 
 void Communicator::unregister(std::shared_ptr<CommElement> comms) {

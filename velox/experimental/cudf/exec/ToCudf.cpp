@@ -471,6 +471,24 @@ void CudfConfig::initialize(
         "{} must be at least one",
         kUcxExchangeCompressionSafetyMargin);
   }
+  if (config.find(kUcxExchangeSimulatedCudaIpcBandwidth) != config.end()) {
+    exchangeSimulatedCudaIpcGBytesPerSecond =
+        folly::to<double>(config[kUcxExchangeSimulatedCudaIpcBandwidth]);
+    VELOX_USER_CHECK_GE(
+        exchangeSimulatedCudaIpcGBytesPerSecond,
+        0.0,
+        "{} must not be negative",
+        kUcxExchangeSimulatedCudaIpcBandwidth);
+  }
+  if (config.find(kUcxExchangeSimulatedCudaIpcLatencyUs) != config.end()) {
+    exchangeSimulatedCudaIpcLatencyUs =
+        folly::to<int64_t>(config[kUcxExchangeSimulatedCudaIpcLatencyUs]);
+    VELOX_USER_CHECK_GE(
+        exchangeSimulatedCudaIpcLatencyUs,
+        0,
+        "{} must not be negative",
+        kUcxExchangeSimulatedCudaIpcLatencyUs);
+  }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }

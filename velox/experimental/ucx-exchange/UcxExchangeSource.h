@@ -28,6 +28,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <optional>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 
@@ -71,6 +72,7 @@ class UcxExchangeSource
     ReadyToReceive,
     WaitingForMetadata,
     WaitingForData,
+    WaitingForShapedData,
     WaitingForDecompression,
     WaitingForIntraNodeData,
     Done,
@@ -200,6 +202,16 @@ class UcxExchangeSource
   /// @param arg
   void onData(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// Processes a data completion after either native or shaped delivery.
+  void onDataReady(
+      ucs_status_t status,
+      std::shared_ptr<void> arg,
+      ReceiverState expectedState);
+
+  /// Returns true for a cross-worker CUDA-IPC endpoint when the link model
+  /// is explicitly enabled.
+  bool shouldShapeCudaIpc();
+
   /// Returns true when this received chunk should be decoded away from the
   /// UCXX progress thread.
   bool shouldPipelineDecompression(const DataAndMetadata& data) const;
@@ -267,6 +279,9 @@ class UcxExchangeSource
       partitionKeyHash_; // A hash of above, used to create unique tags.
 
   std::atomic<ReceiverState> state_;
+
+  /// Cached transport discovery for the experimental CUDA-IPC shaper.
+  std::optional<bool> cudaIpcTransport_;
 
   uint32_t sequenceNumber_{0};
   uint32_t intraNodePollCount_{0};
