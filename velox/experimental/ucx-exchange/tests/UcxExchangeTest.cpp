@@ -24,6 +24,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <folly/Executor.h>
+#include <folly/ScopeGuard.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/synchronization/EventCount.h>
@@ -33,11 +34,14 @@
 #include <rmm/device_buffer.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 #include "velox/common/memory/MemoryPool.h"
@@ -53,6 +57,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
@@ -67,6 +72,64 @@ using namespace facebook::velox::exec;
 using namespace facebook::velox::core;
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+class IncompressibleInt64Table : public BaseTableGenerator {
+ public:
+  inline static const RowTypePtr kRowType = ROW({"c0"}, {BIGINT()});
+
+  void initialize(size_t numRows) override {
+    values_.resize(numRows);
+    for (size_t i = 0; i < numRows; ++i) {
+      uint64_t value = i + 0x9e3779b97f4a7c15ULL;
+      value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+      values_[i] = static_cast<int64_t>(value ^ (value >> 31));
+    }
+  }
+
+  RowTypePtr getRowType() const override {
+    return kRowType;
+  }
+
+  size_t getNumRows() const override {
+    return values_.size();
+  }
+
+  std::unique_ptr<cudf::table> makeTable(
+      rmm::cuda_stream_view stream) override {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(makeNumericColumn(values_, stream));
+    return std::make_unique<cudf::table>(std::move(columns));
+  }
+
+  bool verifyTable(
+      const cudf::table_view& table,
+      size_t startRow,
+      size_t numRows,
+      rmm::cuda_stream_view stream) override {
+    if (table.num_columns() != 1 || table.num_rows() != numRows) {
+      return false;
+    }
+    const auto received =
+        getColVector<int64_t>(table.column(0), numRows, stream);
+    for (size_t i = 0; i < numRows; ++i) {
+      if (received[i] != values_[(startRow + i) % values_.size()]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+ private:
+  std::vector<int64_t> values_;
+};
+
+std::shared_ptr<cudf::packed_columns> makeEmptyPackedColumns() {
+  return std::make_shared<cudf::packed_columns>();
+}
+} // namespace
 
 struct ExchangeTestParams {
   int numSrcDrivers;
@@ -246,6 +309,452 @@ INSTANTIATE_TEST_SUITE_P(
     UcxExchangeTest,
     ::testing::ValuesIn(generateTestParams()),
     ExchangeTestParamsPrinter());
+
+TEST(UcxExchangeServerTest, sharesBroadcastCompressionWork) {
+  auto input = makeEmptyPackedColumns();
+  auto [firstWork, firstOwns] =
+      UcxExchangeServer::acquireSharedCompressionWork(input);
+  auto [sharedWork, sharedOwns] =
+      UcxExchangeServer::acquireSharedCompressionWork(input);
+
+  EXPECT_TRUE(firstOwns);
+  EXPECT_FALSE(sharedOwns);
+  EXPECT_EQ(firstWork, sharedWork);
+
+  auto otherInput = makeEmptyPackedColumns();
+  auto [otherWork, otherOwns] =
+      UcxExchangeServer::acquireSharedCompressionWork(otherInput);
+  EXPECT_TRUE(otherOwns);
+  EXPECT_NE(firstWork, otherWork);
+
+  firstWork.reset();
+  sharedWork.reset();
+  auto [replacementWork, replacementOwns] =
+      UcxExchangeServer::acquireSharedCompressionWork(input);
+  EXPECT_TRUE(replacementOwns);
+  EXPECT_NE(replacementWork, otherWork);
+}
+
+TEST(UcxExchangeProtocolTest, roundTripsCompressionDescriptor) {
+  MetadataMsg message;
+  message.cudfMetadata = std::make_unique<std::vector<uint8_t>>(
+      std::initializer_list<uint8_t>{1, 2, 3});
+  message.dataSizeBytes = 4096;
+  message.numRows = 17;
+  message.compressionDescriptor = {7, -11, 13};
+  message.atEnd = false;
+
+  const auto [serialized, size] = message.serialize();
+  const auto decoded = MetadataMsg::deserializeMetadataMsg(
+      std::span<const uint8_t>{serialized.get(), size});
+  EXPECT_EQ(*decoded.cudfMetadata, *message.cudfMetadata);
+  EXPECT_EQ(decoded.dataSizeBytes, message.dataSizeBytes);
+  EXPECT_EQ(decoded.numRows, message.numRows);
+  EXPECT_EQ(decoded.compressionDescriptor, message.compressionDescriptor);
+  EXPECT_EQ(decoded.atEnd, message.atEnd);
+}
+
+TEST(UcxExchangeProtocolTest, rejectsNegativeFieldsOnSerialize) {
+  MetadataMsg message;
+  message.dataSizeBytes = -1;
+  EXPECT_THROW(message.serialize(), VeloxException);
+
+  message.dataSizeBytes = 0;
+  message.numRows = -1;
+  EXPECT_THROW(message.serialize(), VeloxException);
+}
+
+TEST(UcxExchangeProtocolTest, rejectsOversizedMetadataOnSerialize) {
+  MetadataMsg message;
+  message.cudfMetadata =
+      std::make_unique<std::vector<uint8_t>>(kMaxMetaBufSize);
+  EXPECT_THROW(message.serialize(), VeloxException);
+}
+
+TEST(UcxExchangeProtocolTest, rejectsMalformedMetadataLengths) {
+  MetadataMsg message;
+  message.cudfMetadata = std::make_unique<std::vector<uint8_t>>();
+  message.dataSizeBytes = 0;
+  message.numRows = 0;
+  message.atEnd = false;
+
+  auto [serialized, size] = message.serialize();
+
+  const uint32_t wrongMagic = kMagicNumber + 1;
+  std::memcpy(serialized.get(), &wrongMagic, sizeof(wrongMagic));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      VeloxException);
+  std::memcpy(serialized.get(), &kMagicNumber, sizeof(kMagicNumber));
+
+  constexpr std::size_t kTotalSizeOffset = sizeof(kMagicNumber);
+  const uint32_t undersizedMessage = kMetaHeaderSize - 1;
+  std::memcpy(
+      serialized.get() + kTotalSizeOffset,
+      &undersizedMessage,
+      sizeof(undersizedMessage));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+  const auto validSize = static_cast<uint32_t>(size);
+  std::memcpy(
+      serialized.get() + kTotalSizeOffset, &validSize, sizeof(validSize));
+
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size - 1}),
+      std::runtime_error);
+
+  constexpr std::size_t kMetadataSizeOffset =
+      sizeof(kMagicNumber) + sizeof(uint32_t);
+  const WireLengthType oversizedMetadataSize =
+      std::numeric_limits<WireLengthType>::max();
+  std::memcpy(
+      serialized.get() + kMetadataSizeOffset,
+      &oversizedMetadataSize,
+      sizeof(oversizedMetadataSize));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+  const WireLengthType emptyMetadataSize = 0;
+  std::memcpy(
+      serialized.get() + kMetadataSizeOffset,
+      &emptyMetadataSize,
+      sizeof(emptyMetadataSize));
+
+  constexpr std::size_t kDataSizeOffset =
+      kMetadataSizeOffset + sizeof(WireLengthType);
+  const WireDataSizeType negativeDataSize = -1;
+  std::memcpy(
+      serialized.get() + kDataSizeOffset,
+      &negativeDataSize,
+      sizeof(negativeDataSize));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+  const WireDataSizeType emptyDataSize = 0;
+  std::memcpy(
+      serialized.get() + kDataSizeOffset,
+      &emptyDataSize,
+      sizeof(emptyDataSize));
+
+  serialized.get()[size - 1] = 2;
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+  serialized.get()[size - 1] = 0;
+
+  constexpr std::size_t kRowCountOffset =
+      kDataSizeOffset + sizeof(WireDataSizeType);
+  const WireRowCountType negativeRowCount = -1;
+  std::memcpy(
+      serialized.get() + kRowCountOffset,
+      &negativeRowCount,
+      sizeof(negativeRowCount));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+  const WireRowCountType emptyRowCount = 0;
+  std::memcpy(
+      serialized.get() + kRowCountOffset,
+      &emptyRowCount,
+      sizeof(emptyRowCount));
+
+  constexpr std::size_t kDescriptorCountOffset = sizeof(kMagicNumber) +
+      sizeof(uint32_t) + sizeof(WireLengthType) + sizeof(WireDataSizeType) +
+      sizeof(WireRowCountType);
+  const WireLengthType oversizedCount =
+      std::numeric_limits<WireLengthType>::max();
+  std::memcpy(
+      serialized.get() + kDescriptorCountOffset,
+      &oversizedCount,
+      sizeof(oversizedCount));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{serialized.get(), size}),
+      std::runtime_error);
+
+  message.compressionDescriptor = {7};
+  auto [serializedWithDescriptor, descriptorSize] = message.serialize();
+  const WireLengthType emptyDescriptorCount = 0;
+  std::memcpy(
+      serializedWithDescriptor.get() + kDescriptorCountOffset,
+      &emptyDescriptorCount,
+      sizeof(emptyDescriptorCount));
+  EXPECT_THROW(
+      MetadataMsg::deserializeMetadataMsg(
+          std::span<const uint8_t>{
+              serializedWithDescriptor.get(), descriptorSize}),
+      std::runtime_error);
+}
+
+TEST(UcxExchangeSourceTest, malformedCompressionDescriptor) {
+  auto queue = std::make_shared<UcxExchangeQueue>(1);
+  auto source = std::shared_ptr<UcxExchangeSource>(new UcxExchangeSource(
+      std::shared_ptr<Communicator>{},
+      "localTask",
+      "127.0.0.1",
+      0,
+      PartitionKey{"remoteTask", 0},
+      queue));
+
+  MetadataMsg metadata;
+  metadata.cudfMetadata = std::make_unique<std::vector<uint8_t>>();
+  metadata.dataSizeBytes = 0;
+  metadata.numRows = 0;
+  metadata.compressionDescriptor = {1};
+  metadata.atEnd = false;
+  auto payload = std::make_shared<UcxExchangeSource::DataAndMetadata>(
+      UcxExchangeSource::DataAndMetadata{
+          std::move(metadata),
+          std::make_unique<rmm::device_buffer>(),
+          rmm::cuda_stream_default});
+
+  EXPECT_THROW(source->decodeAndUnpack(std::move(payload)), VeloxException);
+}
+
+TEST_P(UcxExchangeTest, decompressionFailurePropagatesToQueue) {
+  if (!(GetParam() == generateTestParams().front())) {
+    GTEST_SKIP() << "decompression failure scenario runs only once";
+  }
+
+  auto queue = std::make_shared<UcxExchangeQueue>(1);
+  auto source = std::shared_ptr<UcxExchangeSource>(new UcxExchangeSource(
+      communicator_,
+      "localTask",
+      "127.0.0.1",
+      communicatorPort_,
+      PartitionKey{"remoteTask", 0},
+      queue));
+  source->setState(UcxExchangeSource::ReceiverState::DecompressionReady);
+  auto result = std::make_unique<UcxExchangeSource::DecompressionResult>();
+  result->error =
+      std::make_exception_ptr(std::runtime_error{"synthetic codec failure"});
+  source->decompressionResult_ = std::move(result);
+
+  source->finishDecompression();
+
+  EXPECT_EQ(source->getState(), UcxExchangeSource::ReceiverState::Done);
+  EXPECT_TRUE(queue->isInError());
+}
+
+TEST_P(UcxExchangeTest, compressionCompletionAfterCloseIsIgnored) {
+  if (!(GetParam() == generateTestParams().front())) {
+    GTEST_SKIP() << "late compression callback scenario runs only once";
+  }
+
+  auto queue = std::make_shared<UcxExchangeQueue>(1);
+  auto source = std::shared_ptr<UcxExchangeSource>(new UcxExchangeSource(
+      communicator_,
+      "localTask",
+      "127.0.0.1",
+      communicatorPort_,
+      PartitionKey{"remoteTask", 0},
+      queue));
+  source->setState(UcxExchangeSource::ReceiverState::WaitingForDecompression);
+  source->close();
+  source->onDecompressionComplete(
+      std::make_unique<UcxExchangeSource::DecompressionResult>());
+  EXPECT_EQ(source->getState(), UcxExchangeSource::ReceiverState::Done);
+  EXPECT_EQ(source->decompressionResult_, nullptr);
+
+  auto server = UcxExchangeServer::create(
+      communicator_,
+      std::shared_ptr<EndpointRef>{},
+      PartitionKey{"remoteTask", 0},
+      false);
+  server->setState(UcxExchangeServer::ServerState::WaitingForCompression);
+  server->close();
+  server->onCompressionComplete(
+      makeEmptyPackedColumns(),
+      std::make_shared<UcxExchangeServer::AsyncCompressionResult>());
+  EXPECT_EQ(server->compressionResult_, nullptr);
+}
+
+TEST_P(UcxExchangeTest, compressionTcpRoundTripAndRawFallback) {
+  if (!(GetParam() == generateTestParams().front())) {
+    GTEST_SKIP() << "compression integration scenarios run only once";
+  }
+
+  const char* ucxTls = std::getenv("UCX_TLS");
+  if (ucxTls == nullptr || std::string_view{ucxTls} != "tcp,cuda_copy") {
+    GTEST_SKIP() << "run through the compression-specific CTest target";
+  }
+
+  auto& config = cudf_velox::CudfConfig::getInstance();
+  const auto originalCompression = config.exchangeCompression;
+  const auto originalMinimumBytes = config.exchangeCompressionMinBytes;
+  const auto originalIntraNode = config.intraNodeExchange;
+  SCOPE_EXIT {
+    config.exchangeCompression = originalCompression;
+    config.exchangeCompressionMinBytes = originalMinimumBytes;
+    config.intraNodeExchange = originalIntraNode;
+  };
+
+  struct TransferResult {
+    uint64_t rows;
+    uint64_t chunks;
+    bool valid;
+    folly::F14FastMap<std::string, RuntimeMetric> stats;
+  };
+
+  constexpr int kNumChunks = 3;
+  auto runScenario = [&](const std::shared_ptr<BaseTableGenerator>& data,
+                         core::PartitionedOutputNode::Kind kind,
+                         int numDestinations,
+                         std::string_view label) {
+    const auto taskPrefix = getUniqueTaskPrefix();
+    const auto srcTaskId = taskPrefix + std::string(label) + "Src";
+    const auto rowType = data->getRowType();
+    auto srcTask = createSourceTask(srcTaskId, pool_, rowType);
+    queueManager_->initializeTask(
+        srcTask, kind, numDestinations, /*numDrivers=*/1);
+    SCOPE_EXIT {
+      queueManager_->removeTask(srcTaskId);
+    };
+
+    if (kind == core::PartitionedOutputNode::Kind::kBroadcast) {
+      EXPECT_TRUE(
+          queueManager_->updateOutputBuffers(srcTaskId, numDestinations, true));
+    }
+
+    std::vector<std::shared_ptr<SinkDriverMock>> sinks;
+    sinks.reserve(numDestinations);
+    for (int destination = 0; destination < numDestinations; ++destination) {
+      core::PlanNodeId exchangeNodeId;
+      auto sinkTask = createExchangeTask(
+          taskPrefix + std::string(label) + "Sink" +
+              std::to_string(destination),
+          rowType,
+          destination,
+          exchangeNodeId);
+      auto sink =
+          std::make_shared<SinkDriverMock>(sinkTask, /*numDrivers=*/1, data);
+      std::vector<exec::Split> splits;
+      splits.emplace_back(remoteSplit(srcTaskId, destination));
+      sink->addSplits(splits);
+      sinks.push_back(std::move(sink));
+    }
+
+    const auto outputPartitions =
+        kind == core::PartitionedOutputNode::Kind::kBroadcast ? 1
+                                                              : numDestinations;
+    auto source = std::make_shared<UcxPartitionedOutputMock>(
+        srcTaskId,
+        /*numDrivers=*/1,
+        outputPartitions,
+        kNumChunks,
+        data->getNumRows(),
+        data);
+    source->run();
+    for (auto& sink : sinks) {
+      sink->run();
+    }
+    source->joinThreads();
+    for (auto& sink : sinks) {
+      sink->joinThreads();
+    }
+
+    std::vector<TransferResult> results;
+    results.reserve(sinks.size());
+    for (const auto& sink : sinks) {
+      results.push_back(
+          TransferResult{
+              sink->numRows(),
+              sink->numChunksReceived(),
+              sink->dataIsValid(),
+              sink->stats()});
+    }
+    return results;
+  };
+
+  auto metricSum = [](const auto& stats, std::string_view name) {
+    const auto it = stats.find(std::string(name));
+    EXPECT_NE(it, stats.end()) << "missing runtime metric " << name;
+    return it == stats.end() ? int64_t{0} : it->second.sum;
+  };
+
+  constexpr size_t kRowsPerChunk = 1 << 18;
+  auto compressible = std::make_shared<UcxTestData>();
+  compressible->setData(
+      std::make_shared<std::vector<uint32_t>>(kRowsPerChunk, 7),
+      std::make_shared<std::vector<float>>(kRowsPerChunk, 1.25F),
+      std::make_shared<std::vector<std::string>>(
+          kRowsPerChunk, "repeated-value"));
+
+  config.exchangeCompression = "column";
+  config.exchangeCompressionMinBytes = 0;
+  config.intraNodeExchange = false;
+  const auto compressed = runScenario(
+      compressible,
+      core::PartitionedOutputNode::Kind::kBroadcast,
+      /*numDestinations=*/3,
+      "Compressed");
+  for (const auto& result : compressed) {
+    EXPECT_EQ(result.rows, kNumChunks * kRowsPerChunk);
+    EXPECT_EQ(result.chunks, kNumChunks);
+    EXPECT_TRUE(result.valid);
+    EXPECT_EQ(
+        metricSum(result.stats, "ucxExchangeSource.numCompressedPackedColumns"),
+        kNumChunks);
+    EXPECT_LT(
+        metricSum(result.stats, "ucxExchangeSource.compressedBytes"),
+        metricSum(result.stats, "ucxExchangeSource.uncompressedBytes"));
+  }
+
+  auto incompressible = std::make_shared<IncompressibleInt64Table>();
+  incompressible->initialize(kRowsPerChunk);
+  const auto rawFallback = runScenario(
+      incompressible,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      "RawFallback");
+  ASSERT_EQ(rawFallback.size(), 1);
+  EXPECT_EQ(rawFallback[0].rows, kNumChunks * kRowsPerChunk);
+  EXPECT_EQ(rawFallback[0].chunks, kNumChunks);
+  EXPECT_TRUE(rawFallback[0].valid);
+  EXPECT_EQ(
+      metricSum(
+          rawFallback[0].stats, "ucxExchangeSource.numCompressedPackedColumns"),
+      0);
+
+  config.exchangeCompression = "none";
+  const auto disabled = runScenario(
+      compressible,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      "Disabled");
+  ASSERT_EQ(disabled.size(), 1);
+  EXPECT_EQ(disabled[0].rows, kNumChunks * kRowsPerChunk);
+  EXPECT_EQ(disabled[0].chunks, kNumChunks);
+  EXPECT_TRUE(disabled[0].valid);
+  EXPECT_EQ(
+      metricSum(
+          disabled[0].stats, "ucxExchangeSource.numCompressedPackedColumns"),
+      0);
+
+  config.exchangeCompression = "column";
+  config.intraNodeExchange = true;
+  const auto intraNode = runScenario(
+      compressible,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      /*numDestinations=*/1,
+      "IntraNode");
+  ASSERT_EQ(intraNode.size(), 1);
+  EXPECT_EQ(intraNode[0].rows, kNumChunks * kRowsPerChunk);
+  EXPECT_EQ(intraNode[0].chunks, kNumChunks);
+  EXPECT_TRUE(intraNode[0].valid);
+  EXPECT_EQ(
+      metricSum(
+          intraNode[0].stats, "ucxExchangeSource.numCompressedPackedColumns"),
+      0);
+}
 
 TEST_P(UcxExchangeTest, basicTest) {
   VLOG(3) << "+ UcxExchangeTest::basicTest";

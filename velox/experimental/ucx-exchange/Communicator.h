@@ -18,9 +18,11 @@
 #include <ucxx/api.h>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
+#include "velox/common/base/LazyCPUThreadPoolExecutor.h"
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -82,6 +84,9 @@ class Communicator {
   /// such that "process" will be called on it.
   /// @param comms The element to be added to the work queue.
   void addToWorkQueue(std::shared_ptr<CommElement> comms);
+
+  /// Runs synchronous compression work away from the UCX progress thread.
+  void submitCodecTask(folly::Func task);
 
   /// @brief Unregisters a communication element
   /// @brief comms The communication element.
@@ -224,6 +229,10 @@ class Communicator {
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
   // are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
+
+  // Owned by the communicator so codec tasks finish before UCX and CUDA
+  // resources are destroyed. The underlying threads are created on first use.
+  std::unique_ptr<LazyCPUThreadPoolExecutor> codecExecutor_;
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{

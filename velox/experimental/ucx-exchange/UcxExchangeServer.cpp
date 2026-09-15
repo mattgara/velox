@@ -13,14 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
+#include <rmm/mr/per_device_resource.hpp>
+
 #include <glog/logging.h>
-#include <rmm/cuda_stream_view.hpp>
+#include <functional>
+#include <mutex>
+#include <unordered_map>
 #include "cuda_runtime.h"
+#include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 
 namespace facebook::velox::ucx_exchange {
 
@@ -36,6 +43,10 @@ serverStateNames() {
               {UcxExchangeServer::ServerState::WaitingForDataFromQueue,
                "WaitingForDataFromQueue"},
               {UcxExchangeServer::ServerState::DataReady, "DataReady"},
+              {UcxExchangeServer::ServerState::WaitingForCompression,
+               "WaitingForCompression"},
+              {UcxExchangeServer::ServerState::CompressionReady,
+               "CompressionReady"},
               {UcxExchangeServer::ServerState::WaitingForSendComplete,
                "WaitingForSendComplete"},
               {UcxExchangeServer::ServerState::WaitingForIntraNodeRetrieve,
@@ -44,6 +55,19 @@ serverStateNames() {
           };
   return kNames;
 }
+
+bool meetsCompressionMinimum(std::size_t bytes) {
+  const auto minimum =
+      cudf_velox::CudfConfig::getInstance().exchangeCompressionMinBytes;
+  return minimum <= 0 || bytes >= static_cast<std::size_t>(minimum);
+}
+
+constexpr std::size_t kSharedCompressionRegistryCleanupInterval = 1024;
+
+bool isColumnCompressionMode(std::string_view mode) {
+  return mode == "column";
+}
+
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -66,6 +90,51 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  // Compressed payload when exchange compression kicked in; kept alive with
+  // the context until the DMA completes. When set, the send transfers this
+  // buffer instead of data->gpu_data.
+  std::shared_ptr<rmm::device_buffer> compressedData;
+};
+
+struct UcxExchangeServer::SharedCompressionWork {
+  using Completion =
+      std::function<void(std::shared_ptr<const AsyncCompressionResult>)>;
+
+  explicit SharedCompressionWork(
+      const std::shared_ptr<cudf::packed_columns>& input)
+      : input(input) {}
+
+  void subscribe(Completion completion) {
+    std::shared_ptr<const AsyncCompressionResult> readyResult;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (result) {
+        readyResult = result;
+      } else {
+        completions.push_back(std::move(completion));
+        return;
+      }
+    }
+    completion(std::move(readyResult));
+  }
+
+  void complete(std::shared_ptr<const AsyncCompressionResult> value) {
+    std::vector<Completion> readyCompletions;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      VELOX_CHECK_NULL(result);
+      result = value;
+      readyCompletions = std::move(completions);
+    }
+    for (auto& completion : readyCompletions) {
+      completion(value);
+    }
+  }
+
+  std::weak_ptr<cudf::packed_columns> input;
+  std::mutex mutex;
+  std::shared_ptr<const AsyncCompressionResult> result;
+  std::vector<Completion> completions;
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -132,7 +201,7 @@ void UcxExchangeServer::process() {
           [weakQueue](
               std::shared_ptr<cudf::packed_columns> data,
               vector_size_t numRows,
-              std::vector<int64_t> remainingBytes) {
+              std::vector<int64_t> /*remainingBytes*/) {
             auto self = weakQueue.lock();
             if (!self) {
               return; // Object was destroyed, safe to ignore
@@ -165,6 +234,16 @@ void UcxExchangeServer::process() {
       // to do
       break;
     case ServerState::DataReady:
+      if (shouldCompressCurrentChunk()) {
+        startCompression();
+      } else {
+        sendData();
+      }
+      break;
+    case ServerState::WaitingForCompression:
+      // Completion is published by the codec executor.
+      break;
+    case ServerState::CompressionReady:
       sendData();
       break;
     case ServerState::WaitingForSendComplete:
@@ -256,6 +335,141 @@ std::shared_ptr<UcxExchangeServer> UcxExchangeServer::getSelfPtr() {
   return shared_from_this();
 }
 
+bool UcxExchangeServer::endpointAllowsCompression() {
+  VELOX_CHECK_NOT_NULL(endpointRef_);
+  const auto usesCudaIpc = endpointRef_->usesCudaIpc();
+  return usesCudaIpc.has_value() && !*usesCudaIpc;
+}
+
+std::pair<std::shared_ptr<UcxExchangeServer::SharedCompressionWork>, bool>
+UcxExchangeServer::acquireSharedCompressionWork(
+    const std::shared_ptr<cudf::packed_columns>& input) {
+  static std::mutex registryMutex;
+  static std::unordered_map<
+      const cudf::packed_columns*,
+      std::weak_ptr<SharedCompressionWork>>
+      registry;
+  static std::size_t acquisitions{0};
+
+  std::lock_guard<std::mutex> lock(registryMutex);
+  if (++acquisitions % kSharedCompressionRegistryCleanupInterval == 0) {
+    for (auto it = registry.begin(); it != registry.end();) {
+      if (it->second.expired()) {
+        it = registry.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  const auto key = input.get();
+  auto it = registry.find(key);
+  if (it != registry.end()) {
+    if (auto work = it->second.lock()) {
+      if (work->input.lock() == input) {
+        return {std::move(work), false};
+      }
+    }
+    registry.erase(it);
+  }
+
+  auto work = std::make_shared<SharedCompressionWork>(input);
+  registry.emplace(key, work);
+  return {std::move(work), true};
+}
+
+bool UcxExchangeServer::shouldCompressCurrentChunk() {
+  if (isIntraNodeTransfer_ || !dataPtr_ || !dataPtr_->gpu_data ||
+      dataPtr_->gpu_data->size() == 0 ||
+      !meetsCompressionMinimum(dataPtr_->gpu_data->size())) {
+    return false;
+  }
+
+  const auto& mode = cudf_velox::CudfConfig::getInstance().exchangeCompression;
+  if (!isColumnCompressionMode(mode)) {
+    return false;
+  }
+
+  return endpointAllowsCompression();
+}
+
+void UcxExchangeServer::startCompression() {
+  std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+  VELOX_CHECK(getState() == ServerState::DataReady);
+  VELOX_CHECK_NOT_NULL(dataPtr_);
+
+  auto input = dataPtr_;
+  int device = 0;
+  auto cudaStatus = cudaGetDevice(&device);
+  VELOX_CHECK(
+      cudaStatus == cudaSuccess,
+      "Failed to get codec CUDA device: {}",
+      cudaGetErrorString(cudaStatus));
+
+  setState(ServerState::WaitingForCompression);
+  std::weak_ptr<UcxExchangeServer> weak = weak_from_this();
+  auto [work, ownsCompression] = acquireSharedCompressionWork(input);
+  compressionWork_ = work;
+  work->subscribe(
+      [weak, input](std::shared_ptr<const AsyncCompressionResult> result) {
+        if (auto self = weak.lock()) {
+          self->onCompressionComplete(input, std::move(result));
+        }
+      });
+  if (!ownsCompression) {
+    VLOG(1) << "@" << partitionKey_.taskId
+            << " reusing broadcast compression for destination "
+            << partitionKey_.destination << " sequence " << sequenceNumber_;
+    return;
+  }
+
+  communicator_->submitCodecTask([work, input, device]() mutable {
+    auto result = std::make_shared<AsyncCompressionResult>();
+    try {
+      const auto status = cudaSetDevice(device);
+      VELOX_CHECK(
+          status == cudaSuccess,
+          "Failed to set codec CUDA device {}: {}",
+          device,
+          cudaGetErrorString(status));
+
+      // The returned device buffer retains this stream for asynchronous
+      // deallocation after the UCX send completes. Use a process-lifetime
+      // pool stream so the buffer cannot outlive its stream.
+      const auto codecStream =
+          cudf_velox::cudfGlobalStreamPool().get_stream();
+      const auto memoryResource = rmm::mr::get_current_device_resource_ref();
+      cudf_velox::compression::PackedColumnsCodec codec{
+          codecStream, memoryResource, memoryResource};
+      if (auto compressed = codec.compress(*input)) {
+        result->descriptor = compressed->descriptor.serialize();
+        result->data = std::make_shared<rmm::device_buffer>(
+            std::move(compressed->data));
+      }
+    } catch (...) {
+      result->error = std::current_exception();
+    }
+    work->complete(std::move(result));
+  });
+}
+
+void UcxExchangeServer::onCompressionComplete(
+    const std::shared_ptr<cudf::packed_columns>& input,
+    std::shared_ptr<const AsyncCompressionResult> result) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    if (getState() != ServerState::WaitingForCompression || dataPtr_ != input) {
+      return;
+    }
+    compressionResult_ = std::move(result);
+    setState(ServerState::CompressionReady);
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
 void UcxExchangeServer::sendData() {
   std::lock_guard<std::recursive_mutex> lock(dataMutex_);
 
@@ -269,7 +483,7 @@ void UcxExchangeServer::sendData() {
   if (isIntraNodeTransfer_) {
     // INTRA-NODE TRANSFER PATH: Use registry for all communication, no UCXX
     // needed
-    sendStart_ = std::chrono::high_resolution_clock::now();
+    sendStart_ = std::chrono::steady_clock::now();
 
     if (dataPtr_) {
       bytes_ = dataPtr_->gpu_data->size();
@@ -315,15 +529,48 @@ void UcxExchangeServer::sendData() {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
+    // Compressed payload for this chunk, when compression is enabled and
+    // pays. Its opaque descriptor travels in the metadata message.
+    std::shared_ptr<rmm::device_buffer> compressedData;
+
+    std::shared_ptr<const AsyncCompressionResult> prepared;
+    if (getState() == ServerState::CompressionReady) {
+      prepared = std::move(compressionResult_);
+      VELOX_CHECK_NOT_NULL(prepared);
+      if (prepared->error) {
+        try {
+          std::rethrow_exception(prepared->error);
+        } catch (const std::exception& error) {
+          LOG(WARNING) << "Exchange compression failed. Sending the original "
+                          "buffer: "
+                       << error.what();
+        } catch (...) {
+          LOG(WARNING) << "Exchange compression failed with an unknown error. "
+                          "Sending the original buffer";
+        }
+      } else {
+        compressedData = prepared->data;
+      }
+    }
+
     if (dataPtr_) {
       // Copy metadata (not move) because in broadcast mode, the same
       // packed_columns may be shared across multiple destination queues.
       // Metadata is small (CPU-side), so copying is negligible.
       metadataMsg->cudfMetadata =
           std::make_unique<std::vector<uint8_t>>(*dataPtr_->metadata);
-      metadataMsg->dataSizeBytes = dataPtr_->gpu_data->size();
       metadataMsg->numRows = dataNumRows_;
-      metadataMsg->remainingBytes = {};
+      metadataMsg->compressionDescriptor = {};
+      if (compressedData) {
+        VELOX_CHECK_NOT_NULL(prepared);
+        VELOX_CHECK(!prepared->descriptor.empty());
+        metadataMsg->compressionDescriptor = prepared->descriptor;
+        VLOG(1) << "@" << partitionKey_.taskId << " compressed chunk "
+                << sequenceNumber_ << ": " << dataPtr_->gpu_data->size()
+                << " -> " << compressedData->size() << " bytes";
+      }
+      metadataMsg->dataSizeBytes =
+          compressedData ? compressedData->size() : dataPtr_->gpu_data->size();
       metadataMsg->atEnd = false;
     } else {
       VLOG(3) << "@" << partitionKey_.taskId << " Final exchange for "
@@ -331,7 +578,7 @@ void UcxExchangeServer::sendData() {
       metadataMsg->cudfMetadata = nullptr;
       metadataMsg->dataSizeBytes = 0;
       metadataMsg->numRows = 0;
-      metadataMsg->remainingBytes = {};
+      metadataMsg->compressionDescriptor = {};
       metadataMsg->atEnd = true;
     }
 
@@ -391,8 +638,9 @@ void UcxExchangeServer::sendData() {
 
     // send the data chunk (if any)
     if (dataPtr_) {
-      sendStart_ = std::chrono::high_resolution_clock::now();
-      bytes_ = dataPtr_->gpu_data->size();
+      sendStart_ = std::chrono::steady_clock::now();
+      bytes_ =
+          compressedData ? compressedData->size() : dataPtr_->gpu_data->size();
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Sending rmm::buffer: " << std::hex
@@ -417,10 +665,16 @@ void UcxExchangeServer::sendData() {
       // stays alive for UCP wireup replay.
       auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
+      dataCtx->compressedData = compressedData;
 
+      void* sendPtr = compressedData ? compressedData->data()
+                                     : dataCtx->data->gpu_data->data();
+      const std::size_t sendBytes = compressedData
+          ? compressedData->size()
+          : dataCtx->data->gpu_data->size();
       dataRequest_ = endpointRef_->endpoint_->tagSend(
-          dataCtx->data->gpu_data->data(),
-          dataCtx->data->gpu_data->size(),
+          sendPtr,
+          sendBytes,
           ucxx::Tag{dataTag},
           false,
           [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
@@ -429,9 +683,10 @@ void UcxExchangeServer::sendData() {
             // safe to free. The context shell stays alive with the Request.
             auto ctx = std::static_pointer_cast<DataSendContext>(arg);
             auto dataHolder = std::move(ctx->data);
+            auto compressedHolder = std::move(ctx->compressedData);
 
             if (auto self = weakData.lock()) {
-              self->sendComplete(status, arg);
+              self->sendComplete(status);
             }
             // dataHolder is destroyed here, releasing the GPU buffer if
             // sendComplete() already reset the server's dataPtr_.
@@ -449,9 +704,7 @@ void UcxExchangeServer::sendData() {
   }
 }
 
-void UcxExchangeServer::sendComplete(
-    ucs_status_t status,
-    std::shared_ptr<void> arg) {
+void UcxExchangeServer::sendComplete(ucs_status_t status) {
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << "@" << partitionKey_.taskId
@@ -462,11 +715,11 @@ void UcxExchangeServer::sendComplete(
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
     VELOX_CHECK_NOT_NULL(dataPtr_, "dataPtr_ is null");
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = end - sendStart_;
+    const auto end = std::chrono::steady_clock::now();
+    const auto duration = end - sendStart_;
     auto micros =
         std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    auto throughput = bytes_ / micros;
+    auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
 
     VLOG(3) << "@" << partitionKey_.taskId << " duration: "
             << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
@@ -478,6 +731,7 @@ void UcxExchangeServer::sendComplete(
     this->sequenceNumber_++;
     dataPtr_.reset(); // release memory.
     dataNumRows_ = 0;
+    compressionWork_.reset();
     VLOG(3) << "@" << partitionKey_.taskId
             << " Releasing dataPtr_ in sendComplete.";
     setState(ServerState::ReadyToTransfer);
@@ -498,8 +752,8 @@ void UcxExchangeServer::onIntraNodeRetrieveComplete() {
     return;
   }
 
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = end - sendStart_;
+  const auto end = std::chrono::steady_clock::now();
+  const auto duration = end - sendStart_;
   auto micros =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
   auto throughput = (micros > 0) ? (bytes_ / micros) : 0;

@@ -96,6 +96,7 @@ class UcxExchangeClient
   }
 
  private:
+  folly::F14FastMap<std::string, RuntimeMetric> collectStatsLocked() const;
   // Handy for ad-hoc logging.
   const std::string taskId_;
   const int destination_;
@@ -107,6 +108,7 @@ class UcxExchangeClient
   std::unordered_set<std::string> remoteTaskIds_;
   std::vector<std::shared_ptr<UcxExchangeSource>> sources_;
   bool closed_{false};
+  folly::F14FastMap<std::string, RuntimeMetric> stats_;
 
   // Total number of packed columns in flight.
   int64_t totalPendingColumns_{0};

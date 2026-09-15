@@ -458,6 +458,33 @@ void CudfConfig::initialize(
     partitionedOutputBatchRows =
         folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
+  if (config.find(kUcxExchangeCompression) != config.end()) {
+    exchangeCompression = config[kUcxExchangeCompression];
+    VELOX_USER_CHECK(
+        exchangeCompression == "none" || exchangeCompression == "column",
+        "{} must be one of: none, column. Found: {}",
+        kUcxExchangeCompression,
+        exchangeCompression);
+  }
+  if (config.find(kUcxExchangeCompressionPipelineThreads) != config.end()) {
+    exchangeCompressionPipelineThreads =
+        folly::to<int32_t>(config[kUcxExchangeCompressionPipelineThreads]);
+    VELOX_USER_CHECK(
+        exchangeCompressionPipelineThreads >= 1 &&
+            exchangeCompressionPipelineThreads <= 4,
+        "{} must be between one and four. Found: {}",
+        kUcxExchangeCompressionPipelineThreads,
+        exchangeCompressionPipelineThreads);
+  }
+  if (config.find(kUcxExchangeCompressionMinBytes) != config.end()) {
+    exchangeCompressionMinBytes =
+        folly::to<int64_t>(config[kUcxExchangeCompressionMinBytes]);
+    VELOX_USER_CHECK_GE(
+        exchangeCompressionMinBytes,
+        0,
+        "{} must not be negative",
+        kUcxExchangeCompressionMinBytes);
+  }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }

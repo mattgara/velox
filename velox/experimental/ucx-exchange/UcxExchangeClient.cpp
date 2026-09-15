@@ -74,15 +74,15 @@ void UcxExchangeClient::noMoreRemoteTasks() {
 void UcxExchangeClient::close() {
   std::vector<std::shared_ptr<UcxExchangeSource>> sources;
   {
-    std::lock_guard<std::mutex> l(queue_->mutex());
+    std::lock_guard<std::mutex> lock(queue_->mutex());
     if (closed_) {
       return;
     }
+    stats_ = collectStatsLocked();
     closed_ = true;
     sources = std::move(sources_);
   }
 
-  // Outside of mutex.
   for (auto& source : sources) {
     source->close();
   }
@@ -90,8 +90,29 @@ void UcxExchangeClient::close() {
 }
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeClient::stats() {
-  // TODO: Implement stats collection.
+  std::lock_guard<std::mutex> lock(queue_->mutex());
+  return closed_ ? stats_ : collectStatsLocked();
+}
+
+folly::F14FastMap<std::string, RuntimeMetric>
+UcxExchangeClient::collectStatsLocked() const {
   folly::F14FastMap<std::string, RuntimeMetric> stats;
+  for (const auto& source : sources_) {
+    for (const auto& [name, value] : source->metrics()) {
+      auto iterator = stats.try_emplace(name, value.unit).first;
+      iterator->second.merge(value);
+    }
+  }
+
+  stats.insert_or_assign(
+      "peakBytes",
+      RuntimeMetric(queue_->peakBytes(), RuntimeCounter::Unit::kBytes));
+  stats.insert_or_assign(
+      "numReceivedPages", RuntimeMetric(queue_->receivedTables()));
+  stats.insert_or_assign(
+      "averageReceivedPageBytes",
+      RuntimeMetric(
+          queue_->averageReceivedTablesBytes(), RuntimeCounter::Unit::kBytes));
   return stats;
 }
 

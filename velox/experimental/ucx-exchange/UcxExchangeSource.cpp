@@ -19,6 +19,8 @@
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
+#include <rmm/mr/per_device_resource.hpp>
+#include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
@@ -43,12 +45,17 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::WaitingForMetadata,
            "WaitingForMetadata"},
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
+          {UcxExchangeSource::ReceiverState::WaitingForDecompression,
+           "WaitingForDecompression"},
+          {UcxExchangeSource::ReceiverState::DecompressionReady,
+           "DecompressionReady"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
            "WaitingForIntraNodeData"},
           {UcxExchangeSource::ReceiverState::Done, "Done"},
       };
   return kNames;
 }
+
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -178,6 +185,12 @@ void UcxExchangeSource::process() {
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
       break;
+    case ReceiverState::WaitingForDecompression:
+      // Completion is published by the codec executor.
+      break;
+    case ReceiverState::DecompressionReady:
+      finishDecompression();
+      break;
     case ReceiverState::WaitingForIntraNodeData:
       // Poll for intra-node transfer data
       waitForIntraNodeData();
@@ -190,6 +203,10 @@ void UcxExchangeSource::process() {
 }
 
 void UcxExchangeSource::cleanUp() {
+  {
+    std::lock_guard<std::mutex> lock(decompressionMutex_);
+    decompressionResult_.reset();
+  }
   uint32_t value = static_cast<uint32_t>(getState());
   if (value != static_cast<uint32_t>(ReceiverState::Done)) {
     // Unexpected cleanup
@@ -266,14 +283,15 @@ folly::F14FastMap<std::string, int64_t> UcxExchangeSource::stats() const {
 
 folly::F14FastMap<std::string, RuntimeMetric> UcxExchangeSource::metrics()
     const {
-  folly::F14FastMap<std::string, RuntimeMetric> map;
-
-  // these metrics will be aggregated over all exchange sources of the same
-  // exchange client.
-  map["ucxExchangeSource.numPackedColumns"] = metrics_.numPackedColumns_;
-  map["ucxExchangeSource.totalBytes"] = metrics_.totalBytes_;
-  map["ucxExchangeSource.rttPerRequest"] = metrics_.rttPerRequest_;
-  return map;
+  std::lock_guard<std::mutex> lock(metricsMutex_);
+  return {
+      {"ucxExchangeSource.numPackedColumns", metrics_.numPackedColumns_},
+      {"ucxExchangeSource.totalBytes", metrics_.totalBytes_},
+      {"ucxExchangeSource.numCompressedPackedColumns",
+       metrics_.numCompressedPackedColumns_},
+      {"ucxExchangeSource.compressedBytes", metrics_.compressedBytes_},
+      {"ucxExchangeSource.uncompressedBytes", metrics_.uncompressedBytes_},
+      {"ucxExchangeSource.rttPerRequest", metrics_.rttPerRequest_}};
 }
 
 // private methods ---
@@ -489,8 +507,9 @@ void UcxExchangeSource::onMetadata(
 
     auto ptr = std::make_shared<DataAndMetadata>();
 
-    ptr->metadata =
-        std::move(MetadataMsg::deserializeMetadataMsg(metadataMsg->data()));
+    ptr->metadata = std::move(
+        MetadataMsg::deserializeMetadataMsg(
+            std::span<const uint8_t>{*metadataMsg}));
 
     VLOG(3) << toString()
             << " Datasize bytes == " << ptr->metadata.dataSizeBytes;
@@ -602,27 +621,167 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     std::shared_ptr<DataAndMetadata> ptr =
         std::static_pointer_cast<DataAndMetadata>(arg);
 
-    metrics_.numPackedColumns_.addValue(1);
-    metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+    {
+      std::lock_guard<std::mutex> lock(metricsMutex_);
+      metrics_.numPackedColumns_.addValue(1);
+      metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
+    }
 
-    // Create packed_columns from the received metadata and data buffer
-    cudf::packed_columns packedCols(
-        std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+    if (!ptr->metadata.compressionDescriptor.empty()) {
+      if (!setStateIf(
+              ReceiverState::WaitingForData,
+              ReceiverState::WaitingForDecompression)) {
+        return;
+      }
+      startDecompression(std::move(ptr));
+      return;
+    }
 
-    // Unpack to get the table_view and create a packed_table
-    cudf::table_view tableView = cudf::unpack(packedCols);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedCols)});
-
-    // Bundle the packed_table with the stream that was used for allocation
-    // and the producer's row count, which the packed table cannot report for
-    // itself when it has no columns.
-    auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), ptr->stream, ptr->metadata.numRows);
-
-    enqueue(std::move(data));
+    try {
+      auto result = decodeAndUnpack(std::move(ptr));
+      enqueue(std::move(result.data));
+    } catch (const std::exception& e) {
+      failDecompression(e.what());
+      return;
+    }
     setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
   }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeSource::startDecompression(
+    std::shared_ptr<DataAndMetadata> data) {
+  int device = 0;
+  const auto cudaStatus = cudaGetDevice(&device);
+  VELOX_CHECK(
+      cudaStatus == cudaSuccess,
+      "Failed to get decode CUDA device: {}",
+      cudaGetErrorString(cudaStatus));
+
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  communicator_->submitCodecTask(
+      [weak, data = std::move(data), device]() mutable {
+        auto self = weak.lock();
+        if (!self || self->closed_.load(std::memory_order_acquire)) {
+          return;
+        }
+
+        auto result = std::make_unique<DecompressionResult>();
+        try {
+          const auto status = cudaSetDevice(device);
+          VELOX_CHECK(
+              status == cudaSuccess,
+              "Failed to set decode CUDA device {}: {}",
+              device,
+              cudaGetErrorString(status));
+          *result = self->decodeAndUnpack(std::move(data));
+        } catch (...) {
+          result->error = std::current_exception();
+        }
+        self->onDecompressionComplete(std::move(result));
+      });
+}
+
+void UcxExchangeSource::onDecompressionComplete(
+    std::unique_ptr<DecompressionResult> result) {
+  if (closed_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(decompressionMutex_);
+    if (getState() != ReceiverState::WaitingForDecompression) {
+      return;
+    }
+    decompressionResult_ = std::move(result);
+    if (!setStateIf(
+            ReceiverState::WaitingForDecompression,
+            ReceiverState::DecompressionReady)) {
+      decompressionResult_.reset();
+      return;
+    }
+  }
+  communicator_->addToWorkQueue(getSelfPtr());
+}
+
+void UcxExchangeSource::finishDecompression() {
+  std::unique_ptr<DecompressionResult> result;
+  {
+    std::lock_guard<std::mutex> lock(decompressionMutex_);
+    result = std::move(decompressionResult_);
+  }
+  VELOX_CHECK_NOT_NULL(result);
+
+  if (result->error) {
+    try {
+      std::rethrow_exception(result->error);
+    } catch (const std::exception& error) {
+      failDecompression(error.what());
+    } catch (...) {
+      failDecompression("Unknown codec error");
+    }
+    return;
+  }
+
+  if (result->compressed) {
+    {
+      std::lock_guard<std::mutex> lock(metricsMutex_);
+      metrics_.numCompressedPackedColumns_.addValue(1);
+      metrics_.compressedBytes_.addValue(result->encodedBytes);
+      metrics_.uncompressedBytes_.addValue(result->decodedBytes);
+    }
+    VLOG(1) << toString() << " column-decompressed chunk "
+            << sequenceNumber_ - 1 << ": " << result->encodedBytes << " -> "
+            << result->decodedBytes << " bytes";
+  }
+  enqueue(std::move(result->data));
+  if (setStateIf(
+          ReceiverState::DecompressionReady, ReceiverState::ReadyToReceive)) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+}
+
+UcxExchangeSource::DecompressionResult UcxExchangeSource::decodeAndUnpack(
+    std::shared_ptr<DataAndMetadata> ptr) {
+  DecompressionResult result;
+
+  // A non-empty extension field contains an opaque codec descriptor. Invalid
+  // descriptors fail the exchange rather than treating encoded bytes as a
+  // raw packed allocation.
+  if (!ptr->metadata.compressionDescriptor.empty()) {
+    auto descriptor =
+        cudf_velox::compression::PackedColumnsDescriptor::deserialize(
+            ptr->metadata.compressionDescriptor);
+    VELOX_CHECK(descriptor.has_value(), "Malformed packed-column descriptor");
+
+    const auto memoryResource = rmm::mr::get_current_device_resource_ref();
+    cudf_velox::compression::PackedColumnsCodec codec{
+        ptr->stream, memoryResource, memoryResource};
+    result.encodedBytes = ptr->dataBuf->size();
+    auto blob = codec.decompress(
+        {static_cast<const uint8_t*>(ptr->dataBuf->data()),
+         result.encodedBytes},
+        *descriptor);
+    result.decodedBytes = blob.size();
+    result.compressed = true;
+    ptr->dataBuf = std::make_unique<rmm::device_buffer>(std::move(blob));
+  }
+
+  cudf::packed_columns packedCols(
+      std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+  cudf::table_view tableView = cudf::unpack(packedCols);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedCols)});
+  result.data = std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), ptr->stream, ptr->metadata.numRows);
+  return result;
+}
+
+void UcxExchangeSource::failDecompression(const std::string& message) {
+  VLOG(0) << toString() << " exchange decompression failed: " << message;
+  queue_->setError(std::string("exchange decompression failed: ") + message);
+  deliverEndMarker();
+  setState(ReceiverState::Done);
   communicator_->addToWorkQueue(getSelfPtr());
 }
 
@@ -769,8 +928,11 @@ void UcxExchangeSource::onIntraNodeData(
           << " Intra-node transfer: received data for seq=" << sequenceNumber_
           << " size=" << data->gpu_data->size();
 
-  metrics_.numPackedColumns_.addValue(1);
-  metrics_.totalBytes_.addValue(data->gpu_data->size());
+  {
+    std::lock_guard<std::mutex> lock(metricsMutex_);
+    metrics_.numPackedColumns_.addValue(1);
+    metrics_.totalBytes_.addValue(data->gpu_data->size());
+  }
 
   // Convert packed_columns to PackedTableWithStream for the queue.
   // Create packed_columns from the shared data.

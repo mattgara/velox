@@ -16,9 +16,11 @@
 
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 
-#include <cstring>
-#include <stdexcept>
 #include "velox/common/base/Exceptions.h"
+
+#include <cstring>
+#include <limits>
+#include <stdexcept>
 
 namespace facebook::velox::ucx_exchange {
 
@@ -31,17 +33,52 @@ uint32_t fnv1a_32(std::string_view s) {
   return hash;
 }
 
-std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {
-  uint32_t totalSize = getSerializedSize();
+namespace {
+
+std::size_t serializedSize(const MetadataMsg& metadata) {
+  std::size_t totalSize = sizeof(kMagicNumber) + sizeof(uint32_t);
+  const auto addSize = [&totalSize](std::size_t size) {
+    VELOX_CHECK_LE(
+        size,
+        std::numeric_limits<std::size_t>::max() - totalSize,
+        "Metadata serialized size overflow");
+    totalSize += size;
+  };
+
+  addSize(sizeof(WireLengthType));
+  addSize(metadata.cudfMetadata ? metadata.cudfMetadata->size() : 0);
+  addSize(sizeof(metadata.dataSizeBytes));
+  addSize(sizeof(metadata.numRows));
+  addSize(sizeof(WireLengthType));
+  VELOX_CHECK_LE(
+      metadata.compressionDescriptor.size(),
+      std::numeric_limits<std::size_t>::max() /
+          sizeof(metadata.compressionDescriptor[0]),
+      "Compression descriptor size overflow");
+  addSize(
+      metadata.compressionDescriptor.size() *
+      sizeof(metadata.compressionDescriptor[0]));
+  addSize(sizeof(uint8_t));
+  return totalSize;
+}
+
+} // namespace
+
+std::pair<std::shared_ptr<uint8_t>, std::size_t> MetadataMsg::serialize()
+    const {
+  const auto requiredSize = serializedSize(*this);
+  VELOX_CHECK_GE(dataSizeBytes, 0, "Cannot serialize a negative data size");
+  VELOX_CHECK_GE(numRows, 0, "Cannot serialize a negative row count");
 
   VELOX_CHECK_LE(
-      totalSize,
+      requiredSize,
       kMaxMetaBufSize,
       "Metadata serialized size ({}) exceeds maximum buffer size ({}). "
       "This can happen with extremely wide tables. "
       "Consider reducing table width or increasing kMaxMetaBufSize.",
-      totalSize,
+      requiredSize,
       kMaxMetaBufSize);
+  const auto totalSize = static_cast<uint32_t>(requiredSize);
 
   auto deleter = [](uint8_t* p) { delete[] p; };
   std::shared_ptr<uint8_t> buffer(new uint8_t[totalSize], deleter);
@@ -54,7 +91,7 @@ std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {
   std::memcpy(ptr, &totalSize, sizeof(totalSize));
   ptr += sizeof(totalSize);
 
-  WireLengthType cudfSize = cudfMetadata ? cudfMetadata->size() : 0;
+  const WireLengthType cudfSize = cudfMetadata ? cudfMetadata->size() : 0;
   std::memcpy(ptr, &cudfSize, sizeof(cudfSize));
   ptr += sizeof(cudfSize);
 
@@ -69,25 +106,29 @@ std::pair<std::shared_ptr<uint8_t>, size_t> MetadataMsg::serialize() {
   std::memcpy(ptr, &numRows, sizeof(numRows));
   ptr += sizeof(numRows);
 
-  WireLengthType numRemaining = remainingBytes.size();
-  std::memcpy(ptr, &numRemaining, sizeof(numRemaining));
-  ptr += sizeof(numRemaining);
+  const WireLengthType descriptorWordCount = compressionDescriptor.size();
+  std::memcpy(ptr, &descriptorWordCount, sizeof(descriptorWordCount));
+  ptr += sizeof(descriptorWordCount);
 
-  if (numRemaining > 0) {
-    auto bytesSize = numRemaining * sizeof(remainingBytes[0]);
-    std::memcpy(ptr, remainingBytes.data(), bytesSize);
+  if (descriptorWordCount > 0) {
+    const auto bytesSize =
+        descriptorWordCount * sizeof(compressionDescriptor[0]);
+    std::memcpy(ptr, compressionDescriptor.data(), bytesSize);
     ptr += bytesSize;
   }
 
-  uint8_t atEndByte = atEnd ? 1 : 0;
+  const uint8_t atEndByte = atEnd ? 1 : 0;
   *ptr = atEndByte;
 
-  return std::make_pair<std::shared_ptr<uint8_t>, size_t>(
-      std::move(buffer), totalSize);
+  return {std::move(buffer), requiredSize};
 }
 
-MetadataMsg MetadataMsg::deserializeMetadataMsg(const uint8_t* buffer) {
-  const uint8_t* ptr = buffer;
+MetadataMsg MetadataMsg::deserializeMetadataMsg(
+    std::span<const uint8_t> buffer) {
+  if (buffer.size() < kMetaHeaderSize) {
+    throw std::runtime_error("Insufficient data for metadata header");
+  }
+  const uint8_t* ptr = buffer.data();
 
   MetadataMsg record;
 
@@ -99,50 +140,77 @@ MetadataMsg MetadataMsg::deserializeMetadataMsg(const uint8_t* buffer) {
   uint32_t totalSize = 0;
   std::memcpy(&totalSize, ptr, sizeof(totalSize));
   ptr += sizeof(totalSize);
+  if (totalSize < kMetaHeaderSize || totalSize > buffer.size() ||
+      totalSize > kMaxMetaBufSize) {
+    throw std::runtime_error("Invalid metadata serialized size");
+  }
 
-  const uint8_t* endPtr = buffer + totalSize;
+  const uint8_t* endPtr = buffer.data() + totalSize;
+  const auto remaining = [&]() {
+    return static_cast<std::size_t>(endPtr - ptr);
+  };
+  const auto requireBytes = [&](std::size_t size, const char* message) {
+    if (size > remaining()) {
+      throw std::runtime_error(message);
+    }
+  };
 
   WireLengthType metaSize = 0;
-  if (ptr + sizeof(metaSize) > endPtr)
-    throw std::runtime_error("Insufficient data for cudfMetadata size");
+  requireBytes(sizeof(metaSize), "Insufficient data for cudfMetadata size");
   std::memcpy(&metaSize, ptr, sizeof(metaSize));
   ptr += sizeof(metaSize);
 
-  record.cudfMetadata = std::make_unique<std::vector<uint8_t>>(metaSize);
+  if (metaSize > remaining()) {
+    throw std::runtime_error("Insufficient data for cudfMetadata bytes");
+  }
+  const auto metadataSize = static_cast<std::size_t>(metaSize);
+  record.cudfMetadata = std::make_unique<std::vector<uint8_t>>(metadataSize);
   if (metaSize > 0) {
-    if (ptr + metaSize > endPtr)
-      throw std::runtime_error("Insufficient data for cudfMetadata bytes");
-    std::memcpy(record.cudfMetadata->data(), ptr, metaSize);
-    ptr += metaSize;
+    std::memcpy(record.cudfMetadata->data(), ptr, metadataSize);
+    ptr += metadataSize;
   }
 
-  if (ptr + sizeof(record.dataSizeBytes) > endPtr)
-    throw std::runtime_error("Insufficient data for dataSizeBytes");
+  requireBytes(
+      sizeof(record.dataSizeBytes), "Insufficient data for dataSizeBytes");
   std::memcpy(&record.dataSizeBytes, ptr, sizeof(record.dataSizeBytes));
   ptr += sizeof(record.dataSizeBytes);
+  if (record.dataSizeBytes < 0) {
+    throw std::runtime_error("Negative dataSizeBytes");
+  }
 
-  if (ptr + sizeof(record.numRows) > endPtr)
-    throw std::runtime_error("Insufficient data for numRows");
+  requireBytes(sizeof(record.numRows), "Insufficient data for numRows");
   std::memcpy(&record.numRows, ptr, sizeof(record.numRows));
   ptr += sizeof(record.numRows);
+  if (record.numRows < 0) {
+    throw std::runtime_error("Negative numRows");
+  }
 
-  WireLengthType numRemaining = 0;
-  if (ptr + sizeof(numRemaining) > endPtr)
-    throw std::runtime_error("Insufficient data for remainingBytes count");
-  std::memcpy(&numRemaining, ptr, sizeof(numRemaining));
-  ptr += sizeof(numRemaining);
+  WireLengthType descriptorWordCount = 0;
+  requireBytes(
+      sizeof(descriptorWordCount),
+      "Insufficient data for compression descriptor count");
+  std::memcpy(&descriptorWordCount, ptr, sizeof(descriptorWordCount));
+  ptr += sizeof(descriptorWordCount);
 
-  record.remainingBytes.resize(numRemaining);
-  if (numRemaining > 0) {
-    auto bytesSize = numRemaining * sizeof(record.remainingBytes[0]);
-    if (ptr + bytesSize > endPtr)
-      throw std::runtime_error("Insufficient data for remainingBytes values");
-    std::memcpy(record.remainingBytes.data(), ptr, bytesSize);
+  if (descriptorWordCount >
+      remaining() / sizeof(record.compressionDescriptor[0])) {
+    throw std::runtime_error(
+        "Insufficient data for compression descriptor values");
+  }
+  const auto descriptorSize = static_cast<std::size_t>(descriptorWordCount);
+  record.compressionDescriptor.resize(descriptorSize);
+  if (descriptorWordCount > 0) {
+    const auto bytesSize =
+        descriptorSize * sizeof(record.compressionDescriptor[0]);
+    std::memcpy(record.compressionDescriptor.data(), ptr, bytesSize);
     ptr += bytesSize;
   }
 
-  if (ptr + 1 > endPtr) {
-    throw std::runtime_error("Insufficient data for atEnd flag");
+  if (remaining() != sizeof(uint8_t)) {
+    throw std::runtime_error("Invalid trailing metadata bytes");
+  }
+  if (*ptr > 1) {
+    throw std::runtime_error("Invalid atEnd flag");
   }
   record.atEnd = (*ptr != 0);
 

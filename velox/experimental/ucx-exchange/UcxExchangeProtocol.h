@@ -16,7 +16,9 @@
 #pragma once
 
 #include <cinttypes>
+#include <cstddef>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,50 +108,30 @@ constexpr uint32_t kMetaHeaderSize = sizeof(kMagicNumber) + sizeof(uint32_t);
 /// ensures serialize() and deserializeMetadataMsg() agree on field widths.
 using WireLengthType = uint64_t;
 using WireDataSizeType = int64_t;
-using WireRemainingElementType = int64_t;
+using WireCompressionDescriptorWord = int64_t;
 /// A cuDF table's row count is a cudf::size_type, so it cannot exceed
 /// 2^31 - 1 and needs no more than 32 bits on the wire.
 using WireRowCountType = int32_t;
 
 struct MetadataMsg {
   std::unique_ptr<std::vector<uint8_t>> cudfMetadata;
-  WireDataSizeType dataSizeBytes;
+  WireDataSizeType dataSizeBytes{0};
 
   /// Logical rows in the payload. Sent explicitly because cuDF derives a
   /// table's row count from its columns, so a payload with no columns — an
   /// exchange fragment whose output layout is empty — cannot report its own
   /// row count once it has been packed. Bounded by cudf::size_type, which is
   /// also what bounds the CudfVector the consumer rebuilds.
-  WireRowCountType numRows;
+  WireRowCountType numRows{0};
 
-  std::vector<WireRemainingElementType> remainingBytes;
-  bool atEnd;
-
-  uint32_t getSerializedSize() const {
-    // The header: the magic number and the metadata length.
-    uint32_t totalSize = sizeof(kMagicNumber) + sizeof(totalSize);
-    // cudfMetadata: length info and then the data.
-    WireLengthType cudfSize = cudfMetadata ? cudfMetadata->size() : 0;
-    totalSize += sizeof(cudfSize);
-    totalSize += cudfSize;
-    // dataSizeBytes
-    totalSize += sizeof(dataSizeBytes);
-    // numRows
-    totalSize += sizeof(numRows);
-    // remainingBytes: length and then the data.
-    totalSize += sizeof(WireLengthType); // for numRemaining count
-    totalSize += remainingBytes.size() * sizeof(remainingBytes[0]);
-    // atEnd, encoded in a byte.
-    totalSize += sizeof(uint8_t);
-
-    return totalSize;
-  }
+  std::vector<WireCompressionDescriptorWord> compressionDescriptor;
+  bool atEnd{false};
 
   /// Serializes this metadata record into a newly allocated buffer.
-  std::pair<std::shared_ptr<uint8_t>, size_t> serialize();
+  std::pair<std::shared_ptr<uint8_t>, std::size_t> serialize() const;
 
   /// Deserializes a MetadataMsg from a buffer produced by serialize().
-  static MetadataMsg deserializeMetadataMsg(const uint8_t* buffer);
+  static MetadataMsg deserializeMetadataMsg(std::span<const uint8_t> buffer);
 };
 
 } // namespace facebook::velox::ucx_exchange

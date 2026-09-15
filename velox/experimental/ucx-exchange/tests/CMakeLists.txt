@@ -33,6 +33,34 @@ add_test(
 
 set_tests_properties(ucx_exchange_test PROPERTIES LABELS cuda_driver TIMEOUT 3000)
 
+string(
+  CONCAT
+    UCX_COMPRESSION_TEST_FILTER
+    "*compressionTcpRoundTripAndRawFallback*"
+    ":*UcxExchangeProtocolTest*"
+    ":*malformedCompressionDescriptor*"
+    ":*sharesBroadcastCompressionWork*"
+    ":*decompressionFailurePropagatesToQueue*"
+    ":*compressionCompletionAfterCloseIsIgnored*"
+)
+
+# Compression is intentionally skipped for CUDA-IPC endpoints. Run the focused
+# consumer scenarios over a real UCX host-staged transport so they exercise
+# descriptor carriage, asynchronous codec work, and raw fallback.
+add_test(
+  NAME ucx_exchange_compression_test
+  COMMAND ucx_exchange_test
+          "--gtest_filter=${UCX_COMPRESSION_TEST_FILTER}"
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_tests_properties(
+  ucx_exchange_compression_test
+  PROPERTIES
+    ENVIRONMENT "UCX_TLS=tcp,cuda_copy"
+    LABELS cuda_driver
+    TIMEOUT 3000
+)
+
 target_link_libraries(
   ucx_exchange_test
   velox_ucx_exchange

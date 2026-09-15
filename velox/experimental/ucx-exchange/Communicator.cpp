@@ -49,6 +49,11 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     instancePtr_ = std::shared_ptr<Communicator>(new Communicator());
     instancePtr_->port_ = port;
     instancePtr_->coordinatorURL_ = coordinatorURL;
+    instancePtr_->codecExecutor_ =
+        std::make_unique<LazyCPUThreadPoolExecutor>(
+            static_cast<std::size_t>(CudfConfig::getInstance()
+                                         .exchangeCompressionPipelineThreads),
+            "ucx-codec");
     // Generate a random unique worker ID for same-process detection.
     // std::random_device reads from /dev/urandom on Linux (non-blocking).
     // A 64-bit random value has negligible collision probability.
@@ -93,6 +98,9 @@ std::shared_ptr<Communicator> Communicator::getInstance() {
 }
 
 Communicator::~Communicator() {
+  // Wait for codec callbacks while the communicator and CUDA resources they
+  // reference are still alive.
+  codecExecutor_.reset();
   listener_.reset();
   // Note: worker_->flush() was removed - it only applies to RMA (Remote Memory
   // Access) operations like ucp_put/ucp_get, which this code doesn't use.
@@ -280,6 +288,11 @@ void Communicator::addToWorkQueue(std::shared_ptr<CommElement> comms) {
   }
   workQueue_.push(comms);
   signalWorker();
+}
+
+void Communicator::submitCodecTask(folly::Func task) {
+  VELOX_CHECK_NOT_NULL(codecExecutor_);
+  codecExecutor_->add(std::move(task));
 }
 
 void Communicator::unregister(std::shared_ptr<CommElement> comms) {
