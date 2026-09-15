@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include <thread>
 
 #include <cudf/contiguous_split.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
 #include <rmm/mr/per_device_resource.hpp>
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
+#include "velox/experimental/ucx-exchange/UcxCompressionCostModel.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
 using namespace facebook::velox::exec;
@@ -54,6 +57,15 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::Done, "Done"},
       };
   return kNames;
+}
+
+UcxCompressionCostModel& compressionCostModel() {
+  return UcxCompressionCostModel::instance(
+      cudf_velox::CudfConfig::getInstance().exchangeCompressionSafetyMargin);
+}
+
+bool isAdaptiveCompressionMode(std::string_view mode) {
+  return mode == "column-adaptive";
 }
 
 } // namespace
@@ -730,6 +742,11 @@ void UcxExchangeSource::finishDecompression() {
       metrics_.compressedBytes_.addValue(result->encodedBytes);
       metrics_.uncompressedBytes_.addValue(result->decodedBytes);
     }
+    if (isAdaptiveCompressionMode(
+            cudf_velox::CudfConfig::getInstance().exchangeCompression)) {
+      compressionCostModel().recordDecode(
+          partitionKey_.taskId, result->decodedBytes, result->decodeSeconds);
+    }
     VLOG(1) << toString() << " column-decompressed chunk "
             << sequenceNumber_ - 1 << ": " << result->encodedBytes << " -> "
             << result->decodedBytes << " bytes";
@@ -758,10 +775,14 @@ UcxExchangeSource::DecompressionResult UcxExchangeSource::decodeAndUnpack(
     cudf_velox::compression::PackedColumnsCodec codec{
         ptr->stream, memoryResource, memoryResource};
     result.encodedBytes = ptr->dataBuf->size();
+    const auto start = std::chrono::steady_clock::now();
     auto blob = codec.decompress(
         {static_cast<const uint8_t*>(ptr->dataBuf->data()),
          result.encodedBytes},
         *descriptor);
+    result.decodeSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
     result.decodedBytes = blob.size();
     result.compressed = true;
     ptr->dataBuf = std::make_unique<rmm::device_buffer>(std::move(blob));

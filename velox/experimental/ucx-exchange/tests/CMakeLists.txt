@@ -17,6 +17,7 @@ add_executable(
   UcxOutputQueueManagerTest.cpp
   UcxPartitionedOutputTest.cpp
   UcxExchangeTest.cpp
+  UcxCompressionCostModelTest.cpp
   Main.cpp
   UcxTestHelpers.cpp
   UcxTestData.cpp

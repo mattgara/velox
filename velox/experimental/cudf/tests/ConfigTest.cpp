@@ -32,7 +32,8 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kUcxExchangeCompression, "column"},
       {CudfConfig::kUcxExchangeCompressionPipelineThreads, "2"},
-      {CudfConfig::kUcxExchangeCompressionMinBytes, "268435456"}};
+      {CudfConfig::kUcxExchangeCompressionMinBytes, "268435456"},
+      {CudfConfig::kUcxExchangeCompressionSafetyMargin, "1.5"}};
 
   CudfConfig config;
   config.initialize(std::move(options));
@@ -45,6 +46,15 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.exchangeCompression, "column");
   ASSERT_EQ(config.exchangeCompressionPipelineThreads, 2);
   ASSERT_EQ(config.exchangeCompressionMinBytes, 268435456);
+  ASSERT_DOUBLE_EQ(config.exchangeCompressionSafetyMargin, 1.5);
+}
+
+TEST(ConfigTest, adaptiveCompressionConfig) {
+  std::unordered_map<std::string, std::string> options = {
+      {CudfConfig::kUcxExchangeCompression, "column-adaptive"}};
+  CudfConfig config;
+  config.initialize(std::move(options));
+  ASSERT_EQ(config.exchangeCompression, "column-adaptive");
 }
 
 TEST(ConfigTest, rejectsInvalidCompressionConfig) {
@@ -58,5 +68,8 @@ TEST(ConfigTest, rejectsInvalidCompressionConfig) {
   expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "0");
   expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "5");
   expectRejected(CudfConfig::kUcxExchangeCompressionMinBytes, "-1");
+  expectRejected(CudfConfig::kUcxExchangeCompressionSafetyMargin, "0.99");
+  expectRejected(CudfConfig::kUcxExchangeCompressionSafetyMargin, "nan");
+  expectRejected(CudfConfig::kUcxExchangeCompressionSafetyMargin, "inf");
 }
 } // namespace facebook::velox::cudf_velox::test
