@@ -17,16 +17,19 @@
 
 #include <cudf/contiguous_split.hpp>
 #include <folly/Synchronized.h>
+#include <rmm/device_buffer.hpp>
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <velox/exec/Task.h>
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <chrono>
+#include <exception>
 #include <future>
 #include <memory>
 #include <tuple>
 #include "velox/common/EnumDeclare.h"
 #include "velox/common/EnumDefine.h"
+#include "velox/common/base/GTestMacros.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/PartitionKey.h"
@@ -43,6 +46,8 @@ class UcxExchangeServer
     ReadyToTransfer,
     WaitingForDataFromQueue,
     DataReady,
+    WaitingForCompression,
+    CompressionReady,
     WaitingForSendComplete,
     WaitingForIntraNodeRetrieve,
     Done,
@@ -56,6 +61,9 @@ class UcxExchangeServer
   /// @param key The partition key identifying the data to serve.
   /// @param isIntraNodeTransfer True if the source is on the same node,
   ///        determined by checking if the peer's IP is in the local IP set.
+  VELOX_FRIEND_TEST(UcxExchangeServerTest, sharesBroadcastCompressionWork);
+  VELOX_FRIEND_TEST(UcxExchangeTest, compressionCompletionAfterCloseIsIgnored);
+
   static std::shared_ptr<UcxExchangeServer> create(
       const std::shared_ptr<Communicator> communicator,
       std::shared_ptr<EndpointRef> endpointRef,
@@ -87,11 +95,42 @@ class UcxExchangeServer
   /// @return A shared pointer to itself.
   std::shared_ptr<UcxExchangeServer> getSelfPtr();
 
+  struct AsyncCompressionResult {
+    std::shared_ptr<rmm::device_buffer> data;
+    std::vector<int64_t> descriptor;
+    std::exception_ptr error;
+  };
+
+  struct SharedCompressionWork;
+
+  /// Returns true when this chunk should be compressed away from the UCXX
+  /// progress thread.
+  bool shouldCompressCurrentChunk();
+
+  /// Returns true only when UCP identifies this as a non-CUDA-IPC endpoint.
+  /// Unknown transports fail closed and are queried again on a later chunk.
+  bool endpointAllowsCompression();
+
+  /// Submits the current chunk to the bounded codec executor.
+  void startCompression();
+
+  /// Returns shared codec work for a packed buffer. Broadcast output places
+  /// the same packed_columns object in every destination queue, so sharing by
+  /// object identity makes exactly one destination own the encode.
+  static std::pair<std::shared_ptr<SharedCompressionWork>, bool>
+  acquireSharedCompressionWork(
+      const std::shared_ptr<cudf::packed_columns>& input);
+
+  /// Publish a codec result back to the communicator state machine.
+  void onCompressionComplete(
+      const std::shared_ptr<cudf::packed_columns>& input,
+      std::shared_ptr<const AsyncCompressionResult> result);
+
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
   /// @brief Completion handler after data has been sent.
-  void sendComplete(ucs_status_t status, std::shared_ptr<void> arg);
+  void sendComplete(ucs_status_t status);
 
   /// @brief Completion handler for intra-node transfer after source retrieves
   /// data.
@@ -121,6 +160,11 @@ class UcxExchangeServer
   /// Logical rows in 'dataPtr_', taken from the output queue rather than from
   /// the packed table, which reports zero rows when it has no columns.
   vector_size_t dataNumRows_{0};
+  /// Completed asynchronous codec result, protected by dataMutex_.
+  std::shared_ptr<const AsyncCompressionResult> compressionResult_;
+  /// Keeps this destination subscribed to shared broadcast codec work until
+  /// its result has been consumed.
+  std::shared_ptr<SharedCompressionWork> compressionWork_;
   /// Protects dataPtr_. Must be recursive because sendData() holds the lock
   /// when calling tagSend(), and for small messages UCX completes inline via
   /// its fast-completion path, firing the sendComplete() callback on the same
@@ -152,7 +196,7 @@ class UcxExchangeServer
   // server.
   std::vector<std::shared_ptr<ucxx::Request>> completedRequests_;
 
-  std::chrono::time_point<std::chrono::high_resolution_clock> sendStart_;
+  std::chrono::steady_clock::time_point sendStart_;
   std::size_t bytes_;
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;

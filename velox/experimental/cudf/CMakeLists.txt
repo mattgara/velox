@@ -14,7 +14,7 @@
 
 option(VELOX_ENABLE_CUDF_COMPRESSION "Build GPU compression for cudf::packed_columns." OFF)
 
-if(VELOX_ENABLE_CUDF_COMPRESSION)
+if(VELOX_ENABLE_CUDF_COMPRESSION OR VELOX_ENABLE_UCX_EXCHANGE)
   add_subdirectory(compression)
 endif()
 

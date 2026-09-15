@@ -17,6 +17,7 @@
 
 #include "velox/common/EnumDeclare.h"
 #include "velox/common/EnumDefine.h"
+#include "velox/common/base/GTestMacros.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/Exchange.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -36,15 +37,26 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <cstddef>
+#include <exception>
+#include <mutex>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
   UcxExchangeMetrics()
-      : numPackedColumns_(RuntimeMetric(RuntimeCounter::Unit::kNone)),
+      : numPackedColumns_(RuntimeCounter::Unit::kNone),
         totalBytes_(RuntimeCounter::Unit::kBytes),
-        rttPerRequest_(RuntimeMetric(RuntimeCounter::Unit::kNanos)) {}
-  RuntimeMetric numPackedColumns_; // total number of packed columns received.
-  RuntimeMetric totalBytes_; // total number of bytes received
+        numCompressedPackedColumns_(RuntimeCounter::Unit::kNone),
+        compressedBytes_(RuntimeCounter::Unit::kBytes),
+        uncompressedBytes_(RuntimeCounter::Unit::kBytes),
+        rttPerRequest_(RuntimeCounter::Unit::kNanos) {}
+
+  RuntimeMetric numPackedColumns_;
+  RuntimeMetric totalBytes_;
+  RuntimeMetric numCompressedPackedColumns_;
+  RuntimeMetric compressedBytes_;
+  RuntimeMetric uncompressedBytes_;
   RuntimeMetric rttPerRequest_;
 };
 
@@ -71,6 +83,8 @@ class UcxExchangeSource
     ReadyToReceive,
     WaitingForMetadata,
     WaitingForData,
+    WaitingForDecompression,
+    DecompressionReady,
     WaitingForIntraNodeData,
     Done,
   };
@@ -141,12 +155,24 @@ class UcxExchangeSource
     return obj;
   }
 
+  VELOX_FRIEND_TEST(UcxExchangeSourceTest, malformedCompressionDescriptor);
+  VELOX_FRIEND_TEST(UcxExchangeTest, decompressionFailurePropagatesToQueue);
+  VELOX_FRIEND_TEST(UcxExchangeTest, compressionCompletionAfterCloseIsIgnored);
+
  private:
   struct DataAndMetadata {
     MetadataMsg metadata;
     std::unique_ptr<rmm::device_buffer> dataBuf;
     cuda::stream_ref stream{
         cudaStream_t{cudaStreamDefault}}; // The stream used to allocate dataBuf
+  };
+
+  struct DecompressionResult {
+    PackedTableWithStreamPtr data;
+    std::size_t encodedBytes{0};
+    std::size_t decodedBytes{0};
+    bool compressed{false};
+    std::exception_ptr error;
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -199,6 +225,21 @@ class UcxExchangeSource
   /// @param status indication by transport layer of transfer status
   /// @param arg
   void onData(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Submits synchronous decompression away from the UCX progress thread.
+  void startDecompression(std::shared_ptr<DataAndMetadata> data);
+
+  /// Decompresses when required and reconstructs a packed table.
+  DecompressionResult decodeAndUnpack(std::shared_ptr<DataAndMetadata> data);
+
+  /// Publishes codec completion without mutating the exchange queue.
+  void onDecompressionComplete(std::unique_ptr<DecompressionResult> result);
+
+  /// Consumes codec completion on the communicator thread.
+  void finishDecompression();
+
+  /// Reports a decode failure without unwinding the UCX progress thread.
+  void failDecompression(const std::string& message);
 
   /// @brief Initiates receiving the HandshakeResponse from server.
   void receiveHandshakeResponse();
@@ -289,7 +330,13 @@ class UcxExchangeSource
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
 
+  // The codec executor publishes exactly one result here. The communicator
+  // thread consumes it and performs all queue and receiver-state mutations.
+  std::mutex decompressionMutex_;
+  std::unique_ptr<DecompressionResult> decompressionResult_;
+
   // Some metrics/counters:
+  mutable std::mutex metricsMutex_;
   UcxExchangeMetrics metrics_;
 
   // The outstanding request - there can only be one outstanding request
