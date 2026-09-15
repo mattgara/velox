@@ -171,6 +171,7 @@ class UcxExchangeSource
     PackedTableWithStreamPtr data;
     std::size_t encodedBytes{0};
     std::size_t decodedBytes{0};
+    double decodeSeconds{0.0};
     bool compressed{false};
     std::exception_ptr error;
   };

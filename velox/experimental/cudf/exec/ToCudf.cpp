@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfConversion.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
@@ -22,7 +23,6 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/PrestoAggregateFunctions.h"
-#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
@@ -36,6 +36,8 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <cuda.h>
+
+#include <cmath>
 
 static const std::string kCudfAdapterName = "cuDF";
 
@@ -473,8 +475,9 @@ void CudfConfig::initialize(
   if (config.find(kUcxExchangeCompression) != config.end()) {
     exchangeCompression = config[kUcxExchangeCompression];
     VELOX_USER_CHECK(
-        exchangeCompression == "none" || exchangeCompression == "column",
-        "{} must be one of: none, column. Found: {}",
+        exchangeCompression == "none" || exchangeCompression == "column" ||
+            exchangeCompression == "column-adaptive",
+        "{} must be one of: none, column, column-adaptive. Found: {}",
         kUcxExchangeCompression,
         exchangeCompression);
   }
@@ -496,6 +499,16 @@ void CudfConfig::initialize(
         0,
         "{} must not be negative",
         kUcxExchangeCompressionMinBytes);
+  }
+  if (config.find(kUcxExchangeCompressionSafetyMargin) != config.end()) {
+    exchangeCompressionSafetyMargin =
+        folly::to<double>(config[kUcxExchangeCompressionSafetyMargin]);
+    VELOX_USER_CHECK(
+        std::isfinite(exchangeCompressionSafetyMargin) &&
+            exchangeCompressionSafetyMargin >= 1.0,
+        "{} must be finite and at least one. Found: {}",
+        kUcxExchangeCompressionSafetyMargin,
+        exchangeCompressionSafetyMargin);
   }
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);

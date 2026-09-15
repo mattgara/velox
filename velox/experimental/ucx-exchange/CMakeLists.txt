@@ -18,6 +18,7 @@ set(
   UcxQueues.cpp
   UcxExchange.cpp
   UcxExchangeProtocol.cpp
+  UcxCompressionCostModel.cpp
   UcxExchangeSource.cpp
   UcxExchangeServer.cpp
   UcxExchangeQueue.cpp

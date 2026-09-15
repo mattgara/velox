@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
+#include "velox/experimental/ucx-exchange/UcxCompressionCostModel.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 
@@ -64,8 +65,17 @@ bool meetsCompressionMinimum(std::size_t bytes) {
 
 constexpr std::size_t kSharedCompressionRegistryCleanupInterval = 1024;
 
+UcxCompressionCostModel& compressionCostModel() {
+  return UcxCompressionCostModel::instance(
+      cudf_velox::CudfConfig::getInstance().exchangeCompressionSafetyMargin);
+}
+
+bool isAdaptiveCompressionMode(std::string_view mode) {
+  return mode == "column-adaptive";
+}
+
 bool isColumnCompressionMode(std::string_view mode) {
-  return mode == "column";
+  return mode == "column" || isAdaptiveCompressionMode(mode);
 }
 
 } // namespace
@@ -390,7 +400,31 @@ bool UcxExchangeServer::shouldCompressCurrentChunk() {
     return false;
   }
 
-  return endpointAllowsCompression();
+  if (!endpointAllowsCompression()) {
+    return false;
+  }
+
+  if (!isAdaptiveCompressionMode(mode)) {
+    return true;
+  }
+
+  const auto decision = compressionCostModel().decide(
+      partitionKey_.taskId, dataPtr_->gpu_data->size());
+  VLOG(1) << "[UCX-COMPRESSION-DECISION] worker="
+          << communicator_->getWorkerId() << " task=" << partitionKey_.taskId
+          << " destination=" << partitionKey_.destination
+          << " seq=" << sequenceNumber_
+          << " action=" << UcxCompressionCostModel::actionName(decision.action)
+          << " rawBytes=" << dataPtr_->gpu_data->size()
+          << " encodeSamples=" << decision.encodeSamples
+          << " transferSamples=" << decision.transferSamples
+          << " decodeSamples=" << decision.decodeSamples
+          << " encodedRatio=" << decision.encodedRatio
+          << " effectiveTransferBps="
+          << decision.effectiveTransferBytesPerSecond
+          << " transferSavedSeconds=" << decision.estimatedTransferSavedSeconds
+          << " codecSeconds=" << decision.estimatedCodecSeconds;
+  return decision.action != UcxCompressionCostModel::Action::kRaw;
 }
 
 void UcxExchangeServer::startCompression() {
@@ -399,6 +433,9 @@ void UcxExchangeServer::startCompression() {
   VELOX_CHECK_NOT_NULL(dataPtr_);
 
   auto input = dataPtr_;
+  const bool adaptive = isAdaptiveCompressionMode(
+      cudf_velox::CudfConfig::getInstance().exchangeCompression);
+  const auto taskId = partitionKey_.taskId;
   int device = 0;
   auto cudaStatus = cudaGetDevice(&device);
   VELOX_CHECK(
@@ -423,34 +460,49 @@ void UcxExchangeServer::startCompression() {
     return;
   }
 
-  communicator_->submitCodecTask([work, input, device]() mutable {
-    auto result = std::make_shared<AsyncCompressionResult>();
-    try {
-      const auto status = cudaSetDevice(device);
-      VELOX_CHECK(
-          status == cudaSuccess,
-          "Failed to set codec CUDA device {}: {}",
-          device,
-          cudaGetErrorString(status));
+  communicator_->submitCodecTask(
+      [work, input, device, adaptive, taskId]() mutable {
+        auto result = std::make_shared<AsyncCompressionResult>();
+        try {
+          const auto status = cudaSetDevice(device);
+          VELOX_CHECK(
+              status == cudaSuccess,
+              "Failed to set codec CUDA device {}: {}",
+              device,
+              cudaGetErrorString(status));
 
-      // The returned device buffer retains this stream for asynchronous
-      // deallocation after the UCX send completes. Use a process-lifetime
-      // pool stream so the buffer cannot outlive its stream.
-      const auto codecStream =
-          cudf_velox::cudfGlobalStreamPool().get_stream();
-      const auto memoryResource = rmm::mr::get_current_device_resource_ref();
-      cudf_velox::compression::PackedColumnsCodec codec{
-          codecStream, memoryResource, memoryResource};
-      if (auto compressed = codec.compress(*input)) {
-        result->descriptor = compressed->descriptor.serialize();
-        result->data = std::make_shared<rmm::device_buffer>(
-            std::move(compressed->data));
-      }
-    } catch (...) {
-      result->error = std::current_exception();
-    }
-    work->complete(std::move(result));
-  });
+          // The returned device buffer retains this stream for asynchronous
+          // deallocation after the UCX send completes. Use a process-lifetime
+          // pool stream so the buffer cannot outlive its stream.
+          const auto codecStream =
+              cudf_velox::cudfGlobalStreamPool().get_stream();
+          const auto memoryResource =
+              rmm::mr::get_current_device_resource_ref();
+          cudf_velox::compression::PackedColumnsCodec codec{
+              codecStream, memoryResource, memoryResource};
+          const auto start = std::chrono::steady_clock::now();
+          auto compressed = codec.compress(*input);
+          const auto encodeSeconds =
+              std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+          if (adaptive) {
+            compressionCostModel().recordEncode(
+                taskId,
+                input->gpu_data->size(),
+                compressed ? compressed->data.size() : input->gpu_data->size(),
+                encodeSeconds);
+          }
+          if (compressed) {
+            result->descriptor = compressed->descriptor.serialize();
+            result->data = std::make_shared<rmm::device_buffer>(
+                std::move(compressed->data));
+          }
+        } catch (...) {
+          result->error = std::current_exception();
+        }
+        work->complete(std::move(result));
+      });
 }
 
 void UcxExchangeServer::onCompressionComplete(
@@ -718,8 +770,18 @@ void UcxExchangeServer::sendComplete(ucs_status_t status) {
 
     const auto end = std::chrono::steady_clock::now();
     const auto duration = end - sendStart_;
+    const double seconds = std::chrono::duration<double>(duration).count();
     auto micros =
         std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+
+    const auto& compressionMode =
+        cudf_velox::CudfConfig::getInstance().exchangeCompression;
+    if (isAdaptiveCompressionMode(compressionMode) &&
+        meetsCompressionMinimum(dataPtr_->gpu_data->size()) &&
+        endpointAllowsCompression()) {
+      compressionCostModel().recordTransfer(
+          partitionKey_.taskId, bytes_, seconds);
+    }
     auto throughput = (micros > 0) ? (bytes_ / micros) : 0;
 
     VLOG(3) << "@" << partitionKey_.taskId << " duration: "
