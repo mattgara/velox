@@ -1,0 +1,2 @@
+gh-pr-tool live collapse and push fixture
+anchor before collapse
