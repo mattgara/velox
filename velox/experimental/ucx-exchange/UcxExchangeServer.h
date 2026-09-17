@@ -197,7 +197,11 @@ class UcxExchangeServer
   std::vector<std::shared_ptr<ucxx::Request>> completedRequests_;
 
   std::chrono::steady_clock::time_point sendStart_;
-  std::size_t bytes_;
+  std::size_t bytes_{0};
+  /// Size of the original packed allocation for the in-flight transfer.
+  /// A compressed send can release dataPtr_ before DMA completes, so transfer
+  /// accounting must not depend on the raw allocation remaining alive.
+  std::size_t uncompressedBytes_{0};
 
   std::shared_ptr<UcxOutputQueueManager> queueMgr_;
 };
