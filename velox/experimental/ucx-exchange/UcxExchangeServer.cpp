@@ -78,6 +78,29 @@ bool isColumnCompressionMode(std::string_view mode) {
   return mode == "column" || isAdaptiveCompressionMode(mode);
 }
 
+cudf_velox::compression::CompressionOptions compressionCodecOptions(
+    std::string_view mode) {
+  using cudf_velox::compression::CompressionOptions;
+  using cudf_velox::compression::EntropyEncoding;
+  using cudf_velox::compression::NumericTransform;
+
+  if (mode == "for") {
+    return {NumericTransform::kFrameOfReference, EntropyEncoding::kNone};
+  }
+  if (mode == "for-ans") {
+    return {NumericTransform::kFrameOfReference, EntropyEncoding::kAns};
+  }
+  if (mode == "delta-for") {
+    return {
+        NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kNone};
+  }
+  if (mode == "delta-for-ans") {
+    return {NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kAns};
+  }
+  VELOX_CHECK_EQ(mode, "automatic-ans");
+  return {NumericTransform::kAutomatic, EntropyEncoding::kAns};
+}
+
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -435,6 +458,8 @@ void UcxExchangeServer::startCompression() {
   auto input = dataPtr_;
   const bool adaptive = isAdaptiveCompressionMode(
       cudf_velox::CudfConfig::getInstance().exchangeCompression);
+  const auto codecOptions = compressionCodecOptions(
+      cudf_velox::CudfConfig::getInstance().exchangeCompressionCodec);
   const auto taskId = partitionKey_.taskId;
   int device = 0;
   auto cudaStatus = cudaGetDevice(&device);
@@ -461,7 +486,7 @@ void UcxExchangeServer::startCompression() {
   }
 
   communicator_->submitCodecTask(
-      [work, input, device, adaptive, taskId]() mutable {
+      [work, input, device, adaptive, taskId, codecOptions]() mutable {
         auto result = std::make_shared<AsyncCompressionResult>();
         try {
           const auto status = cudaSetDevice(device);
@@ -481,7 +506,7 @@ void UcxExchangeServer::startCompression() {
           cudf_velox::compression::PackedColumnsCodec codec{
               codecStream, memoryResource, memoryResource};
           const auto start = std::chrono::steady_clock::now();
-          auto compressed = codec.compress(*input);
+          auto compressed = codec.compress(*input, codecOptions);
           const auto encodeSeconds =
               std::chrono::duration<double>(
                   std::chrono::steady_clock::now() - start)

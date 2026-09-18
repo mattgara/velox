@@ -64,6 +64,8 @@ struct CudfConfig {
       "cudf.partitioned_output_batch_rows"};
   static constexpr const char* kUcxExchangeCompression{
       "cudf.exchange_compression"};
+  static constexpr const char* kUcxExchangeCompressionCodec{
+      "cudf.exchange_compression_codec"};
   static constexpr const char* kUcxExchangeCompressionPipelineThreads{
       "cudf.exchange_compression_pipeline_threads"};
   static constexpr const char* kUcxExchangeCompressionMinBytes{
@@ -129,6 +131,10 @@ struct CudfConfig {
   /// GPU codec for the UCX exchange payload.
   /// Supported values: none, column, column-adaptive.
   std::string exchangeCompression{"none"};
+
+  /// Local experiment selector for the packed-column codec pipeline.
+  /// Supported values: automatic-ans, for-ans, for, delta-for-ans, delta-for.
+  std::string exchangeCompressionCodec{"automatic-ans"};
 
   /// Maximum number of codec tasks executing concurrently per worker.
   int32_t exchangeCompressionPipelineThreads{1};

@@ -33,6 +33,7 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kUcxExchangeCompression, "column"},
+      {CudfConfig::kUcxExchangeCompressionCodec, "for"},
       {CudfConfig::kUcxExchangeCompressionPipelineThreads, "2"},
       {CudfConfig::kUcxExchangeCompressionMinBytes, "268435456"},
       {CudfConfig::kUcxExchangeCompressionSafetyMargin, "1.5"}};
@@ -50,6 +51,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.exchangeCompression, "column");
+  ASSERT_EQ(config.exchangeCompressionCodec, "for");
   ASSERT_EQ(config.exchangeCompressionPipelineThreads, 2);
   ASSERT_EQ(config.exchangeCompressionMinBytes, 268435456);
   ASSERT_DOUBLE_EQ(config.exchangeCompressionSafetyMargin, 1.5);
@@ -71,6 +73,7 @@ TEST(ConfigTest, rejectsInvalidCompressionConfig) {
   };
 
   expectRejected(CudfConfig::kUcxExchangeCompression, "invalid");
+  expectRejected(CudfConfig::kUcxExchangeCompressionCodec, "invalid");
   expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "0");
   expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "5");
   expectRejected(CudfConfig::kUcxExchangeCompressionMinBytes, "-1");
