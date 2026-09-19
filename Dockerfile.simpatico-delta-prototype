@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=mgara-local/pr2-codec-shootout-nsys:20260919
+FROM ${BASE_IMAGE}
+
+ARG BUILD_BASE_DIR=/presto_native_release_gpu_ON_codec_shootout_integrated_20260918_build
+ARG NUM_THREADS=8
+
+ENV CC=/opt/rh/gcc-toolset-14/root/bin/gcc \
+    CXX=/opt/rh/gcc-toolset-14/root/bin/g++
+
+RUN --mount=type=bind,from=presto,source=.,target=/presto_native_staging/presto \
+    --mount=type=bind,from=velox,source=.,target=/presto_native_staging/presto/velox \
+    --mount=type=cache,id=mgara-codec-shootout-integrated-20260918,target=${BUILD_BASE_DIR},sharing=locked \
+    <<EOF
+set -euxo pipefail
+source /opt/rh/gcc-toolset-14/enable
+cmake --build "${BUILD_BASE_DIR}" \
+  --target cudf_compression_test cudf_compression_benchmark \
+  -j "${NUM_THREADS}"
+mkdir -p /opt/simpatico-delta/lib
+test_binary="${BUILD_BASE_DIR}/velox/velox/experimental/cudf/compression/tests/cudf_compression_test"
+benchmark_binary="${BUILD_BASE_DIR}/velox/velox/experimental/cudf/compression/tests/cudf_compression_benchmark"
+cp "${test_binary}" "${benchmark_binary}" /opt/simpatico-delta/
+ldd "${test_binary}" | \
+  awk 'NF == 4 && $3 != "not" { system("cp -L " $3 " /opt/simpatico-delta/lib/") }'
+ldd "${benchmark_binary}" | \
+  awk 'NF == 4 && $3 != "not" { system("cp -L " $3 " /opt/simpatico-delta/lib/") }'
+EOF
+
+ENV LD_LIBRARY_PATH=/opt/simpatico-delta/lib:/usr/local/lib
+ENTRYPOINT ["/opt/simpatico-delta/cudf_compression_test"]

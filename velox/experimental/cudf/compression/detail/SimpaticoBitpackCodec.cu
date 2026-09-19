@@ -25,9 +25,11 @@
 // clang-format on
 
 #include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_scan.cuh>
 
 #include <algorithm>
+#include <cuda/std/bit>
 #include <cuda/std/limits>
 #include <stdexcept>
 #include <type_traits>
@@ -36,6 +38,10 @@ namespace facebook::velox::cudf_velox::compression::detail {
 namespace {
 
 constexpr int kThreadsPerBlock = 128;
+constexpr int kValuesPerThread = kSimpaticoTileRows / kThreadsPerBlock;
+static_assert(kValuesPerThread * kThreadsPerBlock == kSimpaticoTileRows);
+constexpr uint8_t kDeltaMode = 0x80;
+constexpr uint8_t kWidthMask = 0x7f;
 
 template <typename T>
 struct Minimum {
@@ -56,14 +62,35 @@ __device__ int bitWidth(uint64_t value) {
 }
 
 template <typename T>
+__device__ uint64_t adjustedValue(
+    const T* input,
+    std::size_t tileStart,
+    int index,
+    bool useDelta,
+    T base) {
+  using Unsigned = std::make_unsigned_t<T>;
+  const auto current = static_cast<Unsigned>(input[tileStart + index]);
+  auto transformed = current;
+  if (useDelta) {
+    const auto previous = tileStart + index == 0
+        ? current
+        : static_cast<Unsigned>(input[tileStart + index - 1]);
+    transformed = current - previous;
+  }
+  return static_cast<uint64_t>(transformed - static_cast<Unsigned>(base));
+}
+
+template <typename T>
 __global__ void analyzeAndPackKernel(
     const T* input,
     std::size_t elementCount,
     T* tileMinimums,
+    T* tileReferences,
     uint8_t* tileBits,
     uint32_t* tileWordCounts,
     uint32_t* overallocatedPacked,
-    std::size_t tileStrideWords) {
+    std::size_t tileStrideWords,
+    SimpaticoTransform requestedTransform) {
   const auto tile = static_cast<std::size_t>(blockIdx.x);
   const auto tileStart = tile * kSimpaticoTileRows;
   if (tileStart >= elementCount) {
@@ -74,41 +101,83 @@ __global__ void analyzeAndPackKernel(
       remainingElements < kSimpaticoTileRows ? remainingElements
                                              : kSimpaticoTileRows);
 
+  using Unsigned = std::make_unsigned_t<T>;
+  using SignedDelta = std::make_signed_t<Unsigned>;
   T localMinimum = cuda::std::numeric_limits<T>::max();
   T localMaximum = cuda::std::numeric_limits<T>::lowest();
+  SignedDelta localDeltaMinimum = cuda::std::numeric_limits<SignedDelta>::max();
+  SignedDelta localDeltaMaximum =
+      cuda::std::numeric_limits<SignedDelta>::lowest();
   for (int index = threadIdx.x; index < tileSize; index += blockDim.x) {
     const auto value = input[tileStart + index];
     localMinimum = value < localMinimum ? value : localMinimum;
     localMaximum = value > localMaximum ? value : localMaximum;
+    const auto current = static_cast<Unsigned>(value);
+    const auto previous = tileStart + index == 0
+        ? current
+        : static_cast<Unsigned>(input[tileStart + index - 1]);
+    const auto delta = cuda::std::bit_cast<SignedDelta>(current - previous);
+    localDeltaMinimum = delta < localDeltaMinimum ? delta : localDeltaMinimum;
+    localDeltaMaximum = delta > localDeltaMaximum ? delta : localDeltaMaximum;
   }
 
-  using Reduction = cub::BlockReduce<T, kThreadsPerBlock>;
-  __shared__ typename Reduction::TempStorage reductionStorage;
+  using ValueReduction = cub::BlockReduce<T, kThreadsPerBlock>;
+  using DeltaReduction = cub::BlockReduce<SignedDelta, kThreadsPerBlock>;
+  __shared__ typename ValueReduction::TempStorage valueReductionStorage;
+  __shared__ typename DeltaReduction::TempStorage deltaReductionStorage;
   __shared__ T sharedMinimum;
   __shared__ T sharedMaximum;
+  __shared__ SignedDelta sharedDeltaMinimum;
+  __shared__ SignedDelta sharedDeltaMaximum;
   const auto minimum =
-      Reduction(reductionStorage).Reduce(localMinimum, Minimum<T>{});
+      ValueReduction(valueReductionStorage).Reduce(localMinimum, Minimum<T>{});
   if (threadIdx.x == 0) {
     sharedMinimum = minimum;
   }
   __syncthreads();
   const auto maximum =
-      Reduction(reductionStorage).Reduce(localMaximum, Maximum<T>{});
+      ValueReduction(valueReductionStorage).Reduce(localMaximum, Maximum<T>{});
   if (threadIdx.x == 0) {
     sharedMaximum = maximum;
   }
   __syncthreads();
+  const auto deltaMinimum =
+      DeltaReduction(deltaReductionStorage)
+          .Reduce(localDeltaMinimum, Minimum<SignedDelta>{});
+  if (threadIdx.x == 0) {
+    sharedDeltaMinimum = deltaMinimum;
+  }
+  __syncthreads();
+  const auto deltaMaximum =
+      DeltaReduction(deltaReductionStorage)
+          .Reduce(localDeltaMaximum, Maximum<SignedDelta>{});
+  if (threadIdx.x == 0) {
+    sharedDeltaMaximum = deltaMaximum;
+  }
+  __syncthreads();
 
-  using Unsigned = std::make_unsigned_t<T>;
-  const auto base = sharedMinimum;
-  const auto range = static_cast<uint64_t>(
-      static_cast<Unsigned>(sharedMaximum) - static_cast<Unsigned>(base));
-  const auto bits = bitWidth(range);
+  const auto frameRange = static_cast<uint64_t>(
+      static_cast<Unsigned>(sharedMaximum) -
+      static_cast<Unsigned>(sharedMinimum));
+  const auto deltaRange = static_cast<uint64_t>(
+      static_cast<Unsigned>(sharedDeltaMaximum) -
+      static_cast<Unsigned>(sharedDeltaMinimum));
+  const auto frameBits = bitWidth(frameRange);
+  const auto deltaBits = bitWidth(deltaRange);
+  const auto useDelta =
+      requestedTransform == SimpaticoTransform::kDeltaFrameOfReference ||
+      (requestedTransform == SimpaticoTransform::kAutomatic &&
+       deltaBits < frameBits);
+  const auto base =
+      useDelta ? cuda::std::bit_cast<T>(sharedDeltaMinimum) : sharedMinimum;
+  const auto bits = useDelta ? deltaBits : frameBits;
   const auto liveWords =
       static_cast<uint32_t>((static_cast<uint64_t>(tileSize) * bits + 31) / 32);
   if (threadIdx.x == 0) {
     tileMinimums[tile] = base;
-    tileBits[tile] = static_cast<uint8_t>(bits);
+    tileReferences[tile] = tileStart == 0 ? input[0] : input[tileStart - 1];
+    tileBits[tile] =
+        static_cast<uint8_t>(bits) | (useDelta ? kDeltaMode : uint8_t{0});
     tileWordCounts[tile] = liveWords;
   }
   if (bits == 0) {
@@ -120,8 +189,7 @@ __global__ void analyzeAndPackKernel(
     if (bits == 32) {
       for (int index = threadIdx.x; index < tileSize; index += blockDim.x) {
         destination[index] = static_cast<uint32_t>(
-            static_cast<Unsigned>(input[tileStart + index]) -
-            static_cast<Unsigned>(base));
+            adjustedValue(input, tileStart, index, useDelta, base));
       }
       return;
     }
@@ -129,9 +197,8 @@ __global__ void analyzeAndPackKernel(
   if constexpr (sizeof(T) == sizeof(uint64_t)) {
     if (bits == 64) {
       for (int index = threadIdx.x; index < tileSize; index += blockDim.x) {
-        const auto adjusted = static_cast<uint64_t>(
-            static_cast<Unsigned>(input[tileStart + index]) -
-            static_cast<Unsigned>(base));
+        const auto adjusted =
+            adjustedValue(input, tileStart, index, useDelta, base);
         destination[2 * index] = static_cast<uint32_t>(adjusted);
         destination[2 * index + 1] = static_cast<uint32_t>(adjusted >> 32);
       }
@@ -140,9 +207,8 @@ __global__ void analyzeAndPackKernel(
   }
 
   for (int index = threadIdx.x; index < tileSize; index += blockDim.x) {
-    const auto adjusted = static_cast<uint64_t>(
-        static_cast<Unsigned>(input[tileStart + index]) -
-        static_cast<Unsigned>(base));
+    const auto adjusted =
+        adjustedValue(input, tileStart, index, useDelta, base);
     auto remaining = bits;
     auto sourceBit = 0;
     auto targetWord = (index * bits) >> 5;
@@ -203,8 +269,8 @@ __global__ void deriveWordCountsKernel(
   if (tile >= tileCount) {
     return;
   }
-  const auto bits = static_cast<int>(tileBits[tile]);
-  if (bits < 0 || bits > maximumBits) {
+  const auto bits = static_cast<int>(tileBits[tile] & kWidthMask);
+  if (bits > maximumBits) {
     atomicExch(invalid, 1);
     wordCounts[tile] = 0;
     return;
@@ -236,11 +302,13 @@ unpackOne(const uint32_t* packed, int bits, uint32_t index) {
 template <typename T>
 __global__ void unpackKernel(
     const T* tileMinimums,
+    const T* tileReferences,
     const uint8_t* tileBits,
     const uint32_t* offsets,
     const uint32_t* packed,
     std::size_t elementCount,
     T* output) {
+  using Unsigned = std::make_unsigned_t<T>;
   const auto tile = static_cast<std::size_t>(blockIdx.x);
   const auto tileStart = tile * kSimpaticoTileRows;
   if (tileStart >= elementCount) {
@@ -250,15 +318,54 @@ __global__ void unpackKernel(
   const auto tileSize = remainingElements < kSimpaticoTileRows
       ? remainingElements
       : kSimpaticoTileRows;
-  const auto bits = static_cast<int>(tileBits[tile]);
-  using Unsigned = std::make_unsigned_t<T>;
+  const auto encodedBits = tileBits[tile];
+  const auto bits = static_cast<int>(encodedBits & kWidthMask);
+  const auto useDelta = (encodedBits & kDeltaMode) != 0;
   const auto base = static_cast<Unsigned>(tileMinimums[tile]);
   const auto* input = packed + offsets[tile];
   auto* unsignedOutput = reinterpret_cast<Unsigned*>(output);
-  for (std::size_t index = threadIdx.x; index < tileSize; index += blockDim.x) {
-    const auto adjusted =
-        bits == 0 ? uint64_t{0} : unpackOne(input, bits, index);
-    unsignedOutput[tileStart + index] = base + static_cast<Unsigned>(adjusted);
+
+  if (!useDelta) {
+    for (std::size_t index = threadIdx.x; index < tileSize;
+         index += blockDim.x) {
+      const auto adjusted =
+          bits == 0 ? uint64_t{0} : unpackOne(input, bits, index);
+      unsignedOutput[tileStart + index] =
+          base + static_cast<Unsigned>(adjusted);
+    }
+    return;
+  }
+
+  Unsigned values[kValuesPerThread];
+#pragma unroll
+  for (int value = 0; value < kValuesPerThread; ++value) {
+    const auto index = threadIdx.x * kValuesPerThread + value;
+    const auto adjusted = index < tileSize && bits != 0
+        ? unpackOne(input, bits, index)
+        : uint64_t{0};
+    values[value] =
+        index < tileSize ? base + static_cast<Unsigned>(adjusted) : Unsigned{0};
+  }
+
+  using Scan = cub::BlockScan<Unsigned, kThreadsPerBlock>;
+  __shared__ typename Scan::TempStorage scanStorage;
+  __shared__ Unsigned transposed[kSimpaticoTileRows];
+  Scan(scanStorage).InclusiveSum(values, values);
+  const auto reference = static_cast<Unsigned>(tileReferences[tile]);
+#pragma unroll
+  for (int value = 0; value < kValuesPerThread; ++value) {
+    const auto index = threadIdx.x * kValuesPerThread + value;
+    if (index < tileSize) {
+      transposed[index] = reference + values[value];
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int value = 0; value < kValuesPerThread; ++value) {
+    const auto index = value * blockDim.x + threadIdx.x;
+    if (index < tileSize) {
+      unsignedOutput[tileStart + index] = transposed[index];
+    }
   }
 }
 
@@ -267,7 +374,7 @@ __global__ void unpackKernel(
       type.id() == cudf::type_id::UINT64;
 }
 
-[[nodiscard]] std::size_t bitsOffset(
+[[nodiscard]] std::size_t referenceOffset(
     std::size_t rawSize,
     cudf::data_type type) {
   const auto tiles = simpaticoTileCount(rawSize, type);
@@ -277,10 +384,25 @@ __global__ void unpackKernel(
       "Simpatico minimum array size overflow"));
 }
 
+[[nodiscard]] std::size_t bitsOffset(
+    std::size_t rawSize,
+    cudf::data_type type) {
+  const auto tiles = simpaticoTileCount(rawSize, type);
+  const auto referencesEnd = checkedAddSizes(
+      referenceOffset(rawSize, type),
+      checkedMultiplySizes(
+          tiles,
+          static_cast<std::size_t>(cudf::size_of(type)),
+          "Simpatico reference array size overflow"),
+      "Simpatico metadata size overflow");
+  return nvcompAlignedSize(referencesEnd);
+}
+
 template <typename T>
 [[nodiscard]] rmm::device_buffer compressTyped(
     cudf::device_span<const uint8_t> input,
     cudf::data_type logicalType,
+    SimpaticoTransform transform,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref memoryResource) {
   const auto elementCount = input.size() / sizeof(T);
@@ -291,6 +413,11 @@ template <typename T>
   rmm::device_buffer minimums{
       checkedMultiplySizes(
           tileCount, sizeof(T), "Simpatico minimum array size overflow"),
+      stream,
+      memoryResource};
+  rmm::device_buffer references{
+      checkedMultiplySizes(
+          tileCount, sizeof(T), "Simpatico reference array size overflow"),
       stream,
       memoryResource};
   rmm::device_buffer bits{tileCount, stream, memoryResource};
@@ -325,10 +452,12 @@ template <typename T>
           reinterpret_cast<const T*>(input.data()),
           elementCount,
           static_cast<T*>(minimums.data()),
+          static_cast<T*>(references.data()),
           static_cast<uint8_t*>(bits.data()),
           static_cast<uint32_t*>(wordCounts.data()),
           static_cast<uint32_t*>(overallocated.data()),
-          tileStrideWords);
+          tileStrideWords,
+          transform);
   CUDF_CUDA_TRY(cudaGetLastError());
 
   std::size_t scanBytes = 0;
@@ -382,6 +511,13 @@ template <typename T>
       output.data(),
       minimums.data(),
       minimums.size(),
+      cudaMemcpyDeviceToDevice,
+      stream.value()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      static_cast<uint8_t*>(output.data()) +
+          referenceOffset(input.size(), logicalType),
+      references.data(),
+      references.size(),
       cudaMemcpyDeviceToDevice,
       stream.value()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(
@@ -508,6 +644,8 @@ void decompressTyped(
          0,
          stream.value()>>>(
           reinterpret_cast<const T*>(input.data()),
+          reinterpret_cast<const T*>(
+              input.data() + referenceOffset(output.size(), logicalType)),
           input.data() + bitsOffset(output.size(), logicalType),
           static_cast<const uint32_t*>(offsets.data()),
           reinterpret_cast<const uint32_t*>(input.data() + packedOffset),
@@ -549,22 +687,23 @@ std::size_t simpaticoPackedOffset(
 rmm::device_buffer compressSimpaticoBitpack(
     cudf::device_span<const uint8_t> input,
     cudf::data_type logicalType,
+    SimpaticoTransform transform,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temporaryMemoryResource) {
   if (cudf::size_of(logicalType) == 8) {
     if (usesUnsignedStorage(logicalType)) {
       return compressTyped<uint64_t>(
-          input, logicalType, stream, temporaryMemoryResource);
+          input, logicalType, transform, stream, temporaryMemoryResource);
     }
     return compressTyped<int64_t>(
-        input, logicalType, stream, temporaryMemoryResource);
+        input, logicalType, transform, stream, temporaryMemoryResource);
   }
   if (usesUnsignedStorage(logicalType)) {
     return compressTyped<uint32_t>(
-        input, logicalType, stream, temporaryMemoryResource);
+        input, logicalType, transform, stream, temporaryMemoryResource);
   }
   return compressTyped<int32_t>(
-      input, logicalType, stream, temporaryMemoryResource);
+      input, logicalType, transform, stream, temporaryMemoryResource);
 }
 
 void decompressSimpaticoBitpack(

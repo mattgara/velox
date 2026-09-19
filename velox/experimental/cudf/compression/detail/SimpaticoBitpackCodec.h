@@ -30,9 +30,16 @@ namespace facebook::velox::cudf_velox::compression::detail {
 inline constexpr std::size_t kSimpaticoTileRows = 1024;
 inline constexpr std::size_t kSimpaticoDecodeGuardBytes = 3 * sizeof(uint32_t);
 
+enum class SimpaticoTransform {
+  kAutomatic,
+  kFrameOfReference,
+  kDeltaFrameOfReference,
+};
+
 [[nodiscard]] rmm::device_buffer compressSimpaticoBitpack(
     cudf::device_span<const uint8_t> input,
     cudf::data_type logicalType,
+    SimpaticoTransform transform,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref temporaryMemoryResource);
 

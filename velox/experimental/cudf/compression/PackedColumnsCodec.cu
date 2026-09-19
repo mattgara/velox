@@ -16,8 +16,8 @@
 #include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
 #include "velox/experimental/cudf/compression/detail/AnsCodec.h"
 #include "velox/experimental/cudf/compression/detail/CascadedCodec.h"
-#include "velox/experimental/cudf/compression/detail/SizeUtils.h"
 #include "velox/experimental/cudf/compression/detail/SimpaticoBitpackCodec.h"
+#include "velox/experimental/cudf/compression/detail/SizeUtils.h"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/contiguous_split.hpp>
@@ -55,7 +55,7 @@ constexpr int kThreadsPerBlock = 256;
 
 // ASCII "VLXPCOMP". Format identity and version are separate wire fields.
 constexpr int64_t kDescriptorMagic = 0x564c5850434f4d50LL;
-constexpr int64_t kDescriptorVersion = 4;
+constexpr int64_t kDescriptorVersion = 5;
 constexpr std::size_t kDescriptorHeaderWordCount = 4;
 constexpr std::size_t kRegionFixedWordCount = 8;
 constexpr std::size_t kMaximumBytePlaneCount = sizeof(uint64_t);
@@ -180,12 +180,15 @@ class DescriptorReader {
     return std::nullopt;
   }
 
+  const auto tileValueBytes = tileCount * elementWidth;
+  std::size_t referenceOffset = 0;
   std::size_t bitsOffset = 0;
   std::size_t metadataEnd = 0;
   std::size_t packedOffset = 0;
   std::size_t minimumSize = 0;
-  if (!detail::tryNvcompAlignedSize(
-          tileCount * elementWidth, bitsOffset) ||
+  if (!detail::tryNvcompAlignedSize(tileValueBytes, referenceOffset) ||
+      !detail::tryAddSizes(referenceOffset, tileValueBytes, bitsOffset) ||
+      !detail::tryNvcompAlignedSize(bitsOffset, bitsOffset) ||
       !detail::tryAddSizes(bitsOffset, tileCount, metadataEnd) ||
       !detail::tryNvcompAlignedSize(metadataEnd, packedOffset) ||
       !detail::tryAddSizes(
@@ -194,7 +197,6 @@ class DescriptorReader {
   }
   return minimumSize;
 }
-
 
 [[nodiscard]] std::optional<ParsedDescriptor> parseDescriptor(
     std::span<const int64_t> words) {
@@ -241,7 +243,8 @@ class DescriptorReader {
     }
 
     if (*transformValue < static_cast<int64_t>(RegionTransform::kNone) ||
-        *transformValue > static_cast<int64_t>(RegionTransform::kSimpaticoBitpack) ||
+        *transformValue >
+            static_cast<int64_t>(RegionTransform::kSimpaticoBitpack) ||
         *encodingValue < static_cast<int64_t>(RegionEncoding::kNone) ||
         *encodingValue > static_cast<int64_t>(RegionEncoding::kAns)) {
       return std::nullopt;
@@ -307,8 +310,7 @@ class DescriptorReader {
 
     auto addAlignedSegments = [&](std::size_t first) {
       std::size_t size = 0;
-      for (std::size_t segment = first;
-           segment < region.segmentSizes.size();
+      for (std::size_t segment = first; segment < region.segmentSizes.size();
            ++segment) {
         std::size_t alignedSize = 0;
         if (!detail::tryNvcompAlignedSize(
@@ -774,9 +776,21 @@ struct EncodedTypedRegion {
       blobBase + region.offset, regionSize};
 
   if (options.typedRegionCodec == TypedRegionCodec::kSimpaticoBitpack) {
+    const auto transform = [&] {
+      switch (options.numericTransform) {
+        case NumericTransform::kAutomatic:
+          return detail::SimpaticoTransform::kAutomatic;
+        case NumericTransform::kFrameOfReference:
+          return detail::SimpaticoTransform::kFrameOfReference;
+        case NumericTransform::kDeltaFrameOfReference:
+          return detail::SimpaticoTransform::kDeltaFrameOfReference;
+      }
+      CUDF_FAIL("Invalid numeric transform", std::invalid_argument);
+    }();
     auto encoded = detail::compressSimpaticoBitpack(
         input,
         region.logicalType,
+        transform,
         state.stream,
         state.temporaryMemoryResource);
     CUDF_EXPECTS(
@@ -784,8 +798,7 @@ struct EncodedTypedRegion {
         "Simpatico bitpack payload exceeds descriptor capacity",
         std::overflow_error);
     descriptor.transform = RegionTransform::kSimpaticoBitpack;
-    descriptor.segmentSizes.push_back(
-        static_cast<uint32_t>(encoded.size()));
+    descriptor.segmentSizes.push_back(static_cast<uint32_t>(encoded.size()));
     return {std::move(descriptor), std::move(encoded)};
   }
 
@@ -795,10 +808,7 @@ struct EncodedTypedRegion {
       "Invalid candidate typed-region codec",
       std::invalid_argument);
   auto cascaded = detail::compressCascaded(
-      input,
-      region.logicalType,
-      state.stream,
-      state.temporaryMemoryResource);
+      input, region.logicalType, state.stream, state.temporaryMemoryResource);
   CUDF_EXPECTS(
       cascaded.chunkSizes.size() <= std::numeric_limits<uint32_t>::max(),
       "Cascaded chunk count exceeds descriptor capacity",
@@ -1161,8 +1171,7 @@ void decodeTypedRegion(
         ? static_cast<std::size_t>(region.planeCount)
         : 0;
     std::size_t result = 0;
-    for (std::size_t segment = first;
-         segment < region.segmentSizes.size();
+    for (std::size_t segment = first; segment < region.segmentSizes.size();
          ++segment) {
       result = detail::checkedAddSizes(
           result,
@@ -1458,8 +1467,7 @@ rmm::device_buffer PackedColumnsCodec::decompress(
         const std::span<const uint32_t> ansSizes{
             region.segmentSizes.data() + region.planeCount,
             region.segmentSizes.size() - region.planeCount};
-        const auto cascadedSize =
-            detail::cascadedEncodedSize(cascadedSizes);
+        const auto cascadedSize = detail::cascadedEncodedSize(cascadedSizes);
         auto cascaded = detail::decompressAns(
             regionInput, ansSizes, cascadedSize, state_->ans);
         detail::decompressCascaded(

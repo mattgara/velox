@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
 #include "velox/experimental/cudf/compression/detail/AnsCodec.h"
+#include "velox/experimental/cudf/compression/detail/SimpaticoBitpackCodec.h"
 #include "velox/experimental/cudf/compression/detail/SizeUtils.h"
 
 #include <cudf/column/column.hpp>
@@ -289,24 +290,17 @@ TEST(PackedColumnsCodecTest, CandidateTypedCodecsRoundTrip) {
     bool expectAns;
   };
   const std::vector<Candidate> candidates{
-      {TypedRegionCodec::kNvcompCascaded,
-       kNvcompCascadedTransform,
-       false},
-      {TypedRegionCodec::kNvcompCascadedAns,
-       kNvcompCascadedTransform,
-       true},
-      {TypedRegionCodec::kSimpaticoBitpack,
-       kSimpaticoBitpackTransform,
-       false}};
+      {TypedRegionCodec::kNvcompCascaded, kNvcompCascadedTransform, false},
+      {TypedRegionCodec::kNvcompCascadedAns, kNvcompCascadedTransform, true},
+      {TypedRegionCodec::kSimpaticoBitpack, kSimpaticoBitpackTransform, false}};
 
   for (const auto& candidate : candidates) {
-    const auto rows =
-        candidate.codec == TypedRegionCodec::kNvcompCascadedAns ? 1u << 23
-                                                                : kRows;
+    const auto rows = candidate.codec == TypedRegionCodec::kNvcompCascadedAns
+        ? 1u << 23
+        : kRows;
     std::vector<int64_t> values(rows);
     for (std::size_t index = 0; index < rows; ++index) {
-      values[index] =
-          candidate.codec == TypedRegionCodec::kSimpaticoBitpack
+      values[index] = candidate.codec == TypedRegionCodec::kSimpaticoBitpack
           ? 1'000'000 + static_cast<int64_t>((index * 17) % 251)
           : 1'700'000'000'000LL + static_cast<int64_t>(index) * 1'000;
     }
@@ -319,8 +313,8 @@ TEST(PackedColumnsCodecTest, CandidateTypedCodecsRoundTrip) {
 
     CompressionOptions options;
     options.typedRegionCodec = candidate.codec;
-    const auto observation = roundTrip(
-        std::move(columns), stream.view(), memoryResource, options);
+    const auto observation =
+        roundTrip(std::move(columns), stream.view(), memoryResource, options);
     ASSERT_FALSE(observation.serializedDescriptor.empty());
     EXPECT_LT(observation.compressedSize, observation.uncompressedSize);
 
@@ -328,8 +322,7 @@ TEST(PackedColumnsCodecTest, CandidateTypedCodecsRoundTrip) {
     bool foundAns = false;
     const auto& words = observation.serializedDescriptor;
     std::size_t position = kFirstRegionIndex;
-    const auto regionCount =
-        static_cast<std::size_t>(words[kRegionCountIndex]);
+    const auto regionCount = static_cast<std::size_t>(words[kRegionCountIndex]);
     for (std::size_t region = 0; region < regionCount; ++region) {
       ASSERT_LE(position + kRegionFixedWordCount, words.size());
       const auto transform = words[position + kRegionTransformOffset];
@@ -338,14 +331,60 @@ TEST(PackedColumnsCodecTest, CandidateTypedCodecsRoundTrip) {
         foundExpectedTransform = true;
         foundAns = foundAns || encoding == kAnsEncoding;
       }
-      const auto segmentCount = static_cast<std::size_t>(
-          words[position + kRegionSegmentCountOffset]);
+      const auto segmentCount =
+          static_cast<std::size_t>(words[position + kRegionSegmentCountOffset]);
       position += kRegionFixedWordCount + segmentCount;
     }
     EXPECT_TRUE(foundExpectedTransform);
     EXPECT_EQ(foundAns, candidate.expectAns);
     EXPECT_EQ(position, words.size());
   }
+}
+
+TEST(SimpaticoBitpackCodecTest, DeltaRoundTripsAcrossTileBoundaries) {
+  constexpr std::size_t kRows = 3 * detail::kSimpaticoTileRows + 17;
+  rmm::cuda_stream stream;
+  const auto memoryResource = rmm::mr::get_current_device_resource_ref();
+
+  std::vector<int64_t> signedValues(kRows);
+  std::vector<uint64_t> unsignedValues(kRows);
+  int64_t signedValue = -7'000'000'000LL;
+  uint64_t unsignedValue = std::numeric_limits<uint64_t>::max() - 100;
+  for (std::size_t index = 0; index < kRows; ++index) {
+    const auto signedStep =
+        static_cast<int64_t>((index * 17) % 29) - int64_t{14};
+    signedValue += signedStep;
+    unsignedValue += static_cast<uint64_t>(signedStep);
+    signedValues[index] = signedValue;
+    unsignedValues[index] = unsignedValue;
+  }
+
+  const auto check = [&]<typename T>(
+                         const std::vector<T>& values, cudf::type_id typeId) {
+    const auto bytes = values.size() * sizeof(T);
+    rmm::device_buffer input{
+        values.data(), bytes, stream.view(), memoryResource};
+    auto compressed = detail::compressSimpaticoBitpack(
+        {static_cast<const uint8_t*>(input.data()), input.size()},
+        cudf::data_type{typeId},
+        detail::SimpaticoTransform::kDeltaFrameOfReference,
+        stream.view(),
+        memoryResource);
+    EXPECT_LT(compressed.size(), input.size());
+
+    rmm::device_buffer output{bytes, stream.view(), memoryResource};
+    detail::decompressSimpaticoBitpack(
+        {static_cast<const uint8_t*>(compressed.data()), compressed.size()},
+        cudf::data_type{typeId},
+        {static_cast<uint8_t*>(output.data()), output.size()},
+        stream.view(),
+        memoryResource);
+    EXPECT_EQ(
+        copyToHost(output, stream.view()), copyToHost(input, stream.view()));
+  };
+
+  check(signedValues, cudf::type_id::INT64);
+  check(unsignedValues, cudf::type_id::UINT64);
 }
 
 TEST(PackedColumnsCodecTest, FrameOfReferenceWithoutAnsSupportsDirectLookup) {
