@@ -527,7 +527,6 @@ template <typename T>
           reinterpret_cast<uint32_t*>(
               static_cast<uint8_t*>(output.data()) + packedOffset));
   CUDF_CUDA_TRY(cudaGetLastError());
-  stream.synchronize();
   return output;
 }
 
@@ -640,7 +639,6 @@ void decompressTyped(
           elementCount,
           reinterpret_cast<T*>(output.data()));
   CUDF_CUDA_TRY(cudaGetLastError());
-  stream.synchronize();
 }
 
 } // namespace
