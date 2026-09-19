@@ -40,6 +40,7 @@ namespace {
 constexpr int kThreadsPerBlock = 128;
 constexpr int kValuesPerThread = kSimpaticoTileRows / kThreadsPerBlock;
 static_assert(kValuesPerThread * kThreadsPerBlock == kSimpaticoTileRows);
+constexpr std::size_t kSerialScanMaximumTiles = 1024;
 constexpr uint8_t kDeltaMode = 0x80;
 constexpr uint8_t kWidthMask = 0x7f;
 
@@ -260,6 +261,50 @@ __global__ void finishOffsetsKernel(
   }
 }
 
+__global__ void serialOffsetsKernel(
+    const uint32_t* wordCounts,
+    uint32_t* offsets,
+    std::size_t tileCount) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  uint32_t offset = 0;
+  for (std::size_t tile = 0; tile < tileCount; ++tile) {
+    offsets[tile] = offset;
+    offset += wordCounts[tile];
+  }
+  offsets[tileCount] = offset;
+}
+
+void computeOffsets(
+    const uint32_t* wordCounts,
+    uint32_t* offsets,
+    std::size_t tileCount,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref memoryResource) {
+  if (tileCount <= kSerialScanMaximumTiles) {
+    serialOffsetsKernel<<<1, 1, 0, stream.value()>>>(
+        wordCounts, offsets, tileCount);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    return;
+  }
+
+  std::size_t scanBytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+      nullptr, scanBytes, wordCounts, offsets, tileCount, stream.value()));
+  rmm::device_buffer scanTemporary{scanBytes, stream, memoryResource};
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+      scanTemporary.data(),
+      scanBytes,
+      wordCounts,
+      offsets,
+      tileCount,
+      stream.value()));
+  finishOffsetsKernel<<<1, 1, 0, stream.value()>>>(
+      wordCounts, offsets, tileCount);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
 __global__ void deriveWordCountsKernel(
     const uint8_t* tileBits,
     std::size_t elementCount,
@@ -447,29 +492,12 @@ template <typename T>
           transform);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  std::size_t scanBytes = 0;
-  CUDF_CUDA_TRY(
-      cub::DeviceScan::ExclusiveSum(
-          nullptr,
-          scanBytes,
-          static_cast<const uint32_t*>(wordCounts.data()),
-          static_cast<uint32_t*>(offsets.data()),
-          tileCount,
-          stream.value()));
-  rmm::device_buffer scanTemporary{scanBytes, stream, memoryResource};
-  CUDF_CUDA_TRY(
-      cub::DeviceScan::ExclusiveSum(
-          scanTemporary.data(),
-          scanBytes,
-          static_cast<const uint32_t*>(wordCounts.data()),
-          static_cast<uint32_t*>(offsets.data()),
-          tileCount,
-          stream.value()));
-  finishOffsetsKernel<<<1, 1, 0, stream.value()>>>(
+  computeOffsets(
       static_cast<const uint32_t*>(wordCounts.data()),
       static_cast<uint32_t*>(offsets.data()),
-      tileCount);
-  CUDF_CUDA_TRY(cudaGetLastError());
+      tileCount,
+      stream,
+      memoryResource);
 
   auto stagedLiveWords =
       cudf::detail::make_pinned_vector_async<uint32_t>(1, stream);
@@ -581,29 +609,12 @@ void decompressTyped(
       sizeof(T) * 8);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  std::size_t scanBytes = 0;
-  CUDF_CUDA_TRY(
-      cub::DeviceScan::ExclusiveSum(
-          nullptr,
-          scanBytes,
-          static_cast<const uint32_t*>(wordCounts.data()),
-          static_cast<uint32_t*>(offsets.data()),
-          tileCount,
-          stream.value()));
-  rmm::device_buffer scanTemporary{scanBytes, stream, memoryResource};
-  CUDF_CUDA_TRY(
-      cub::DeviceScan::ExclusiveSum(
-          scanTemporary.data(),
-          scanBytes,
-          static_cast<const uint32_t*>(wordCounts.data()),
-          static_cast<uint32_t*>(offsets.data()),
-          tileCount,
-          stream.value()));
-  finishOffsetsKernel<<<1, 1, 0, stream.value()>>>(
+  computeOffsets(
       static_cast<const uint32_t*>(wordCounts.data()),
       static_cast<uint32_t*>(offsets.data()),
-      tileCount);
-  CUDF_CUDA_TRY(cudaGetLastError());
+      tileCount,
+      stream,
+      memoryResource);
 
   auto stagedValidation =
       cudf::detail::make_pinned_vector_async<uint32_t>(2, stream);
