@@ -81,15 +81,13 @@ __device__ uint64_t adjustedValue(
 }
 
 template <typename T>
-__global__ void analyzeAndPackKernel(
+__global__ void analyzeKernel(
     const T* input,
     std::size_t elementCount,
     T* tileMinimums,
     T* tileReferences,
     uint8_t* tileBits,
     uint32_t* tileWordCounts,
-    uint32_t* overallocatedPacked,
-    std::size_t tileStrideWords,
     SimpaticoTransform requestedTransform) {
   const auto tile = static_cast<std::size_t>(blockIdx.x);
   const auto tileStart = tile * kSimpaticoTileRows;
@@ -180,11 +178,34 @@ __global__ void analyzeAndPackKernel(
         static_cast<uint8_t>(bits) | (useDelta ? kDeltaMode : uint8_t{0});
     tileWordCounts[tile] = liveWords;
   }
+}
+
+template <typename T>
+__global__ void packKernel(
+    const T* input,
+    std::size_t elementCount,
+    const T* tileMinimums,
+    const uint8_t* tileBits,
+    const uint32_t* offsets,
+    uint32_t* packed) {
+  const auto tile = static_cast<std::size_t>(blockIdx.x);
+  const auto tileStart = tile * kSimpaticoTileRows;
+  if (tileStart >= elementCount) {
+    return;
+  }
+  const auto remainingElements = elementCount - tileStart;
+  const auto tileSize = static_cast<int>(
+      remainingElements < kSimpaticoTileRows ? remainingElements
+                                             : kSimpaticoTileRows);
+  const auto encodedBits = tileBits[tile];
+  const auto bits = static_cast<int>(encodedBits & kWidthMask);
   if (bits == 0) {
     return;
   }
 
-  auto* destination = overallocatedPacked + tile * tileStrideWords;
+  const auto useDelta = (encodedBits & kDeltaMode) != 0;
+  const auto base = tileMinimums[tile];
+  auto* destination = packed + offsets[tile];
   if constexpr (sizeof(T) == sizeof(uint32_t)) {
     if (bits == 32) {
       for (int index = threadIdx.x; index < tileSize; index += blockDim.x) {
@@ -236,24 +257,6 @@ __global__ void finishOffsetsKernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     offsets[tileCount] =
         tileCount == 0 ? 0 : offsets[tileCount - 1] + wordCounts[tileCount - 1];
-  }
-}
-
-__global__ void compactPackedKernel(
-    const uint32_t* source,
-    std::size_t sourceStride,
-    const uint32_t* offsets,
-    uint32_t* destination,
-    std::size_t tileCount) {
-  const auto tile = static_cast<std::size_t>(blockIdx.x);
-  if (tile >= tileCount) {
-    return;
-  }
-  const auto first = offsets[tile];
-  const auto size = offsets[tile + 1] - first;
-  const auto* input = source + tile * sourceStride;
-  for (std::size_t word = threadIdx.x; word < size; word += blockDim.x) {
-    destination[first + word] = input[word];
   }
 }
 
@@ -407,8 +410,6 @@ template <typename T>
     rmm::device_async_resource_ref memoryResource) {
   const auto elementCount = input.size() / sizeof(T);
   const auto tileCount = simpaticoTileCount(input.size(), logicalType);
-  const auto tileStrideWords =
-      kSimpaticoTileRows * sizeof(T) / sizeof(uint32_t);
 
   rmm::device_buffer minimums{
       checkedMultiplySizes(
@@ -431,20 +432,8 @@ template <typename T>
           tileCount + 1, sizeof(uint32_t), "Simpatico offset size overflow"),
       stream,
       memoryResource};
-  rmm::device_buffer overallocated{
-      checkedMultiplySizes(
-          checkedMultiplySizes(
-              tileCount,
-              tileStrideWords,
-              "Simpatico overallocated word count overflow"),
-          sizeof(uint32_t),
-          "Simpatico overallocated byte size overflow"),
-      stream,
-      memoryResource};
-  CUDF_CUDA_TRY(cudaMemsetAsync(
-      overallocated.data(), 0, overallocated.size(), stream.value()));
 
-  analyzeAndPackKernel<T>
+  analyzeKernel<T>
       <<<static_cast<unsigned int>(tileCount),
          kThreadsPerBlock,
          0,
@@ -455,8 +444,6 @@ template <typename T>
           static_cast<T*>(references.data()),
           static_cast<uint8_t*>(bits.data()),
           static_cast<uint32_t*>(wordCounts.data()),
-          static_cast<uint32_t*>(overallocated.data()),
-          tileStrideWords,
           transform);
   CUDF_CUDA_TRY(cudaGetLastError());
 
@@ -527,17 +514,18 @@ template <typename T>
       bits.size(),
       cudaMemcpyDeviceToDevice,
       stream.value()));
-  compactPackedKernel<<<
-      static_cast<unsigned int>(tileCount),
-      kThreadsPerBlock,
-      0,
-      stream.value()>>>(
-      static_cast<const uint32_t*>(overallocated.data()),
-      tileStrideWords,
-      static_cast<const uint32_t*>(offsets.data()),
-      reinterpret_cast<uint32_t*>(
-          static_cast<uint8_t*>(output.data()) + packedOffset),
-      tileCount);
+  packKernel<T>
+      <<<static_cast<unsigned int>(tileCount),
+         kThreadsPerBlock,
+         0,
+         stream.value()>>>(
+          reinterpret_cast<const T*>(input.data()),
+          elementCount,
+          static_cast<const T*>(minimums.data()),
+          static_cast<const uint8_t*>(bits.data()),
+          static_cast<const uint32_t*>(offsets.data()),
+          reinterpret_cast<uint32_t*>(
+              static_cast<uint8_t*>(output.data()) + packedOffset));
   CUDF_CUDA_TRY(cudaGetLastError());
   stream.synchronize();
   return output;
