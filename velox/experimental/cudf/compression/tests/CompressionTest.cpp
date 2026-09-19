@@ -61,6 +61,8 @@ constexpr std::size_t kRegionFixedWordCount = 8;
 constexpr int64_t kNoTransform = 0;
 constexpr int64_t kFrameOfReferenceTransform = 1;
 constexpr int64_t kDeltaFrameOfReferenceTransform = 2;
+constexpr int64_t kNvcompCascadedTransform = 3;
+constexpr int64_t kSimpaticoBitpackTransform = 4;
 constexpr int64_t kNoEntropyEncoding = 0;
 constexpr int64_t kAnsEncoding = 1;
 
@@ -274,6 +276,76 @@ TEST(PackedColumnsCodecTest, RoundTripsLogicalTypesAndNullMask) {
   const auto observation =
       roundTrip(std::move(columns), stream.view(), memoryResource);
   EXPECT_LT(observation.compressedSize, observation.uncompressedSize);
+}
+
+TEST(PackedColumnsCodecTest, CandidateTypedCodecsRoundTrip) {
+  constexpr std::size_t kRows = 1u << 18;
+  rmm::cuda_stream stream;
+  const auto memoryResource = rmm::mr::get_current_device_resource_ref();
+
+  struct Candidate {
+    TypedRegionCodec codec;
+    int64_t expectedTransform;
+    bool expectAns;
+  };
+  const std::vector<Candidate> candidates{
+      {TypedRegionCodec::kNvcompCascaded,
+       kNvcompCascadedTransform,
+       false},
+      {TypedRegionCodec::kNvcompCascadedAns,
+       kNvcompCascadedTransform,
+       true},
+      {TypedRegionCodec::kSimpaticoBitpack,
+       kSimpaticoBitpackTransform,
+       false}};
+
+  for (const auto& candidate : candidates) {
+    const auto rows =
+        candidate.codec == TypedRegionCodec::kNvcompCascadedAns ? 1u << 23
+                                                                : kRows;
+    std::vector<int64_t> values(rows);
+    for (std::size_t index = 0; index < rows; ++index) {
+      values[index] =
+          candidate.codec == TypedRegionCodec::kSimpaticoBitpack
+          ? 1'000'000 + static_cast<int64_t>((index * 17) % 251)
+          : 1'700'000'000'000LL + static_cast<int64_t>(index) * 1'000;
+    }
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(makeColumn(
+        cudf::data_type{cudf::type_id::INT64},
+        values,
+        stream.view(),
+        memoryResource));
+
+    CompressionOptions options;
+    options.typedRegionCodec = candidate.codec;
+    const auto observation = roundTrip(
+        std::move(columns), stream.view(), memoryResource, options);
+    ASSERT_FALSE(observation.serializedDescriptor.empty());
+    EXPECT_LT(observation.compressedSize, observation.uncompressedSize);
+
+    bool foundExpectedTransform = false;
+    bool foundAns = false;
+    const auto& words = observation.serializedDescriptor;
+    std::size_t position = kFirstRegionIndex;
+    const auto regionCount =
+        static_cast<std::size_t>(words[kRegionCountIndex]);
+    for (std::size_t region = 0; region < regionCount; ++region) {
+      ASSERT_LE(position + kRegionFixedWordCount, words.size());
+      const auto transform = words[position + kRegionTransformOffset];
+      const auto encoding = words[position + kRegionEncodingOffset];
+      if (transform == candidate.expectedTransform) {
+        foundExpectedTransform = true;
+        foundAns = foundAns || encoding == kAnsEncoding;
+      }
+      const auto segmentCount = static_cast<std::size_t>(
+          words[position + kRegionSegmentCountOffset]);
+      position += kRegionFixedWordCount + segmentCount;
+    }
+    EXPECT_TRUE(foundExpectedTransform);
+    EXPECT_EQ(foundAns, candidate.expectAns);
+    EXPECT_EQ(position, words.size());
+  }
 }
 
 TEST(PackedColumnsCodecTest, FrameOfReferenceWithoutAnsSupportsDirectLookup) {

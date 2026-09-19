@@ -133,7 +133,8 @@ struct CudfConfig {
   std::string exchangeCompression{"none"};
 
   /// Local experiment selector for the packed-column codec pipeline.
-  /// Supported values: automatic-ans, for-ans, for, delta-for-ans, delta-for.
+  /// Supported values: automatic-ans, for-ans, for, delta-for-ans, delta-for,
+  /// nvcomp-cascaded, nvcomp-cascaded-ans, simpatico-bitpack.
   std::string exchangeCompressionCodec{"automatic-ans"};
 
   /// Maximum number of codec tasks executing concurrently per worker.

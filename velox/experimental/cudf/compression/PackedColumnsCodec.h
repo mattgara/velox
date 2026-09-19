@@ -54,9 +54,25 @@ enum class EntropyEncoding {
   kNone,
 };
 
+/** Codec used for eligible fixed-width regions in the packed allocation. */
+enum class TypedRegionCodec {
+  /** Existing byte-plane FOR or delta-FOR pipeline. */
+  kBytePlanes,
+
+  /** nvCOMP Cascaded with one delta, no RLE, and bitpacking. */
+  kNvcompCascaded,
+
+  /** nvCOMP Cascaded followed by ANS when the second stage saves bytes. */
+  kNvcompCascadedAns,
+
+  /** Simpatico-style 1,024-row tiled frame-of-reference bitpacking. */
+  kSimpaticoBitpack,
+};
+
 struct CompressionOptions {
   NumericTransform numericTransform{NumericTransform::kAutomatic};
   EntropyEncoding entropyEncoding{EntropyEncoding::kAns};
+  TypedRegionCodec typedRegionCodec{TypedRegionCodec::kBytePlanes};
 };
 
 /**
