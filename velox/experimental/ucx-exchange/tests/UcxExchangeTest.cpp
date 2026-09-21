@@ -97,8 +97,7 @@ class IncompressibleInt64Table : public BaseTableGenerator {
     return values_.size();
   }
 
-  std::unique_ptr<cudf::table> makeTable(
-      rmm::cuda_stream_view stream) override {
+  std::unique_ptr<cudf::table> makeTable(cuda::stream_ref stream) override {
     std::vector<std::unique_ptr<cudf::column>> columns;
     columns.push_back(makeNumericColumn(values_, stream));
     return std::make_unique<cudf::table>(std::move(columns));
@@ -108,7 +107,7 @@ class IncompressibleInt64Table : public BaseTableGenerator {
       const cudf::table_view& table,
       size_t startRow,
       size_t numRows,
-      rmm::cuda_stream_view stream) override {
+      cuda::stream_ref stream) override {
     if (table.num_columns() != 1 || table.num_rows() != numRows) {
       return false;
     }
