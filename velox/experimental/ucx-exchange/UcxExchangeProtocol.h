@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 /// Definitions needed for the Ucx exchange protocol.
@@ -67,21 +68,22 @@ inline uint64_t getHandshakeResponseTag(uint64_t taskHash) {
   return (taskHash << 32) | HANDSHAKE_RESPONSE_TAG;
 }
 
-/// @brief Request that is sent from the client (UcxExchangeSource) to the
-/// server (UcxExchangeServer) after connection.
-///
-/// The handshake establishes the partition key for data exchange.
-/// The workerId identifies the source's Communicator instance (process).
-/// If the server's workerId matches, both are in the same process, enabling
-/// intra-node transfer via IntraNodeTransferRegistry instead of UCXX.
+constexpr uint32_t kHandshakeProtocolVersion = 2;
+constexpr std::size_t kMaxWorkerAddressBytes = 64 * 1024;
+
+/// Fixed header for the variable-size source handshake. The serialized UCX
+/// worker address follows this header immediately.
 struct HandshakeMsg {
-  char taskId[256];
-  uint32_t destination;
+  uint32_t protocolVersion{kHandshakeProtocolVersion};
+  uint32_t headerSize{0};
+  uint32_t destination{0};
+  uint32_t workerAddressSize{0};
   /// Unique identifier for the source's Communicator instance.
-  /// Generated randomly at Communicator startup. The server compares this
-  /// against its own workerId to detect same-process (intra-node) transfers.
   uint64_t workerId{0};
+  char taskId[256]{};
 };
+
+static_assert(std::is_trivially_copyable_v<HandshakeMsg>);
 
 /// @brief Response sent from server to source after handshake.
 /// Informs the source whether intra-node transfer optimization is available,

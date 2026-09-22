@@ -92,8 +92,7 @@ cudf_velox::compression::CompressionOptions compressionCodecOptions(
     return {NumericTransform::kFrameOfReference, EntropyEncoding::kAns};
   }
   if (mode == "delta-for") {
-    return {
-        NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kNone};
+    return {NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kNone};
   }
   if (mode == "delta-for-ans") {
     return {NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kAns};
@@ -118,6 +117,19 @@ cudf_velox::compression::CompressionOptions compressionCodecOptions(
   }
   VELOX_CHECK_EQ(mode, "automatic-ans");
   return {NumericTransform::kAutomatic, EntropyEncoding::kAns};
+}
+
+std::shared_ptr<void> makePayloadSendPermit(
+    const std::shared_ptr<Communicator>& communicator,
+    std::size_t bytes) {
+  std::weak_ptr<Communicator> weakCommunicator = communicator;
+  return std::shared_ptr<void>(
+      new char, [weakCommunicator, bytes](void* token) {
+        delete static_cast<char*>(token);
+        if (auto locked = weakCommunicator.lock()) {
+          locked->releasePayloadSendPermit(bytes);
+        }
+      });
 }
 
 } // namespace
@@ -146,6 +158,8 @@ struct DataSendContext {
   // the context until the DMA completes. When set, the send transfers this
   // buffer instead of data->gpu_data.
   std::shared_ptr<rmm::device_buffer> compressedData;
+  // Releases the communicator-wide byte reservation after UCX completes.
+  std::shared_ptr<void> payloadSendPermit;
 };
 
 struct UcxExchangeServer::SharedCompressionWork {
@@ -354,6 +368,15 @@ void UcxExchangeServer::close() {
   if (dataRequest_ && !dataRequest_->isCompleted()) {
     dataRequest_->cancel();
   }
+
+  // A permit granted before tagSend is owned by the server. Once tagSend is
+  // built, the request context owns it instead and releases it on completion.
+  std::shared_ptr<void> unsentPayloadPermit;
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    unsentPayloadPermit = std::move(payloadSendPermit_);
+  }
+  unsentPayloadPermit.reset();
 
   // Move all requests to the Communicator's deferred list so the GPU
   // buffers they reference (via their arg shared_ptr) stay alive until
@@ -631,7 +654,7 @@ void UcxExchangeServer::sendData() {
 
     std::shared_ptr<const AsyncCompressionResult> prepared;
     if (getState() == ServerState::CompressionReady) {
-      prepared = std::move(compressionResult_);
+      prepared = compressionResult_;
       VELOX_CHECK_NOT_NULL(prepared);
       if (prepared->error) {
         try {
@@ -647,6 +670,32 @@ void UcxExchangeServer::sendData() {
       } else {
         compressedData = prepared->data;
       }
+    }
+
+    if (dataPtr_ && !payloadSendPermit_) {
+      if (payloadSendPermitPending_) {
+        return;
+      }
+
+      const std::size_t payloadBytes =
+          compressedData ? compressedData->size() : dataPtr_->gpu_data->size();
+      std::weak_ptr<UcxExchangeServer> weakServer = weak_from_this();
+      std::weak_ptr<Communicator> weakCommunicator = communicator_;
+      payloadSendPermitPending_ = true;
+      const bool acquired = communicator_->requestPayloadSendPermit(
+          payloadBytes, [weakServer, weakCommunicator, payloadBytes]() {
+            if (auto server = weakServer.lock()) {
+              server->onPayloadSendPermitGranted(payloadBytes);
+            } else if (auto communicator = weakCommunicator.lock()) {
+              communicator->releasePayloadSendPermit(payloadBytes);
+            }
+          });
+      if (!acquired) {
+        return;
+      }
+
+      payloadSendPermitPending_ = false;
+      payloadSendPermit_ = makePayloadSendPermit(communicator_, payloadBytes);
     }
 
     if (dataPtr_) {
@@ -770,12 +819,15 @@ void UcxExchangeServer::sendData() {
       // the raw packed allocation as soon as tagSend has accepted the request.
       dataCtx->data = compressedData ? nullptr : dataPtr_;
       dataCtx->compressedData = compressedData;
+      dataCtx->payloadSendPermit = std::move(payloadSendPermit_);
+      compressionResult_.reset();
 
       void* sendPtr = compressedData ? compressedData->data()
                                      : dataCtx->data->gpu_data->data();
       const std::size_t sendBytes = compressedData
           ? compressedData->size()
           : dataCtx->data->gpu_data->size();
+      communicator_->recordPayloadSendStart(sendBytes);
       dataRequest_ =
           endpointRef_->endpoint_
               ->tagSendBuilder(sendPtr, sendBytes, ucxx::Tag{dataTag})
@@ -785,6 +837,7 @@ void UcxExchangeServer::sendData() {
                     auto ctx = std::static_pointer_cast<DataSendContext>(arg);
                     auto dataHolder = std::move(ctx->data);
                     auto compressedHolder = std::move(ctx->compressedData);
+                    auto payloadPermit = std::move(ctx->payloadSendPermit);
 
                     if (auto self = weakData.lock()) {
                       self->sendComplete(status);
@@ -808,7 +861,35 @@ void UcxExchangeServer::sendData() {
   }
 }
 
+void UcxExchangeServer::onPayloadSendPermitGranted(std::size_t bytes) {
+  bool releasePermit = false;
+  bool wakeServer = false;
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    if (!payloadSendPermitPending_) {
+      releasePermit = true;
+    } else {
+      payloadSendPermitPending_ = false;
+      if (closed_.load(std::memory_order_acquire) || !dataPtr_) {
+        releasePermit = true;
+      } else {
+        payloadSendPermit_ = makePayloadSendPermit(communicator_, bytes);
+        wakeServer = true;
+      }
+    }
+  }
+
+  if (releasePermit) {
+    communicator_->releasePayloadSendPermit(bytes);
+    return;
+  }
+  if (wakeServer) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+}
+
 void UcxExchangeServer::sendComplete(ucs_status_t status) {
+  communicator_->recordPayloadSendComplete();
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << "@" << partitionKey_.taskId

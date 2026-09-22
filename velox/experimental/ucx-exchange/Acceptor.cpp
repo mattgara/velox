@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/Acceptor.h"
+
+#include <cstring>
+
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
@@ -27,41 +30,62 @@ namespace facebook::velox::ucx_exchange {
 void Acceptor::cStyleAMCallback(
     std::shared_ptr<ucxx::Request> request,
     ucp_ep_h ep) {
-  VELOX_CHECK_NOT_NULL(request, "AMCallback called with nullptr request!");
-  VELOX_CHECK(
-      request->isCompleted(), "AMCallback called with incomplete request!");
+  if (!request || !request->isCompleted()) {
+    LOG(ERROR) << "AMCallback received an invalid or incomplete request";
+    return;
+  }
   auto buffer =
       std::dynamic_pointer_cast<ucxx::Buffer>(request->getRecvBuffer());
-  VELOX_CHECK_NOT_NULL(buffer, "AMCallback: failed to get receive buffer.");
-  // Validate buffer size BEFORE casting to prevent reading past buffer bounds.
-  VELOX_CHECK_GE(
-      buffer->getSize(),
-      sizeof(HandshakeMsg),
-      "AMCallback: received buffer size ({}) is smaller than HandshakeMsg ({}). "
-      "Possible protocol mismatch or truncated message.",
-      buffer->getSize(),
-      sizeof(HandshakeMsg));
-  HandshakeMsg* handshakePtr = reinterpret_cast<HandshakeMsg*>(buffer->data());
+  if (!buffer || buffer->getSize() < sizeof(HandshakeMsg)) {
+    LOG(ERROR) << "AMCallback received a truncated handshake: bytes="
+               << (buffer ? buffer->getSize() : 0);
+    return;
+  }
+
+  HandshakeMsg handshake;
+  std::memcpy(&handshake, buffer->data(), sizeof(handshake));
+  if (handshake.protocolVersion != kHandshakeProtocolVersion ||
+      handshake.headerSize != sizeof(HandshakeMsg) ||
+      handshake.workerAddressSize == 0 ||
+      handshake.workerAddressSize > kMaxWorkerAddressBytes ||
+      buffer->getSize() != sizeof(HandshakeMsg) + handshake.workerAddressSize) {
+    LOG(ERROR) << "AMCallback received an invalid handshake: version="
+               << handshake.protocolVersion
+               << " headerBytes=" << handshake.headerSize
+               << " addressBytes=" << handshake.workerAddressSize
+               << " totalBytes=" << buffer->getSize();
+    return;
+  }
+  if (std::memchr(handshake.taskId, '\0', sizeof(handshake.taskId)) ==
+      nullptr) {
+    LOG(ERROR) << "AMCallback received a task ID without a terminator";
+    return;
+  }
+
+  const auto* addressData =
+      static_cast<const char*>(buffer->data()) + sizeof(HandshakeMsg);
+  const std::string_view workerAddress{
+      addressData, handshake.workerAddressSize};
 
   // Create a exchangeServer based on the information received in the initial
   // handshake.
   std::shared_ptr<Communicator> communicator = Communicator::getInstance();
 
-  auto epRef = communicator->findEndpointRefByHandle(ep);
-  VELOX_CHECK_NOT_NULL(epRef, "Could not find endpoint reference");
+  auto bootstrapEpRef = communicator->findEndpointRefByHandle(ep);
+  if (!bootstrapEpRef) {
+    LOG(ERROR) << "AMCallback could not resolve the bootstrap endpoint";
+    return;
+  }
 
-  const PartitionKey key = {handshakePtr->taskId, handshakePtr->destination};
+  const PartitionKey key = {handshake.taskId, handshake.destination};
 
   // Determine if this is an intra-process transfer by comparing the source's
   // workerId with our Communicator's workerId. A match means both source and
   // server are in the same Communicator singleton (same process), so
   // IntraNodeTransferRegistry (in-process std::promise/future) can be used.
-  //
-  // Previous approach used IP comparison (getLocalIpAddresses), which fails
-  // when multiple Docker containers share the same host IP address.
   bool isIntraNodeTransfer =
       cudf_velox::CudfConfig::getInstance().intraNodeExchange &&
-      (handshakePtr->workerId == communicator->getWorkerId());
+      (handshake.workerId == communicator->getWorkerId());
 
   // Disable intra-node when the task is not yet initialized (placeholder
   // queue from sinks connecting before initializeTask) or when the task
@@ -76,18 +100,31 @@ void Acceptor::cStyleAMCallback(
     }
   }
 
-  std::string peerIp = epRef->getPeerIp();
+  std::string peerIp = bootstrapEpRef->getPeerIp();
+  auto payloadEpRef = bootstrapEpRef;
+  try {
+    payloadEpRef = communicator->assocWorkerAddressEndpointRef(
+        handshake.workerId, workerAddress, peerIp);
+  } catch (const std::exception& error) {
+    LOG(ERROR) << "[ACCEPTOR] Failed to create worker-address payload endpoint "
+               << "for task " << key.taskId << ": " << error.what()
+               << ". Falling back to bootstrap endpoint.";
+  }
 
-  auto exchangeServer =
-      UcxExchangeServer::create(communicator, epRef, key, isIntraNodeTransfer);
+  // Query once so worker logs record the selected payload lanes.
+  payloadEpRef->usesCudaIpc();
+
+  auto exchangeServer = UcxExchangeServer::create(
+      communicator, payloadEpRef, key, isIntraNodeTransfer);
 
   // Add this exchangeServer to the endpoint reference.
-  epRef->addCommElem(exchangeServer);
+  payloadEpRef->addCommElem(exchangeServer);
 
   // Register exchangeServer with communicator.
   communicator->registerCommElement(exchangeServer);
   VLOG(2) << "[ACCEPTOR] new server: " << exchangeServer->toString()
-          << " peerIp=" << peerIp
+          << " peerIp=" << peerIp << " endpoint="
+          << (payloadEpRef == bootstrapEpRef ? "bootstrap" : "worker-address")
           << " isIntraNodeTransfer=" << isIntraNodeTransfer;
 
   // Send HandshakeResponse back to the source to inform about intra-node
@@ -105,7 +142,7 @@ void Acceptor::cStyleAMCallback(
 
   // Fire-and-forget: we don't need to track this request completion
   [[maybe_unused]] auto sendRequest =
-      epRef->endpoint_
+      payloadEpRef->endpoint_
           ->tagSendBuilder(
               response.get(), sizeof(*response), ucxx::Tag{responseTag})
           .callbackFunction([response, keyStr = key.toString()](

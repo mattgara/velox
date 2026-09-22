@@ -106,15 +106,22 @@ std::optional<bool> EndpointRef::usesCudaIpc() const {
   }
 
   bool found = false;
+  std::string transportNames;
   for (unsigned i = 0; i < attributes.transports.num_entries; ++i) {
     const auto* name = attributes.transports.entries[i].transport_name;
-    if (name != nullptr && std::string_view{name} == "cuda_ipc") {
-      found = true;
-      break;
+    if (name != nullptr) {
+      if (!transportNames.empty()) {
+        transportNames += ',';
+      }
+      transportNames += name;
+      if (std::string_view{name} == "cuda_ipc") {
+        found = true;
+      }
     }
   }
   usesCudaIpc_ = found;
-  VLOG(1) << "[UCX-ENDPOINT-TRANSPORT] transport=cuda_ipc present=" << found;
+  LOG(INFO) << "[UCX-ENDPOINT-TRANSPORT] transports=" << transportNames
+            << " cudaIpc=" << found;
   return found;
 }
 

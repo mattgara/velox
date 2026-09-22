@@ -129,6 +129,9 @@ class UcxExchangeServer
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
+  /// Resumes a send after the communicator reserves payload-window bytes.
+  void onPayloadSendPermitGranted(std::size_t bytes);
+
   /// @brief Completion handler after data has been sent.
   void sendComplete(ucs_status_t status);
 
@@ -170,6 +173,11 @@ class UcxExchangeServer
   /// its fast-completion path, firing the sendComplete() callback on the same
   /// thread while the lock is still held.
   std::recursive_mutex dataMutex_;
+  /// Type-erased RAII token that releases communicator-wide payload credits.
+  /// Protected by dataMutex_.
+  std::shared_ptr<void> payloadSendPermit_;
+  bool payloadSendPermitPending_{false};
+
   std::atomic<bool> closed_{false};
 
   /// Future for intra-node transfer - signaled when source retrieves data.
