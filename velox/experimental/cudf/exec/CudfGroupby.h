@@ -90,6 +90,10 @@ struct GroupbyAggregator {
       cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
+  virtual bool supportsDeferredFinalAggregation() const {
+    return false;
+  }
+
   virtual ~GroupbyAggregator() = default;
 
  protected:
@@ -226,6 +230,7 @@ class CudfGroupby : public CudfOperatorBase {
   const bool isSingleStep_;
   // Incremental aggregation is disabled if companion aggregates are present.
   bool incrementalAggregationEnabled_{true};
+  bool deferFinalAggregation_{false};
   bool streamingGroupbyEnabled_{false};
   const int64_t maxPartialAggregationMemoryUsage_;
   int64_t numInputRows_ = 0;

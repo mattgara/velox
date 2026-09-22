@@ -437,6 +437,10 @@ void CudfConfig::initialize(
     streamingGroupbyCapacityMultiplier =
         folly::to<double>(config[kCudfStreamingGroupbyCapacityMultiplier]);
   }
+  if (config.find(kCudfDeferFinalDecimalSumAggregation) != config.end()) {
+    deferFinalDecimalSumAggregation =
+        folly::to<bool>(config[kCudfDeferFinalDecimalSumAggregation]);
+  }
   if (config.find(kCudfFunctionNamePrefix) != config.end()) {
     functionNamePrefix = config[kCudfFunctionNamePrefix];
   }

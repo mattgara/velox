@@ -31,6 +31,7 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
+      {CudfConfig::kCudfDeferFinalDecimalSumAggregation, "true"},
       {CudfConfig::kCudfAllowCpuFallback, "false"},
       {CudfConfig::kUcxExchangeCompression, "column"},
       {CudfConfig::kUcxExchangeCompressionCodec, "for"},
@@ -41,6 +42,7 @@ TEST(ConfigTest, cudfConfig) {
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
+  ASSERT_FALSE(config.deferFinalDecimalSumAggregation);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
@@ -49,6 +51,7 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
+  ASSERT_TRUE(config.deferFinalDecimalSumAggregation);
   ASSERT_EQ(config.allowCpuFallback, false);
   ASSERT_EQ(config.exchangeCompression, "column");
   ASSERT_EQ(config.exchangeCompressionCodec, "for");

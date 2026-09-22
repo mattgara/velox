@@ -53,6 +53,8 @@ struct CudfConfig {
       "cudf.streaming_groupby_enabled"};
   static constexpr const char* kCudfStreamingGroupbyCapacityMultiplier{
       "cudf.streaming_groupby_capacity_multiplier"};
+  static constexpr const char* kCudfDeferFinalDecimalSumAggregation{
+      "cudf.defer_final_decimal_sum_aggregation"};
   static constexpr const char* kCudfTimestampUnit{"cudf.timestamp_unit"};
   static constexpr const char* kUcxExchange{"cudf.exchange"};
   static constexpr const char* kUcxxErrorHandling{"ucxx.error_handling"};
@@ -200,6 +202,11 @@ struct CudfConfig {
   /// Multiplier used to derive streaming_groupby's initial logical capacity
   /// from the first batch and to grow capacity when it is exhausted.
   double streamingGroupbyCapacityMultiplier{2.0};
+
+  /// Buffer final decimal SUM states and aggregate them once at end of input.
+  /// This avoids repeatedly hashing a growing result, but retains all input
+  /// until finalization and is therefore opt-in.
+  bool deferFinalDecimalSumAggregation{false};
 
   /// Minimum rows to accumulate before GPU-side concatenation in
   /// `CudfBatchConcat` (default 100k).

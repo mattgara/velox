@@ -45,6 +45,8 @@
 #include <cmath>
 #include <limits>
 
+#include <algorithm>
+
 namespace {
 
 using namespace facebook::velox;
@@ -424,6 +426,10 @@ struct GroupbyDecimalSumAggregator : GroupbyAggregator {
       col = cudf::cast(*col, cudfResType, stream, mr);
     }
     return col;
+  }
+
+  bool supportsDeferredFinalAggregation() const override {
+    return step == core::AggregationNode::Step::kFinal;
   }
 
  private:
@@ -1489,6 +1495,17 @@ void CudfGroupby::initialize() {
       aggregationInput.maskChannels);
   incrementalAggregationEnabled_ =
       !hasCompanionAggregates(aggregationNode_->aggregates());
+  deferFinalAggregation_ =
+      CudfConfig::getInstance().deferFinalDecimalSumAggregation &&
+      !aggregators_.empty() &&
+      aggregationNode_->step() == core::AggregationNode::Step::kFinal &&
+      std::all_of(
+          aggregators_.begin(), aggregators_.end(), [](const auto& aggregator) {
+            return aggregator->supportsDeferredFinalAggregation();
+          });
+  if (deferFinalAggregation_) {
+    incrementalAggregationEnabled_ = false;
+  }
 
   // Make aggregators for intermediate step when streaming is enabled.
   if (incrementalAggregationEnabled_) {
@@ -1852,6 +1869,11 @@ RowVectorPtr CudfGroupby::doGetOutput() {
 
   auto permutedInputView = tbl->view().select(
       aggregationInputChannels_.begin(), aggregationInputChannels_.end());
+  if (deferFinalAggregation_) {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cudfDeferredFinalAggregationRows", RuntimeCounter(numInputRows_));
+  }
   return doGroupByAggregation(
       permutedInputView,
       groupingKeyOutputChannels_,
