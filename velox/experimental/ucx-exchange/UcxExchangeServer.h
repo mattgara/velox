@@ -24,7 +24,6 @@
 #include <velox/experimental/ucx-exchange/UcxOutputQueueManager.h>
 #include <chrono>
 #include <exception>
-#include <future>
 #include <memory>
 #include <tuple>
 #include "velox/common/EnumDeclare.h"
@@ -180,15 +179,13 @@ class UcxExchangeServer
 
   std::atomic<bool> closed_{false};
 
-  /// Future for intra-node transfer - signaled when source retrieves data.
-  std::future<void> intraNodeRetrieveFuture_;
+  /// Set by the one-shot registry callback after source retrieval.
+  std::atomic<bool> intraNodeRetrieveReady_{false};
 
   /// For intra-node transfer: true if the last published entry was atEnd.
   bool intraNodeAtEndPublished_{false};
 
   uint32_t sequenceNumber_{0};
-  uint32_t intraNodePollCount_{0};
-
   // The outstanding requests - there can only be one outstanding request
   // of each type at any point in time.
   // NOTE: The request owns/holds references to the upcall function

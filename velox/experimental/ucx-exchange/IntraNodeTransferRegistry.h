@@ -16,7 +16,7 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
-#include <future>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 #include "velox/vector/TypeAliases.h"
 
@@ -58,16 +59,17 @@ struct IntraNodeTransferResult {
 };
 
 /// @brief Entry in the intra-node transfer registry containing the data and
-/// synchronization primitives. The server publishes data via publish() and
-/// waits on retrievedPromise; the source polls via poll() and fulfils the
-/// promise on retrieval.
+/// one-shot notifications. The server publishes data via publish(), while the
+/// source registers a notification and takes the data via poll().
+using IntraNodeTransferCallback = std::function<void()>;
+
 struct IntraNodeTransferEntry {
   std::shared_ptr<cudf::packed_columns> data;
   vector_size_t numRows{
       0}; // Logical rows in 'data'; see IntraNodeTransferResult.
   bool atEnd{false}; // True if this is the end-of-stream marker
-  std::promise<void> retrievedPromise; // Server waits on this after publishing
-  std::mutex entryMutex;
+  IntraNodeTransferCallback onReady;
+  IntraNodeTransferCallback onRetrieved;
   bool ready{false}; // True when data is ready to retrieve
 };
 
@@ -78,7 +80,9 @@ struct IntraNodeTransferEntry {
 /// without going through UCXX network transfers.
 ///
 /// The server publishes packed_columns data to the registry, and the source
-/// polls for it. Synchronization is handled via futures/promises.
+/// waits for a one-shot ready notification before retrieving it. The producer
+/// receives a one-shot notification after retrieval. Callbacks are always
+/// invoked outside registry locks.
 class IntraNodeTransferRegistry {
  public:
   /// @brief Get the singleton instance of the registry.
@@ -89,20 +93,28 @@ class IntraNodeTransferRegistry {
   IntraNodeTransferRegistry& operator=(const IntraNodeTransferRegistry&) =
       delete;
 
-  /// @brief Publish data for intra-node transfer with condition variable
-  /// signaling. Server calls this to make data available to the source.
+  /// @brief Publish data and notify a waiting source.
   /// The producer must synchronize its CUDA stream before calling publish()
   /// so that the GPU data is ready when the consumer reads it.
   /// @param key The unique key identifying this transfer (taskId, dest, seq)
   /// @param data The packed_columns data to share (nullptr for atEnd)
   /// @param numRows Logical rows in 'data'; 0 for atEnd
   /// @param atEnd True if this is the end-of-stream marker
-  /// @return A future that completes when source has retrieved the data
-  [[nodiscard]] std::future<void> publish(
+  /// @param onRetrieved Invoked once after the source retrieves the data, or
+  ///        immediately if the producing task has already been cancelled
+  void publish(
       const IntraNodeTransferKey& key,
       std::shared_ptr<cudf::packed_columns> data,
       vector_size_t numRows,
-      bool atEnd);
+      bool atEnd,
+      IntraNodeTransferCallback onRetrieved);
+
+  /// @brief Registers a one-shot notification for data becoming ready.
+  /// Invokes the callback immediately when data is already available or the
+  /// task has been cancelled.
+  void notifyWhenReady(
+      const IntraNodeTransferKey& key,
+      IntraNodeTransferCallback onReady);
 
   /// @brief Non-blocking poll for intra-node transfer data.
   /// Returns immediately whether data is available or not.

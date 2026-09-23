@@ -56,6 +56,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
@@ -74,6 +75,63 @@ using namespace facebook::velox::core;
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+
+TEST(IntraNodeTransferRegistryTest, notifiesAcrossPublishOrderings) {
+  auto registry = IntraNodeTransferRegistry::getInstance();
+
+  const IntraNodeTransferKey waitFirst{"registry-notify-wait-first", 0, 0};
+  registry->clearCancelledTask(waitFirst.taskId);
+  int readyCount = 0;
+  int retrievedCount = 0;
+  registry->notifyWhenReady(waitFirst, [&]() { ++readyCount; });
+  EXPECT_EQ(readyCount, 0);
+  registry->publish(waitFirst, nullptr, 0, true, [&]() { ++retrievedCount; });
+  EXPECT_EQ(readyCount, 1);
+  auto waitFirstResult = registry->poll(waitFirst);
+  ASSERT_TRUE(waitFirstResult.has_value());
+  EXPECT_TRUE(waitFirstResult->atEnd);
+  EXPECT_EQ(retrievedCount, 1);
+
+  const IntraNodeTransferKey publishFirst{
+      "registry-notify-publish-first", 0, 0};
+  registry->clearCancelledTask(publishFirst.taskId);
+  readyCount = 0;
+  retrievedCount = 0;
+  registry->publish(
+      publishFirst, nullptr, 0, true, [&]() { ++retrievedCount; });
+  registry->notifyWhenReady(publishFirst, [&]() { ++readyCount; });
+  EXPECT_EQ(readyCount, 1);
+  auto publishFirstResult = registry->poll(publishFirst);
+  ASSERT_TRUE(publishFirstResult.has_value());
+  EXPECT_TRUE(publishFirstResult->atEnd);
+  EXPECT_EQ(retrievedCount, 1);
+}
+
+TEST(IntraNodeTransferRegistryTest, cancellationNotifiesBothSides) {
+  auto registry = IntraNodeTransferRegistry::getInstance();
+
+  const IntraNodeTransferKey waitingSource{
+      "registry-cancel-waiting-source", 0, 0};
+  registry->clearCancelledTask(waitingSource.taskId);
+  int readyCount = 0;
+  registry->notifyWhenReady(waitingSource, [&]() { ++readyCount; });
+  registry->cancelTask(waitingSource.taskId);
+  EXPECT_EQ(readyCount, 1);
+  auto cancelledResult = registry->poll(waitingSource);
+  ASSERT_TRUE(cancelledResult.has_value());
+  EXPECT_TRUE(cancelledResult->atEnd);
+  registry->clearCancelledTask(waitingSource.taskId);
+
+  const IntraNodeTransferKey waitingProducer{
+      "registry-cancel-waiting-producer", 0, 0};
+  registry->clearCancelledTask(waitingProducer.taskId);
+  int retrievedCount = 0;
+  registry->publish(
+      waitingProducer, nullptr, 0, true, [&]() { ++retrievedCount; });
+  registry->cancelTask(waitingProducer.taskId);
+  EXPECT_EQ(retrievedCount, 1);
+  registry->clearCancelledTask(waitingProducer.taskId);
+}
 
 class IncompressibleInt64Table : public BaseTableGenerator {
  public:
