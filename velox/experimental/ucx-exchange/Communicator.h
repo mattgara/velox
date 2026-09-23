@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <rmm/cuda_stream_pool.hpp>
 #include <ucxx/api.h>
 #include <atomic>
 #include <chrono>
@@ -288,8 +289,7 @@ class Communicator {
   uint64_t payloadPeakBytesInFlight_{0};
   std::deque<PendingPayloadSend> pendingPayloadSends_;
 
-  std::vector<cuda::stream_ref> receiveStreams_;
-  std::atomic_size_t nextReceiveStream_{0};
+  std::unique_ptr<rmm::cuda_stream_pool> receiveStreamPool_;
 
   std::mutex receiveTelemetryMutex_;
   std::size_t activePayloadReceives_{0};

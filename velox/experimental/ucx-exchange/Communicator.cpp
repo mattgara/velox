@@ -39,11 +39,11 @@ namespace facebook::velox::ucx_exchange {
 
 namespace {
 
-// A single get_stream() call only grows libcudf's per-thread stream pool to
-// two streams. Exchange pages hand those streams to downstream operators, so
-// rapid reuse can place a new receive-buffer allocation behind earlier query
-// work. Acquire a wider set once and rotate it explicitly.
-constexpr std::size_t kReceiveStreamCount = 32;
+// Receive allocation and decode work must not share streams with downstream
+// operators. Otherwise an operator can delay a later receive that reuses its
+// stream. A small dedicated pool keeps receive progress independent while the
+// ordinary libcudf stream pool remains available to consumers.
+constexpr std::size_t kReceiveStreamCount = 4;
 
 } // namespace
 
@@ -151,9 +151,10 @@ void Communicator::run() {
       "Failed to initialize CUDA context: {}",
       cudaGetErrorString(cudaStatus));
 
-  receiveStreams_ = cudfGlobalStreamPool().get_streams(kReceiveStreamCount);
-  VELOX_CHECK(!receiveStreams_.empty());
-  LOG(INFO) << "UCX receive stream count=" << receiveStreams_.size();
+  receiveStreamPool_ = std::make_unique<rmm::cuda_stream_pool>(
+      kReceiveStreamCount, rmm::cuda_stream::flags::non_blocking);
+  LOG(INFO) << "UCX receive stream count="
+            << receiveStreamPool_->get_pool_size();
 
   // create the UCXX context, worker, listener-context etc.
   if (CudfConfig::getInstance().ucxxBlockingProgress) {
@@ -587,9 +588,9 @@ void Communicator::releasePayloadSendPermit(std::size_t bytes) {
 }
 
 cuda::stream_ref Communicator::getReceiveStream() {
-  VELOX_CHECK(!receiveStreams_.empty(), "UCX receive streams not initialized");
-  const auto index = nextReceiveStream_.fetch_add(1, std::memory_order_relaxed);
-  return receiveStreams_[index % receiveStreams_.size()];
+  VELOX_CHECK_NOT_NULL(
+      receiveStreamPool_, "UCX receive streams not initialized");
+  return receiveStreamPool_->get_stream();
 }
 
 std::shared_ptr<EndpointRef> Communicator::findEndpointRefByHandle(
