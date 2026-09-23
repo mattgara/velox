@@ -187,25 +187,8 @@ void UcxExchangeServer::process() {
       // do
       break;
     case ServerState::WaitingForIntraNodeRetrieve:
-      // Intra-node transfer: check if the source has retrieved the data
-      if (intraNodeRetrieveFuture_.valid()) {
-        auto status =
-            intraNodeRetrieveFuture_.wait_for(std::chrono::milliseconds(0));
-        if (status == std::future_status::ready) {
-          intraNodeRetrieveFuture_.get(); // Clear the future
-          intraNodePollCount_ = 0;
-          onIntraNodeRetrieveComplete();
-        } else {
-          // Not ready yet, re-queue to check later
-          ++intraNodePollCount_;
-          if (intraNodePollCount_ % 100 == 0) {
-            VLOG(2) << "[INTRA] [ExSrv " << partitionKey_.toString()
-                    << " seq=" << sequenceNumber_
-                    << "] still waiting for source retrieval, polls="
-                    << intraNodePollCount_;
-          }
-          communicator_->addToWorkQueue(getSelfPtr());
-        }
+      if (intraNodeRetrieveReady_.exchange(false, std::memory_order_acquire)) {
+        onIntraNodeRetrieveComplete();
       }
       break;
     case ServerState::Done:
@@ -304,17 +287,24 @@ void UcxExchangeServer::sendData() {
 
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      // dataPtr_ is already a shared_ptr, pass directly to share ownership.
-      intraNodeRetrieveFuture_ =
-          IntraNodeTransferRegistry::getInstance()->publish(
-              key, dataPtr_, dataNumRows_, /*atEnd=*/false);
+      intraNodeAtEndPublished_ = false;
+      intraNodeRetrieveReady_.store(false, std::memory_order_release);
+      setState(ServerState::WaitingForIntraNodeRetrieve);
+      std::weak_ptr<UcxExchangeServer> weakSelf = getSelfPtr();
+      IntraNodeTransferRegistry::getInstance()->publish(
+          key,
+          dataPtr_,
+          dataNumRows_,
+          /*atEnd=*/false,
+          [weakSelf]() {
+            if (auto self = weakSelf.lock()) {
+              self->intraNodeRetrieveReady_.store(
+                  true, std::memory_order_release);
+              self->communicator_->addToWorkQueue(self);
+            }
+          });
       dataPtr_.reset();
       dataNumRows_ = 0;
-      intraNodeAtEndPublished_ = false;
-
-      // Transition to WaitingForIntraNodeRetrieve state
-      setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
     } else {
       // Data pointer is null, so no more data will be coming.
       // Publish atEnd marker to registry
@@ -324,44 +314,54 @@ void UcxExchangeServer::sendData() {
 
       IntraNodeTransferKey key{
           partitionKey_.taskId, partitionKey_.destination, sequenceNumber_};
-      intraNodeRetrieveFuture_ =
-          IntraNodeTransferRegistry::getInstance()->publish(
-              key, nullptr, /*numRows=*/0, /*atEnd=*/true);
       intraNodeAtEndPublished_ = true;
+      intraNodeRetrieveReady_.store(false, std::memory_order_release);
+      setState(ServerState::WaitingForIntraNodeRetrieve);
+      std::weak_ptr<UcxExchangeServer> weakSelf = getSelfPtr();
+      IntraNodeTransferRegistry::getInstance()->publish(
+          key,
+          nullptr,
+          /*numRows=*/0,
+          /*atEnd=*/true,
+          [weakSelf]() {
+            if (auto self = weakSelf.lock()) {
+              self->intraNodeRetrieveReady_.store(
+                  true, std::memory_order_release);
+              self->communicator_->addToWorkQueue(self);
+            }
+          });
 
       queueMgr_->deleteResults(partitionKey_.taskId, partitionKey_.destination);
-
-      // Wait for source to acknowledge atEnd before finishing
-      setState(ServerState::WaitingForIntraNodeRetrieve);
-      communicator_->addToWorkQueue(getSelfPtr());
     }
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
 
     if (dataPtr_ && !payloadSendPermit_) {
-      if (payloadSendPermitPending_) {
-        return;
-      }
-
       const std::size_t payloadBytes = dataPtr_->gpu_data->size();
-      std::weak_ptr<UcxExchangeServer> weakServer = weak_from_this();
-      std::weak_ptr<Communicator> weakCommunicator = communicator_;
-      payloadSendPermitPending_ = true;
-      const bool acquired = communicator_->requestPayloadSendPermit(
-          payloadBytes, [weakServer, weakCommunicator, payloadBytes]() {
-            if (auto server = weakServer.lock()) {
-              server->onPayloadSendPermitGranted(payloadBytes);
-            } else if (auto communicator = weakCommunicator.lock()) {
-              communicator->releasePayloadSendPermit(payloadBytes);
-            }
-          });
-      if (!acquired) {
-        return;
-      }
+      if (payloadBytes > 0) {
+        if (payloadSendPermitPending_) {
+          return;
+        }
 
-      payloadSendPermitPending_ = false;
-      payloadSendPermit_ = makePayloadSendPermit(communicator_, payloadBytes);
+        std::weak_ptr<UcxExchangeServer> weakServer = weak_from_this();
+        std::weak_ptr<Communicator> weakCommunicator = communicator_;
+        payloadSendPermitPending_ = true;
+        const bool acquired = communicator_->requestPayloadSendPermit(
+            payloadBytes, [weakServer, weakCommunicator, payloadBytes]() {
+              if (auto server = weakServer.lock()) {
+                server->onPayloadSendPermitGranted(payloadBytes);
+              } else if (auto communicator = weakCommunicator.lock()) {
+                communicator->releasePayloadSendPermit(payloadBytes);
+              }
+            });
+        if (!acquired) {
+          return;
+        }
+
+        payloadSendPermitPending_ = false;
+        payloadSendPermit_ = makePayloadSendPermit(communicator_, payloadBytes);
+      }
     }
 
     if (dataPtr_) {

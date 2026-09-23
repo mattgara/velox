@@ -267,7 +267,7 @@ class UcxExchangeSource
   std::atomic<ReceiverState> state_;
 
   uint32_t sequenceNumber_{0};
-  uint32_t intraNodePollCount_{0};
+  std::atomic<bool> intraNodeReadyNotificationPending_{false};
 
   // The shared queue of packed tables that all UcxExchangeSources write to
   const std::shared_ptr<UcxExchangeQueue> queue_{nullptr};

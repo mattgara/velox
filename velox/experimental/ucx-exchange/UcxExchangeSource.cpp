@@ -781,17 +781,23 @@ void UcxExchangeSource::waitForIntraNodeData() {
   auto result = IntraNodeTransferRegistry::getInstance()->poll(key);
 
   if (!result.has_value()) {
-    // Data not ready yet, re-queue to try again
-    ++intraNodePollCount_;
-    if (intraNodePollCount_ % 100 == 0) {
-      VLOG(2) << "[INTRA] [ExSrc " << toString() << " seq=" << sequenceNumber_
-              << "] still polling for data, polls=" << intraNodePollCount_;
+    bool expected = false;
+    if (intraNodeReadyNotificationPending_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      std::weak_ptr<UcxExchangeSource> weakSelf = getSelfPtr();
+      IntraNodeTransferRegistry::getInstance()->notifyWhenReady(
+          key, [weakSelf]() {
+            if (auto self = weakSelf.lock()) {
+              self->intraNodeReadyNotificationPending_.store(
+                  false, std::memory_order_release);
+              self->communicator_->addToWorkQueue(self);
+            }
+          });
     }
-    communicator_->addToWorkQueue(getSelfPtr());
     return;
   }
 
-  intraNodePollCount_ = 0;
+  intraNodeReadyNotificationPending_.store(false, std::memory_order_release);
   onIntraNodeData(std::move(result->data), result->numRows, result->atEnd);
 }
 
