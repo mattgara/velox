@@ -24,7 +24,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
-#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxCompressionCostModel.h"
@@ -558,10 +557,10 @@ void UcxExchangeSource::onMetadata(
       return;
     }
 
-    // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX
-    // Get a stream from the global stream pool
-    auto stream =
-        facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+    // REMOTE EXCHANGE PATH: Allocate buffer and receive via UCXX. Keep enough
+    // receive streams in rotation that this allocation does not queue behind
+    // downstream work inherited from an earlier exchange page.
+    auto stream = communicator_->getReceiveStream();
     // Store the stream in the DataAndMetadata struct so it can be used later
     // in onData() when creating the PackedTableWithStream.
     ptr->stream = stream;
@@ -1037,12 +1036,10 @@ void UcxExchangeSource::onIntraNodeData(
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedCols)});
 
-  // Get a stream from the pool so downstream cuDF operations on this data
-  // run on a dedicated stream, not the default stream. The producer already
-  // synchronized before enqueuing, so the GPU data is ready. This matches
-  // the inter-node (UCX) receive path which also allocates a pool stream.
-  auto stream =
-      facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+  // Assign a receive stream so downstream cuDF operations do not use the
+  // default stream. The producer synchronized before publishing, so the GPU
+  // data is already ready. This matches the inter-node UCX receive path.
+  auto stream = communicator_->getReceiveStream();
   auto tableWithStream = std::make_unique<PackedTableWithStream>(
       std::move(packedTable), stream, numRows);
 

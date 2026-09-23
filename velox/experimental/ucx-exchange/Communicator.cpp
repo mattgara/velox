@@ -24,6 +24,7 @@
 #include <limits>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
 #include "velox/experimental/ucx-exchange/EndpointRef.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeModules.h"
@@ -35,6 +36,16 @@
 using namespace facebook::velox::cudf_velox;
 
 namespace facebook::velox::ucx_exchange {
+
+namespace {
+
+// A single get_stream() call only grows libcudf's per-thread stream pool to
+// two streams. Exchange pages hand those streams to downstream operators, so
+// rapid reuse can place a new receive-buffer allocation behind earlier query
+// work. Acquire a wider set once and rotate it explicitly.
+constexpr std::size_t kReceiveStreamCount = 32;
+
+} // namespace
 
 // static
 std::once_flag Communicator::onceFlag;
@@ -146,6 +157,10 @@ void Communicator::run() {
       cudaStatus == cudaSuccess,
       "Failed to initialize CUDA context: {}",
       cudaGetErrorString(cudaStatus));
+
+  receiveStreams_ = cudfGlobalStreamPool().get_streams(kReceiveStreamCount);
+  VELOX_CHECK(!receiveStreams_.empty());
+  LOG(INFO) << "UCX receive stream count=" << receiveStreams_.size();
 
   // create the UCXX context, worker, listener-context etc.
   if (CudfConfig::getInstance().ucxxBlockingProgress) {
@@ -581,6 +596,12 @@ void Communicator::releasePayloadSendPermit(std::size_t bytes) {
   for (auto& onReady : ready) {
     onReady();
   }
+}
+
+cuda::stream_ref Communicator::getReceiveStream() {
+  VELOX_CHECK(!receiveStreams_.empty(), "UCX receive streams not initialized");
+  const auto index = nextReceiveStream_.fetch_add(1, std::memory_order_relaxed);
+  return receiveStreams_[index % receiveStreams_.size()];
 }
 
 std::shared_ptr<EndpointRef> Communicator::findEndpointRefByHandle(
