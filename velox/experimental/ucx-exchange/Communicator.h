@@ -16,14 +16,17 @@
 #pragma once
 
 #include <ucxx/api.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cuda/stream>
 #include <deque>
 #include <map>
 #include <memory>
 #include <random>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -150,6 +153,11 @@ class Communicator {
   bool requestPayloadSendPermit(std::size_t bytes, folly::Func onReady);
 
   void releasePayloadSendPermit(std::size_t bytes);
+
+  /// Returns a stream reserved for an incoming exchange page. A wider pool
+  /// keeps a newly allocated receive buffer from reusing a stream that still
+  /// carries downstream work from an earlier page.
+  [[nodiscard]] cuda::stream_ref getReceiveStream();
 
   /// Returns the URL of the coordinator.
   [[nodiscard]] const std::string& getCoordinatorUrl();
@@ -279,6 +287,9 @@ class Communicator {
   uint64_t payloadBytesInFlight_{0};
   uint64_t payloadPeakBytesInFlight_{0};
   std::deque<PendingPayloadSend> pendingPayloadSends_;
+
+  std::vector<cuda::stream_ref> receiveStreams_;
+  std::atomic_size_t nextReceiveStream_{0};
 
   std::mutex receiveTelemetryMutex_;
   std::size_t activePayloadReceives_{0};
