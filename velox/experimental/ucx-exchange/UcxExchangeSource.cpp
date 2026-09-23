@@ -177,6 +177,9 @@ void UcxExchangeSource::process() {
     case ReceiverState::WaitingForMetadata:
       // Waiting for metadata is handled by an upcall from UCXX. Nothing to do
       break;
+    case ReceiverState::WaitingForReceiveBuffer:
+      waitForReceiveBuffer();
+      break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
       break;
@@ -192,6 +195,7 @@ void UcxExchangeSource::process() {
 }
 
 void UcxExchangeSource::cleanUp() {
+  pendingData_.reset();
   uint32_t value = static_cast<uint32_t>(getState());
   if (value != static_cast<uint32_t>(ReceiverState::Done)) {
     // Unexpected cleanup
@@ -546,44 +550,85 @@ void UcxExchangeSource::onMetadata(
       return;
     }
 
-    // sync after allocating.
-    stream.sync();
-
-    VLOG(3) << toString() << " Allocated " << ptr->metadata.dataSizeBytes
-            << " bytes of device memory";
-
-    // Initiate the transfer of the actual data from GPU-2-GPU
-    uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
-    VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
-            << " using tag: " << std::hex << dataTag << std::dec;
-
     if (!setStateIf(
-            ReceiverState::WaitingForMetadata, ReceiverState::WaitingForData)) {
+            ReceiverState::WaitingForMetadata,
+            ReceiverState::WaitingForReceiveBuffer)) {
       VLOG(1) << toString() << " onMetadata Invalid previous state ";
       return;
     }
-    // Use weak_ptr to prevent use-after-free if close() is called during
-    // callback
-    std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
-    if (request_) {
-      completedRequests_.push_back(std::move(request_));
-    }
-    communicator_->recordPayloadReceiveStart(ptr->metadata.dataSizeBytes);
-    request_ = endpointRef_->endpoint_
-                   ->tagRecvBuilder(
-                       ptr->dataBuf->data(),
-                       ptr->metadata.dataSizeBytes,
-                       ucxx::Tag{dataTag},
-                       ucxx::TagMaskFull)
-                   .callbackFunction(
-                       [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-                         if (auto self = weak.lock()) {
-                           self->onData(status, arg);
-                         }
-                       })
-                   .callbackData(ptr)
-                   .build();
+    pendingData_ = std::move(ptr);
+    communicator_->addToWorkQueue(getSelfPtr());
   }
+}
+
+void UcxExchangeSource::waitForReceiveBuffer() {
+  VELOX_CHECK_NOT_NULL(pendingData_);
+
+  const auto status = cudaStreamQuery(pendingData_->stream.get());
+  if (status == cudaErrorNotReady) {
+    // Keep progressing UCX while the stream reaches the allocation point.
+    // Blocking here can delay completions for unrelated payloads handled by
+    // this communicator.
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+  if (status != cudaSuccess) {
+    const auto message = fmt::format(
+        "Receive-buffer stream failed for task {}: {}",
+        partitionKey_.toString(),
+        cudaGetErrorString(status));
+    VLOG(0) << toString() << " " << message;
+    pendingData_.reset();
+    queue_->setError(message);
+    deliverEndMarker();
+    setState(ReceiverState::Done);
+    communicator_->addToWorkQueue(getSelfPtr());
+    return;
+  }
+
+  auto data = std::move(pendingData_);
+  startDataReceive(std::move(data));
+}
+
+void UcxExchangeSource::startDataReceive(
+    std::shared_ptr<DataAndMetadata> data) {
+  VELOX_CHECK_NOT_NULL(data);
+  VLOG(3) << toString() << " Allocated " << data->metadata.dataSizeBytes
+          << " bytes of device memory";
+
+  const uint64_t dataTag = getDataTag(partitionKeyHash_, sequenceNumber_);
+  VLOG(3) << toString() << " waiting for data for chunk: " << sequenceNumber_
+          << " using tag: " << std::hex << dataTag << std::dec;
+
+  if (!setStateIf(
+          ReceiverState::WaitingForReceiveBuffer,
+          ReceiverState::WaitingForData)) {
+    VLOG(1) << toString() << " receive buffer became ready in state "
+            << toName(getState());
+    return;
+  }
+
+  // Use weak_ptr to prevent use-after-free if close() is called during the
+  // callback.
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  if (request_) {
+    completedRequests_.push_back(std::move(request_));
+  }
+  communicator_->recordPayloadReceiveStart(data->metadata.dataSizeBytes);
+  request_ = endpointRef_->endpoint_
+                 ->tagRecvBuilder(
+                     data->dataBuf->data(),
+                     data->metadata.dataSizeBytes,
+                     ucxx::Tag{dataTag},
+                     ucxx::TagMaskFull)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       if (auto self = weak.lock()) {
+                         self->onData(status, arg);
+                       }
+                     })
+                 .callbackData(std::move(data))
+                 .build();
 }
 
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {

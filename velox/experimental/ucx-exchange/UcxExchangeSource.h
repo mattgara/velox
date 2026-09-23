@@ -70,6 +70,7 @@ class UcxExchangeSource
     WaitingForHandshakeResponse,
     ReadyToReceive,
     WaitingForMetadata,
+    WaitingForReceiveBuffer,
     WaitingForData,
     WaitingForIntraNodeData,
     Done,
@@ -195,6 +196,13 @@ class UcxExchangeSource
   /// @param arg the serialized form of the metadata
   void onMetadata(ucs_status_t status, std::shared_ptr<void> arg);
 
+  /// Waits for stream-ordered receive-buffer allocation without blocking the
+  /// communicator thread, then posts the UCX receive.
+  void waitForReceiveBuffer();
+
+  /// Posts the UCX data receive after its destination buffer is ready.
+  void startDataReceive(std::shared_ptr<DataAndMetadata> data);
+
   /// @brief Called by the transport layer when data is available
   /// @param status indication by transport layer of transfer status
   /// @param arg
@@ -288,6 +296,10 @@ class UcxExchangeSource
   // goes dormant. The consumer thread wakes it via resumeFromBackpressure()
   // when the queue drains to kBackpressureLowWaterMark.
   std::atomic<bool> backpressureActive_{false};
+
+  // Buffer whose stream-ordered allocation must complete before UCX can write
+  // to it. Only the communicator thread accesses this field.
+  std::shared_ptr<DataAndMetadata> pendingData_;
 
   // Some metrics/counters:
   UcxExchangeMetrics metrics_;
