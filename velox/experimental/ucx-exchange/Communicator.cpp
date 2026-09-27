@@ -18,7 +18,10 @@
 #include <ucxx/api.h>
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
+#include <charconv>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include "velox/common/base/Exceptions.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -57,6 +60,23 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
     std::uniform_int_distribution<uint64_t> dist;
     instancePtr_->workerId_ = dist(gen);
     LOG(INFO) << "Communicator workerId=" << instancePtr_->workerId_;
+
+    if (const char* encodedLimit =
+            std::getenv("VELOX_UCX_MAX_INFLIGHT_BYTES")) {
+      const std::string_view value{encodedLimit};
+      uint64_t parsedLimit = 0;
+      const auto [end, error] = std::from_chars(
+          value.data(), value.data() + value.size(), parsedLimit);
+      VELOX_USER_CHECK(
+          error == std::errc{} && end == value.data() + value.size(),
+          "VELOX_UCX_MAX_INFLIGHT_BYTES must be an unsigned integer, got '{}'",
+          value);
+      instancePtr_->payloadSendWindowBytes_ = parsedLimit;
+    }
+    LOG(INFO) << "UCX aggregate payload-send window="
+              << instancePtr_->payloadSendWindowBytes_
+              << " bytes (0 means unlimited)";
+
     auto logLevel = CudfConfig::getInstance().exchangeLogLevel;
     LOG(INFO) << "ucx-exchange VLOG level set to " << logLevel;
     if (logLevel > 0) {
@@ -128,6 +148,13 @@ void Communicator::run() {
   }
 
   worker_ = context_->workerBuilder().build();
+  auto localAddress = worker_->addressBuilder().build();
+  const auto localAddressView = localAddress->getStringView();
+  VELOX_CHECK_LE(
+      localAddressView.size(),
+      kMaxWorkerAddressBytes,
+      "UCX worker address exceeds the handshake protocol limit");
+  workerAddress_.assign(localAddressView.data(), localAddressView.size());
 
   if (CudfConfig::getInstance().ucxxBlockingProgress) {
     // Communicator is using blocking progress mode.
@@ -320,6 +347,34 @@ std::shared_ptr<EndpointRef> Communicator::assocEndpointRef(
   return epRef;
 }
 
+std::shared_ptr<EndpointRef> Communicator::assocWorkerAddressEndpointRef(
+    uint64_t remoteWorkerId,
+    std::string_view remoteWorkerAddress,
+    std::string peerIp) {
+  std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
+  auto it = workerAddressEndpoints_.find(remoteWorkerId);
+  if (it != workerAddressEndpoints_.end()) {
+    return it->second;
+  }
+
+  VELOX_CHECK(
+      !remoteWorkerAddress.empty(),
+      "Cannot create a payload endpoint from an empty UCX worker address");
+  auto address = ucxx::AddressBuilder(remoteWorkerAddress).build();
+  auto endpoint =
+      worker_->endpointBuilder(address)
+          .endpointErrorHandling(CudfConfig::getInstance().ucxxErrorHandling)
+          .build();
+  VELOX_CHECK_NOT_NULL(endpoint);
+
+  auto endpointRef = std::make_shared<EndpointRef>(endpoint, std::move(peerIp));
+  if (CudfConfig::getInstance().ucxxErrorHandling) {
+    endpoint->setCloseCallback(EndpointRef::onClose, endpointRef);
+  }
+  workerAddressEndpoints_.emplace(remoteWorkerId, endpointRef);
+  return endpointRef;
+}
+
 void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
   std::lock_guard<std::recursive_mutex> lock(endpointsMutex_);
   VLOG(3) << "In Communicator::removeEndpointRef for Communicator with port = "
@@ -341,6 +396,14 @@ void Communicator::removeEndpointRef(std::shared_ptr<EndpointRef> ep) {
       ++it;
     }
   }
+  for (auto it = workerAddressEndpoints_.begin();
+       it != workerAddressEndpoints_.end();) {
+    if (it->second == ep) {
+      it = workerAddressEndpoints_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   VLOG(3) << "- Communicator::removeEndpointRef";
 }
 
@@ -356,6 +419,155 @@ void Communicator::deferEndpointCleanup(std::shared_ptr<EndpointRef> ep) {
 void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
   if (request) {
     deferredRequests_.push_back(std::move(request));
+  }
+}
+
+void Communicator::recordPayloadSendStart(std::size_t bytes) {
+  std::lock_guard<std::mutex> lock(payloadTelemetryMutex_);
+  if (activePayloadSends_++ == 0) {
+    payloadWindowStart_ = std::chrono::steady_clock::now();
+    payloadWindowBytes_ = 0;
+  }
+  payloadWindowBytes_ += bytes;
+}
+
+void Communicator::recordPayloadSendComplete() {
+  std::lock_guard<std::mutex> lock(payloadTelemetryMutex_);
+  if (activePayloadSends_ == 0) {
+    LOG(ERROR) << "[UCX-PAYLOAD-SEND-WINDOW] completion without an active send";
+    return;
+  }
+  if (--activePayloadSends_ != 0) {
+    return;
+  }
+
+  const double seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - payloadWindowStart_)
+          .count();
+  payloadTotalBytes_ += payloadWindowBytes_;
+  payloadTotalBusySeconds_ += seconds;
+  const double windowGbps =
+      seconds > 0 ? payloadWindowBytes_ / seconds / 1'000'000'000.0 : 0.0;
+  const double cumulativeGbps = payloadTotalBusySeconds_ > 0
+      ? payloadTotalBytes_ / payloadTotalBusySeconds_ / 1'000'000'000.0
+      : 0.0;
+  LOG(INFO) << "[UCX-PAYLOAD-SEND-WINDOW] worker=" << workerId_
+            << " bytes=" << payloadWindowBytes_ << " seconds=" << seconds
+            << " GBps=" << windowGbps
+            << " cumulativeBytes=" << payloadTotalBytes_
+            << " cumulativeBusySeconds=" << payloadTotalBusySeconds_
+            << " cumulativeGBps=" << cumulativeGbps;
+  payloadWindowBytes_ = 0;
+}
+
+void Communicator::recordPayloadReceiveStart(std::size_t bytes) {
+  std::lock_guard<std::mutex> lock(receiveTelemetryMutex_);
+  if (activePayloadReceives_++ == 0) {
+    receiveWindowStart_ = std::chrono::steady_clock::now();
+    receiveWindowBytes_ = 0;
+  }
+  receiveWindowBytes_ += bytes;
+}
+
+void Communicator::recordPayloadReceiveComplete() {
+  std::lock_guard<std::mutex> lock(receiveTelemetryMutex_);
+  if (activePayloadReceives_ == 0) {
+    LOG(ERROR)
+        << "[UCX-PAYLOAD-RECEIVE-WINDOW] completion without an active receive";
+    return;
+  }
+  if (--activePayloadReceives_ != 0) {
+    return;
+  }
+
+  const double seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - receiveWindowStart_)
+          .count();
+  receiveTotalBytes_ += receiveWindowBytes_;
+  receiveTotalBusySeconds_ += seconds;
+  const double windowGbps =
+      seconds > 0 ? receiveWindowBytes_ / seconds / 1'000'000'000.0 : 0.0;
+  const double cumulativeGbps = receiveTotalBusySeconds_ > 0
+      ? receiveTotalBytes_ / receiveTotalBusySeconds_ / 1'000'000'000.0
+      : 0.0;
+  LOG(INFO) << "[UCX-PAYLOAD-RECEIVE-WINDOW] worker=" << workerId_
+            << " bytes=" << receiveWindowBytes_ << " seconds=" << seconds
+            << " GBps=" << windowGbps
+            << " cumulativeBytes=" << receiveTotalBytes_
+            << " cumulativeBusySeconds=" << receiveTotalBusySeconds_
+            << " cumulativeGBps=" << cumulativeGbps;
+  receiveWindowBytes_ = 0;
+}
+
+bool Communicator::requestPayloadSendPermit(
+    std::size_t bytes,
+    folly::Func onReady) {
+  VELOX_CHECK_GT(bytes, 0);
+
+  std::lock_guard<std::mutex> lock(payloadFlowMutex_);
+  const auto canFit = [this](std::size_t candidate) {
+    if (payloadSendWindowBytes_ == 0) {
+      return true;
+    }
+    if (candidate > payloadSendWindowBytes_) {
+      return payloadBytesInFlight_ == 0;
+    }
+    return candidate <= payloadSendWindowBytes_ - payloadBytesInFlight_;
+  };
+
+  if (pendingPayloadSends_.empty() && canFit(bytes)) {
+    VELOX_CHECK_LE(
+        bytes, std::numeric_limits<uint64_t>::max() - payloadBytesInFlight_);
+    payloadBytesInFlight_ += bytes;
+    payloadPeakBytesInFlight_ =
+        std::max(payloadPeakBytesInFlight_, payloadBytesInFlight_);
+    return true;
+  }
+
+  pendingPayloadSends_.push_back(PendingPayloadSend{bytes, std::move(onReady)});
+  return false;
+}
+
+void Communicator::releasePayloadSendPermit(std::size_t bytes) {
+  std::vector<folly::Func> ready;
+  {
+    std::lock_guard<std::mutex> lock(payloadFlowMutex_);
+    VELOX_CHECK_GE(payloadBytesInFlight_, bytes);
+    payloadBytesInFlight_ -= bytes;
+
+    const auto canFit = [this](std::size_t candidate) {
+      if (payloadSendWindowBytes_ == 0) {
+        return true;
+      }
+      if (candidate > payloadSendWindowBytes_) {
+        return payloadBytesInFlight_ == 0;
+      }
+      return candidate <= payloadSendWindowBytes_ - payloadBytesInFlight_;
+    };
+
+    while (!pendingPayloadSends_.empty() &&
+           canFit(pendingPayloadSends_.front().bytes)) {
+      auto pending = std::move(pendingPayloadSends_.front());
+      pendingPayloadSends_.pop_front();
+      VELOX_CHECK_LE(
+          pending.bytes,
+          std::numeric_limits<uint64_t>::max() - payloadBytesInFlight_);
+      payloadBytesInFlight_ += pending.bytes;
+      payloadPeakBytesInFlight_ =
+          std::max(payloadPeakBytesInFlight_, payloadBytesInFlight_);
+      ready.push_back(std::move(pending.onReady));
+    }
+
+    VLOG(2) << "[UCX-PAYLOAD-FLOW] released=" << bytes
+            << " inFlight=" << payloadBytesInFlight_
+            << " peak=" << payloadPeakBytesInFlight_
+            << " waiting=" << pendingPayloadSends_.size();
+  }
+
+  for (auto& onReady : ready) {
+    onReady();
   }
 }
 

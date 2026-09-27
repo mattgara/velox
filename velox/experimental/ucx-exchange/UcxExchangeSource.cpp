@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <chrono>
+#include <cstring>
 #include <thread>
 
 #include <cudf/contiguous_split.hpp>
@@ -341,44 +343,56 @@ void UcxExchangeSource::setEndpoint(std::shared_ptr<EndpointRef> endpointRef) {
 }
 
 void UcxExchangeSource::sendHandshake() {
-  std::shared_ptr<HandshakeMsg> handshakeReq = std::make_shared<HandshakeMsg>();
-  handshakeReq->destination = partitionKey_.destination;
+  const auto& workerAddress = communicator_->getWorkerAddress();
+  VELOX_CHECK_LE(workerAddress.size(), kMaxWorkerAddressBytes);
+
+  HandshakeMsg handshake;
+  handshake.headerSize = sizeof(handshake);
+  handshake.destination = partitionKey_.destination;
+  handshake.workerAddressSize = workerAddress.size();
+  handshake.workerId = communicator_->getWorkerId();
   // Use sizeof(...) - 1 and explicitly null-terminate to prevent buffer
   // overread if taskId is longer than the destination buffer.
   strncpy(
-      handshakeReq->taskId,
+      handshake.taskId,
       partitionKey_.taskId.c_str(),
-      sizeof(handshakeReq->taskId) - 1);
-  handshakeReq->taskId[sizeof(handshakeReq->taskId) - 1] = '\0';
-  handshakeReq->workerId = communicator_->getWorkerId();
+      sizeof(handshake.taskId) - 1);
+  handshake.taskId[sizeof(handshake.taskId) - 1] = '\0';
+
+  auto handshakeBytes = std::make_shared<std::vector<uint8_t>>(
+      sizeof(handshake) + workerAddress.size());
+  std::memcpy(handshakeBytes->data(), &handshake, sizeof(handshake));
+  std::memcpy(
+      handshakeBytes->data() + sizeof(handshake),
+      workerAddress.data(),
+      workerAddress.size());
 
   VLOG(3) << toString() << " Sending handshake with initial value: "
-          << partitionKey_.toString() << " to server";
+          << partitionKey_.toString()
+          << " to server, workerAddressBytes=" << workerAddress.size();
 
   // Create the handshake which will register client's existence with the server
   ucxx::AmReceiverCallbackInfo info(
       communicator_->kAmCallbackOwner, communicator_->kAmCallbackId);
-  // Use weak_ptr to prevent use-after-free if close() is called during callback
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
   if (request_) {
     completedRequests_.push_back(std::move(request_));
   }
-  // Pass handshakeReq as the callback arg to keep the send buffer alive until
-  // the async amSend completes. UCXX stores it as shared_ptr<void> but the
-  // type-erased deleter still calls ~HandshakeMsg correctly.
-  request_ =
-      endpointRef_->endpoint_
-          ->amSendBuilder(
-              handshakeReq.get(), sizeof(*handshakeReq), UCS_MEMORY_TYPE_HOST)
-          .receiverCallbackInfo(info)
-          .callbackFunction(
-              [weak](ucs_status_t status, std::shared_ptr<void> arg) {
-                if (auto self = weak.lock()) {
-                  self->onHandshake(status, arg);
-                }
-              })
-          .callbackData(handshakeReq)
-          .build();
+  // Keep the variable-size send buffer alive until asynchronous AM completion.
+  request_ = endpointRef_->endpoint_
+                 ->amSendBuilder(
+                     handshakeBytes->data(),
+                     handshakeBytes->size(),
+                     UCS_MEMORY_TYPE_HOST)
+                 .receiverCallbackInfo(info)
+                 .callbackFunction(
+                     [weak](ucs_status_t status, std::shared_ptr<void> arg) {
+                       if (auto self = weak.lock()) {
+                         self->onHandshake(status, arg);
+                       }
+                     })
+                 .callbackData(handshakeBytes)
+                 .build();
 }
 
 void UcxExchangeSource::onHandshake(
@@ -554,6 +568,7 @@ void UcxExchangeSource::onMetadata(
     if (request_) {
       completedRequests_.push_back(std::move(request_));
     }
+    communicator_->recordPayloadReceiveStart(ptr->metadata.dataSizeBytes);
     request_ = endpointRef_->endpoint_
                    ->tagRecvBuilder(
                        ptr->dataBuf->data(),
@@ -572,6 +587,7 @@ void UcxExchangeSource::onMetadata(
 }
 
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
+  communicator_->recordPayloadReceiveComplete();
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << toString() << " onData called after close, ignoring";

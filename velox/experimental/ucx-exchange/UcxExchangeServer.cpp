@@ -44,6 +44,19 @@ serverStateNames() {
           };
   return kNames;
 }
+
+std::shared_ptr<void> makePayloadSendPermit(
+    const std::shared_ptr<Communicator>& communicator,
+    std::size_t bytes) {
+  std::weak_ptr<Communicator> weakCommunicator = communicator;
+  return std::shared_ptr<void>(
+      new char, [weakCommunicator, bytes](void* token) {
+        delete static_cast<char*>(token);
+        if (auto locked = weakCommunicator.lock()) {
+          locked->releasePayloadSendPermit(bytes);
+        }
+      });
+}
 } // namespace
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
@@ -66,6 +79,8 @@ struct MetaSendContext {
 
 struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
+  // Releases the communicator-wide byte reservation after UCX completes.
+  std::shared_ptr<void> payloadSendPermit;
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -224,6 +239,15 @@ void UcxExchangeServer::close() {
     dataRequest_->cancel();
   }
 
+  // A permit granted before tagSend is owned by the server. Once tagSend is
+  // built, the request context owns it instead and releases it on completion.
+  std::shared_ptr<void> unsentPayloadPermit;
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    unsentPayloadPermit = std::move(payloadSendPermit_);
+  }
+  unsentPayloadPermit.reset();
+
   // Move all requests to the Communicator's deferred list so the GPU
   // buffers they reference (via their arg shared_ptr) stay alive until
   // UCX has fully processed any in-flight operations.
@@ -314,6 +338,31 @@ void UcxExchangeServer::sendData() {
   } else {
     // REMOTE EXCHANGE PATH: Use UCXX for metadata and data transfer
     std::shared_ptr<MetadataMsg> metadataMsg = std::make_shared<MetadataMsg>();
+
+    if (dataPtr_ && !payloadSendPermit_) {
+      if (payloadSendPermitPending_) {
+        return;
+      }
+
+      const std::size_t payloadBytes = dataPtr_->gpu_data->size();
+      std::weak_ptr<UcxExchangeServer> weakServer = weak_from_this();
+      std::weak_ptr<Communicator> weakCommunicator = communicator_;
+      payloadSendPermitPending_ = true;
+      const bool acquired = communicator_->requestPayloadSendPermit(
+          payloadBytes, [weakServer, weakCommunicator, payloadBytes]() {
+            if (auto server = weakServer.lock()) {
+              server->onPayloadSendPermitGranted(payloadBytes);
+            } else if (auto communicator = weakCommunicator.lock()) {
+              communicator->releasePayloadSendPermit(payloadBytes);
+            }
+          });
+      if (!acquired) {
+        return;
+      }
+
+      payloadSendPermitPending_ = false;
+      payloadSendPermit_ = makePayloadSendPermit(communicator_, payloadBytes);
+    }
 
     if (dataPtr_) {
       // Copy metadata (not move) because in broadcast mode, the same
@@ -422,6 +471,8 @@ void UcxExchangeServer::sendData() {
       // stays alive for UCP wireup replay.
       auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
+      dataCtx->payloadSendPermit = std::move(payloadSendPermit_);
+      communicator_->recordPayloadSendStart(dataCtx->data->gpu_data->size());
 
       dataRequest_ =
           endpointRef_->endpoint_
@@ -437,6 +488,7 @@ void UcxExchangeServer::sendData() {
                     // Request.
                     auto ctx = std::static_pointer_cast<DataSendContext>(arg);
                     auto dataHolder = std::move(ctx->data);
+                    auto payloadPermit = std::move(ctx->payloadSendPermit);
 
                     if (auto self = weakData.lock()) {
                       self->sendComplete(status, arg);
@@ -458,9 +510,37 @@ void UcxExchangeServer::sendData() {
   }
 }
 
+void UcxExchangeServer::onPayloadSendPermitGranted(std::size_t bytes) {
+  bool releasePermit = false;
+  bool wakeServer = false;
+  {
+    std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    if (!payloadSendPermitPending_) {
+      releasePermit = true;
+    } else {
+      payloadSendPermitPending_ = false;
+      if (closed_.load(std::memory_order_acquire) || !dataPtr_) {
+        releasePermit = true;
+      } else {
+        payloadSendPermit_ = makePayloadSendPermit(communicator_, bytes);
+        wakeServer = true;
+      }
+    }
+  }
+
+  if (releasePermit) {
+    communicator_->releasePayloadSendPermit(bytes);
+    return;
+  }
+  if (wakeServer) {
+    communicator_->addToWorkQueue(getSelfPtr());
+  }
+}
+
 void UcxExchangeServer::sendComplete(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
+  communicator_->recordPayloadSendComplete();
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << "@" << partitionKey_.taskId

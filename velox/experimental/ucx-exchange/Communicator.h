@@ -18,6 +18,9 @@
 #include <ucxx/api.h>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
@@ -101,6 +104,19 @@ class Communicator {
       std::shared_ptr<CommElement> commElement,
       HostPort hostPort);
 
+  /// Returns a shared endpoint created from the peer's serialized UCX worker
+  /// address. Unlike the socket endpoint used for bootstrap, this lets UCX
+  /// select shared-memory and CUDA transports for same-host payloads.
+  [[nodiscard]] std::shared_ptr<EndpointRef> assocWorkerAddressEndpointRef(
+      uint64_t remoteWorkerId,
+      std::string_view remoteWorkerAddress,
+      std::string peerIp);
+
+  /// Serialized address of this Communicator's UCX worker.
+  [[nodiscard]] const std::string& getWorkerAddress() const {
+    return workerAddress_;
+  }
+
   /// @brief Removes an endpoint from the communicator. This is required when
   /// the endpoint has become stale since the other side has disappeared.
   /// NOTE: This should NOT be called from within a UCX callback. Use
@@ -119,6 +135,21 @@ class Communicator {
   /// held alive until UCX has fully processed the cancellation.
   /// Must only be called from the Communicator thread.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
+
+  void recordPayloadSendStart(std::size_t bytes);
+
+  void recordPayloadSendComplete();
+
+  void recordPayloadReceiveStart(std::size_t bytes);
+
+  void recordPayloadReceiveComplete();
+
+  /// Reserves space in the communicator-wide payload-send window. Returns
+  /// true when the caller can send immediately. Otherwise, invokes onReady
+  /// after reserving the requested bytes for the caller.
+  bool requestPayloadSendPermit(std::size_t bytes, folly::Func onReady);
+
+  void releasePayloadSendPermit(std::size_t bytes);
 
   /// Returns the URL of the coordinator.
   [[nodiscard]] const std::string& getCoordinatorUrl();
@@ -205,6 +236,10 @@ class Communicator {
 
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;
+  // Payload endpoints keyed by the peer's stable worker identifier.
+  std::map<uint64_t, std::shared_ptr<EndpointRef>> workerAddressEndpoints_;
+  // Binary serialized UCX worker address advertised during bootstrap.
+  std::string workerAddress_;
 
   // Signals the UCXX worker to wake up from a blocking
   // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
@@ -226,6 +261,32 @@ class Communicator {
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
   // are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
+
+  std::mutex payloadTelemetryMutex_;
+  std::size_t activePayloadSends_{0};
+  uint64_t payloadWindowBytes_{0};
+  uint64_t payloadTotalBytes_{0};
+  double payloadTotalBusySeconds_{0.0};
+  std::chrono::steady_clock::time_point payloadWindowStart_{
+      std::chrono::steady_clock::now()};
+
+  struct PendingPayloadSend {
+    std::size_t bytes;
+    folly::Func onReady;
+  };
+  std::mutex payloadFlowMutex_;
+  uint64_t payloadSendWindowBytes_{0};
+  uint64_t payloadBytesInFlight_{0};
+  uint64_t payloadPeakBytesInFlight_{0};
+  std::deque<PendingPayloadSend> pendingPayloadSends_;
+
+  std::mutex receiveTelemetryMutex_;
+  std::size_t activePayloadReceives_{0};
+  uint64_t receiveWindowBytes_{0};
+  uint64_t receiveTotalBytes_{0};
+  double receiveTotalBusySeconds_{0.0};
+  std::chrono::steady_clock::time_point receiveWindowStart_{
+      std::chrono::steady_clock::now()};
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{
