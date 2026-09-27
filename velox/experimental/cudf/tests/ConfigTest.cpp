@@ -18,8 +18,6 @@
 
 #include <gtest/gtest.h>
 
-#include "velox/common/base/Exceptions.h"
-
 namespace facebook::velox::cudf_velox::test {
 
 TEST(ConfigTest, cudfConfig) {
@@ -31,16 +29,11 @@ TEST(ConfigTest, cudfConfig) {
       {CudfConfig::kCudfFunctionNamePrefix, "presto"},
       {CudfConfig::kCudfStreamingGroupbyEnabled, "true"},
       {CudfConfig::kCudfStreamingGroupbyCapacityMultiplier, "3.5"},
-      {CudfConfig::kCudfDeferFinalDecimalSumAggregation, "true"},
-      {CudfConfig::kCudfAllowCpuFallback, "false"},
-      {CudfConfig::kUcxExchangeCompression, "column"},
-      {CudfConfig::kUcxExchangeCompressionPipelineThreads, "2"},
-      {CudfConfig::kUcxExchangeCompressionMinBytes, "268435456"}};
+      {CudfConfig::kCudfAllowCpuFallback, "false"}};
 
   CudfConfig config;
   ASSERT_FALSE(config.streamingGroupbyEnabled);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 2.0);
-  ASSERT_FALSE(config.deferFinalDecimalSumAggregation);
   config.initialize(std::move(options));
   ASSERT_EQ(config.enabled, false);
   ASSERT_EQ(config.debugEnabled, true);
@@ -49,23 +42,6 @@ TEST(ConfigTest, cudfConfig) {
   ASSERT_EQ(config.functionNamePrefix, "presto");
   ASSERT_EQ(config.streamingGroupbyEnabled, true);
   ASSERT_EQ(config.streamingGroupbyCapacityMultiplier, 3.5);
-  ASSERT_TRUE(config.deferFinalDecimalSumAggregation);
   ASSERT_EQ(config.allowCpuFallback, false);
-  ASSERT_EQ(config.exchangeCompression, "column");
-  ASSERT_EQ(config.exchangeCompressionPipelineThreads, 2);
-  ASSERT_EQ(config.exchangeCompressionMinBytes, 268435456);
-}
-
-TEST(ConfigTest, rejectsInvalidCompressionConfig) {
-  const auto expectRejected = [](const char* name, const char* value) {
-    std::unordered_map<std::string, std::string> options = {{name, value}};
-    CudfConfig config;
-    EXPECT_THROW(config.initialize(std::move(options)), VeloxUserError);
-  };
-
-  expectRejected(CudfConfig::kUcxExchangeCompression, "invalid");
-  expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "0");
-  expectRejected(CudfConfig::kUcxExchangeCompressionPipelineThreads, "5");
-  expectRejected(CudfConfig::kUcxExchangeCompressionMinBytes, "-1");
 }
 } // namespace facebook::velox::cudf_velox::test

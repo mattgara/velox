@@ -18,7 +18,6 @@
 #include <ucxx/api.h>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <set>
 
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -72,10 +71,6 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
     return peerIp_;
   }
 
-  /// Returns whether this endpoint uses CUDA IPC. A missing value means UCP
-  /// could not report the transport set.
-  std::optional<bool> usesCudaIpc() const;
-
   const std::shared_ptr<ucxx::Endpoint> endpoint_;
 
  private:
@@ -89,7 +84,5 @@ class EndpointRef : public std::enable_shared_from_this<EndpointRef> {
       std::owner_less<std::weak_ptr<CommElement>>>
       communicators_;
   std::mutex commMutex_; // Protects communicators_
-  mutable std::mutex transportMutex_;
-  mutable std::optional<bool> usesCudaIpc_;
 };
 } // namespace facebook::velox::ucx_exchange

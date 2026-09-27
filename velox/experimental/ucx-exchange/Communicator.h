@@ -15,20 +15,12 @@
  */
 #pragma once
 
-#include <rmm/cuda_stream_pool.hpp>
 #include <ucxx/api.h>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cuda/stream>
-#include <deque>
-#include <map>
-#include <memory>
 #include <random>
 #include <string>
 #include <string_view>
-#include <vector>
-#include "velox/common/base/LazyCPUThreadPoolExecutor.h"
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/experimental/ucx-exchange/Acceptor.h"
 #include "velox/experimental/ucx-exchange/CommElement.h"
@@ -93,9 +85,6 @@ class Communicator {
   /// @param comms The element to be added to the work queue.
   void addToWorkQueue(std::shared_ptr<CommElement> comms);
 
-  /// Runs synchronous compression work away from the UCX progress thread.
-  void submitCodecTask(folly::Func task);
-
   /// @brief Unregisters a communication element
   /// @brief comms The communication element.
   void unregister(std::shared_ptr<CommElement> comms);
@@ -111,19 +100,6 @@ class Communicator {
   [[nodiscard]] std::shared_ptr<EndpointRef> assocEndpointRef(
       std::shared_ptr<CommElement> commElement,
       HostPort hostPort);
-
-  /// Returns a shared endpoint created from the peer's serialized UCX worker
-  /// address. Unlike the socket endpoint used for bootstrap, this lets UCX
-  /// select shared-memory and CUDA transports for same-host payloads.
-  [[nodiscard]] std::shared_ptr<EndpointRef> assocWorkerAddressEndpointRef(
-      uint64_t remoteWorkerId,
-      std::string_view remoteWorkerAddress,
-      std::string peerIp);
-
-  /// Serialized address of this Communicator's UCX worker.
-  [[nodiscard]] const std::string& getWorkerAddress() const {
-    return workerAddress_;
-  }
 
   /// @brief Removes an endpoint from the communicator. This is required when
   /// the endpoint has become stale since the other side has disappeared.
@@ -143,30 +119,6 @@ class Communicator {
   /// held alive until UCX has fully processed the cancellation.
   /// Must only be called from the Communicator thread.
   void deferRequestCleanup(std::shared_ptr<ucxx::Request> request);
-
-  /// Records the union of active payload-send intervals. This exposes physical
-  /// payload throughput under real query concurrency without double-counting
-  /// overlapping sends.
-  void recordPayloadSendStart(std::size_t bytes);
-
-  void recordPayloadSendComplete();
-
-  void recordPayloadReceiveStart(std::size_t bytes);
-
-  void recordPayloadReceiveComplete();
-
-  /// Reserves space in the communicator-wide payload-send window. Returns
-  /// true when the caller can send immediately. Otherwise, invokes onReady
-  /// after reserving the requested bytes for the caller.
-  bool requestPayloadSendPermit(std::size_t bytes, folly::Func onReady);
-
-  /// Releases bytes previously reserved by requestPayloadSendPermit().
-  void releasePayloadSendPermit(std::size_t bytes);
-
-  /// Returns a stream reserved for an incoming exchange page. A wider pool
-  /// keeps a newly allocated receive buffer from reusing a stream that still
-  /// carries downstream work from an earlier page.
-  [[nodiscard]] cuda::stream_ref getReceiveStream();
 
   /// Returns the URL of the coordinator.
   [[nodiscard]] const std::string& getCoordinatorUrl();
@@ -253,10 +205,6 @@ class Communicator {
 
   // Shared endpoints keyed by remote host:port.
   std::map<HostPort, std::shared_ptr<EndpointRef>> endpoints_;
-  // Payload endpoints keyed by the peer's stable worker identifier.
-  std::map<uint64_t, std::shared_ptr<EndpointRef>> workerAddressEndpoints_;
-  // Binary serialized UCX worker address advertised during bootstrap.
-  std::string workerAddress_;
 
   // Signals the UCXX worker to wake up from a blocking
   // progressWorkerEvent() call. Thread-safe. No-op if worker_ is null
@@ -278,38 +226,6 @@ class Communicator {
   // ensuring the GPU buffers (owned via the request's arg shared_ptr)
   // are not freed prematurely.
   std::vector<std::shared_ptr<ucxx::Request>> deferredRequests_;
-
-  // Owned by the communicator so codec tasks finish before UCX and CUDA
-  // resources are destroyed. The underlying threads are created on first use.
-  std::unique_ptr<LazyCPUThreadPoolExecutor> codecExecutor_;
-
-  std::mutex payloadTelemetryMutex_;
-  std::size_t activePayloadSends_{0};
-  uint64_t payloadWindowBytes_{0};
-  uint64_t payloadTotalBytes_{0};
-  double payloadTotalBusySeconds_{0.0};
-  std::chrono::steady_clock::time_point payloadWindowStart_{
-      std::chrono::steady_clock::now()};
-
-  struct PendingPayloadSend {
-    std::size_t bytes;
-    folly::Func onReady;
-  };
-  std::mutex payloadFlowMutex_;
-  uint64_t payloadSendWindowBytes_{0};
-  uint64_t payloadBytesInFlight_{0};
-  uint64_t payloadPeakBytesInFlight_{0};
-  std::deque<PendingPayloadSend> pendingPayloadSends_;
-
-  std::unique_ptr<rmm::cuda_stream_pool> receiveStreamPool_;
-
-  std::mutex receiveTelemetryMutex_;
-  std::size_t activePayloadReceives_{0};
-  uint64_t receiveWindowBytes_{0};
-  uint64_t receiveTotalBytes_{0};
-  double receiveTotalBusySeconds_{0.0};
-  std::chrono::steady_clock::time_point receiveWindowStart_{
-      std::chrono::steady_clock::now()};
 
   // Heartbeat state for diagnostic logging.
   std::chrono::steady_clock::time_point lastHeartbeat_{
