@@ -770,8 +770,8 @@ void UcxExchangeServer::sendData() {
     // send the data chunk (if any)
     if (dataPtr_) {
       sendStart_ = std::chrono::steady_clock::now();
-      uncompressedBytes_ = dataPtr_->gpu_data->size();
-      bytes_ = compressedData ? compressedData->size() : uncompressedBytes_;
+      bytes_ =
+          compressedData ? compressedData->size() : dataPtr_->gpu_data->size();
 
       VLOG(3) << "@" << partitionKey_.taskId
               << " Sending rmm::buffer: " << std::hex
@@ -795,10 +795,7 @@ void UcxExchangeServer::sendData() {
       // it after the DMA completes, while the Request (and context shell)
       // stays alive for UCP wireup replay.
       auto dataCtx = std::make_shared<DataSendContext>();
-      // The raw allocation is needed through DMA only for an uncompressed
-      // send. A compressed send owns an independent payload and can release
-      // the raw packed allocation as soon as tagSend has accepted the request.
-      dataCtx->data = compressedData ? nullptr : dataPtr_;
+      dataCtx->data = dataPtr_;
       dataCtx->compressedData = compressedData;
       dataCtx->payloadSendPermit = std::move(payloadSendPermit_);
       compressionResult_.reset();
@@ -826,10 +823,6 @@ void UcxExchangeServer::sendData() {
                   })
               .callbackData(dataCtx)
               .build();
-      if (compressedData) {
-        dataPtr_.reset();
-        dataNumRows_ = 0;
-      }
     } else {
       // Data pointer is null, so no more data will be coming.
       VLOG(3) << "@" << partitionKey_.taskId
@@ -879,6 +872,8 @@ void UcxExchangeServer::sendComplete(ucs_status_t status) {
   }
   if (status == UCS_OK) {
     std::lock_guard<std::recursive_mutex> lock(dataMutex_);
+    VELOX_CHECK_NOT_NULL(dataPtr_, "dataPtr_ is null");
+
     const auto end = std::chrono::steady_clock::now();
     const auto duration = end - sendStart_;
     const double seconds = std::chrono::duration<double>(duration).count();
@@ -888,7 +883,7 @@ void UcxExchangeServer::sendComplete(ucs_status_t status) {
     const auto& compressionMode =
         cudf_velox::CudfConfig::getInstance().exchangeCompression;
     if (isAdaptiveCompressionMode(compressionMode) &&
-        meetsCompressionMinimum(uncompressedBytes_) &&
+        meetsCompressionMinimum(dataPtr_->gpu_data->size()) &&
         endpointAllowsCompression()) {
       compressionCostModel().recordTransfer(
           partitionKey_.taskId, bytes_, seconds);
@@ -905,7 +900,6 @@ void UcxExchangeServer::sendComplete(ucs_status_t status) {
     this->sequenceNumber_++;
     dataPtr_.reset(); // release memory.
     dataNumRows_ = 0;
-    uncompressedBytes_ = 0;
     compressionWork_.reset();
     VLOG(3) << "@" << partitionKey_.taskId
             << " Releasing dataPtr_ in sendComplete.";

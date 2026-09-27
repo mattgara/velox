@@ -70,8 +70,6 @@ struct CudfConfig {
       "cudf.exchange_compression_pipeline_threads"};
   static constexpr const char* kUcxExchangeCompressionMinBytes{
       "cudf.exchange_compression_min_bytes"};
-  static constexpr const char* kUcxExchangeCompressionSafetyMargin{
-      "cudf.exchange_compression_safety_margin"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 
@@ -129,7 +127,7 @@ struct CudfConfig {
   int64_t partitionedOutputBatchRows{10'000};
 
   /// GPU codec for the UCX exchange payload.
-  /// Supported values: none, column, column-adaptive.
+  /// Supported values: none, column.
   std::string exchangeCompression{"none"};
 
   /// Maximum number of codec tasks executing concurrently per worker.
@@ -137,9 +135,6 @@ struct CudfConfig {
 
   /// Send smaller exchange chunks without attempting the GPU codec.
   int64_t exchangeCompressionMinBytes{0};
-
-  /// Required ratio of estimated transfer savings to measured codec cost.
-  double exchangeCompressionSafetyMargin{1.10};
 
   /// Memory resource for cuDF.
   /// Possible values are (cuda, pool, async, arena, managed, managed_pool).
