@@ -26,11 +26,13 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/FusedForWire.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/fused_for.hpp>
 #include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/partitioning.hpp>
@@ -86,7 +88,9 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       driverId_(ctx->driverId),
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
           CudfConfig::kUcxPartitionedOutputBatchRows,
-          CudfConfig::getInstance().partitionedOutputBatchRows)) {
+          CudfConfig::getInstance().partitionedOutputBatchRows)),
+      fusedForEnabled_(
+          ctx->queryConfig().get<bool>(CudfConfig::kUcxFusedFor, false)) {
   VELOX_CHECK_NOT_NULL(
       queueManager, "UcxPartitionedOutput requires an output queue manager");
   VELOX_CHECK(
@@ -106,6 +110,53 @@ UcxPartitionedOutput::UcxPartitionedOutput(
   if (inNames != outNames) {
     getRemapping(inNames, outNames, remap_);
   }
+}
+
+void UcxPartitionedOutput::recordFusedForOutput(
+    std::size_t logicalBytes,
+    std::size_t wireBytes,
+    std::size_t segmentCount) {
+  VELOX_CHECK_LE(
+      logicalBytes,
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max()));
+  VELOX_CHECK_LE(
+      wireBytes,
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max()));
+  VELOX_CHECK_LE(
+      segmentCount,
+      static_cast<std::size_t>(std::numeric_limits<int64_t>::max()));
+  auto lockedStats = stats_.wlock();
+  lockedStats->addRuntimeStat(
+      "fusedForLogicalBytes",
+      RuntimeCounter(
+          static_cast<int64_t>(logicalBytes), RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "fusedForWireBytes",
+      RuntimeCounter(
+          static_cast<int64_t>(wireBytes), RuntimeCounter::Unit::kBytes));
+  lockedStats->addRuntimeStat(
+      "fusedForSegments", RuntimeCounter(static_cast<int64_t>(segmentCount)));
+}
+
+std::unique_ptr<cudf::packed_columns>
+UcxPartitionedOutput::packForExchange(
+    cudf::table_view tableView,
+    cuda::stream_ref stream) {
+  if (!fusedForEnabled_ || tableView.num_columns() == 0) {
+    return std::make_unique<cudf::packed_columns>(
+        cudf::pack(tableView, stream, get_output_mr()));
+  }
+
+  auto packed =
+      cudf::detail::pack_fused_for(tableView, stream, get_output_mr());
+  recordFusedForOutput(
+      packed.logical_data_size, packed.wire_data->size(), packed.segment_count);
+  auto metadata = wrapFusedForMetadata(
+      std::move(packed.metadata),
+      packed.segment_count,
+      packed.logical_data_size);
+  return std::make_unique<cudf::packed_columns>(
+      std::move(metadata), std::move(packed.wire_data));
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
@@ -223,10 +274,8 @@ void UcxPartitionedOutput::flushPending() {
         partitionAndEnqueue(tableView, numRows, stream);
       }
     } else if (numRows > 0) {
-      auto packedCols = cudf::pack(tableView, stream, get_output_mr());
+      auto packedColsPtr = packForExchange(tableView, stream);
       stream.sync();
-      auto packedColsPtr = std::make_unique<cudf::packed_columns>(
-          std::move(packedCols.metadata), std::move(packedCols.gpu_data));
       queueManager->enqueue(
           this->taskId(), 0, std::move(packedColsPtr), numRows);
     }
@@ -371,7 +420,6 @@ void UcxPartitionedOutput::equalPartitionRowCountOnly(
     return;
   }
 
-  auto mr = get_output_mr();
   // Same boundaries equalPartition() computes, so the split is identical to the
   // column-bearing case and the rows still add up to numRows.
   // The products are formed in 64 bits: numRows * (destination + 1) overflows
@@ -395,9 +443,7 @@ void UcxPartitionedOutput::equalPartitionRowCountOnly(
     if (rowsPerDestination[destination] == 0) {
       continue;
     }
-    auto packed = cudf::pack(tableView, stream, mr);
-    perDestination[destination] = std::make_unique<cudf::packed_columns>(
-        std::move(packed.metadata), std::move(packed.gpu_data));
+    perDestination[destination] = packForExchange(tableView, stream);
   }
   // UCX is not stream aware, so the packs must be complete before enqueueing.
   stream.sync();
@@ -522,14 +568,10 @@ void UcxPartitionedOutput::packAndEnqueueToAllDestinations(
     return;
   }
 
-  auto mr = get_output_mr();
   std::vector<std::unique_ptr<cudf::packed_columns>> perDestination;
   perDestination.reserve(numPartitions_);
   for (size_t destination = 0; destination < numPartitions_; ++destination) {
-    auto packed = cudf::pack(tableView, stream, mr);
-    perDestination.push_back(
-        std::make_unique<cudf::packed_columns>(
-            std::move(packed.metadata), std::move(packed.gpu_data)));
+    perDestination.push_back(packForExchange(tableView, stream));
   }
   // UCX is not stream aware, so the packs must be complete before enqueueing.
   stream.sync();
@@ -597,6 +639,47 @@ void UcxPartitionedOutput::splitAndEnqueue(
   // table, which the loop below would index out of bounds. Such payloads are
   // routed to equalPartitionRowCountOnly instead and never arrive here.
   VELOX_CHECK_GT(tableView.num_columns(), 0);
+  VELOX_CHECK_EQ(
+      offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
+
+  if (fusedForEnabled_) {
+    auto partitions = cudf::detail::contiguous_split_fused_for(
+        tableView, offsets, stream, get_output_mr());
+    stream.sync();
+    VELOX_CHECK_EQ(partitions.size(), numPartitions_);
+
+    auto queueManager = sharedQueueManager();
+    cudf::size_type rowStart = 0;
+    for (size_t destination = 0; destination < numPartitions_; ++destination) {
+      const auto rowEnd = destination < offsets.size()
+          ? offsets[destination]
+          : tableView.num_rows();
+      const auto numRows = rowEnd - rowStart;
+      rowStart = rowEnd;
+      if (numRows == 0) {
+        continue;
+      }
+
+      auto& partition = partitions[destination];
+      recordFusedForOutput(
+          partition.logical_data_size,
+          partition.wire_data->size(),
+          partition.segment_count);
+      auto metadata = wrapFusedForMetadata(
+          std::move(partition.metadata),
+          partition.segment_count,
+          partition.logical_data_size);
+      auto packed = std::make_unique<cudf::packed_columns>(
+          std::move(metadata), std::move(partition.wire_data));
+      queueManager->enqueue(
+          this->taskId(),
+          static_cast<int>(destination),
+          std::move(packed),
+          static_cast<vector_size_t>(numRows));
+    }
+    return;
+  }
+
   auto contiguousTables =
       cudf::contiguous_split(tableView, offsets, stream, get_output_mr());
 
@@ -605,8 +688,6 @@ void UcxPartitionedOutput::splitAndEnqueue(
   // the GPU kernels have finished writing to the buffers.
   stream.sync();
 
-  VELOX_CHECK_EQ(
-      offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
   auto queueManager = sharedQueueManager();
   for (int i = 0; i < numPartitions_; ++i) {
     auto const& partitionTable = contiguousTables[i];

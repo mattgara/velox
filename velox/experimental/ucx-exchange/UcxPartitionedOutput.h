@@ -127,6 +127,18 @@ class UcxPartitionedOutput : public exec::Operator,
       cudf::table_view tableView,
       cuda::stream_ref stream);
 
+  // Packs one exchange payload. The default path is ordinary cuDF packing.
+  // The opt-in path applies byte-aligned FOR while the packed allocation is
+  // materialized and wraps only the scalar decode parameters in host metadata.
+  std::unique_ptr<cudf::packed_columns> packForExchange(
+      cudf::table_view tableView,
+      cuda::stream_ref stream);
+
+  void recordFusedForOutput(
+      std::size_t logicalBytes,
+      std::size_t wireBytes,
+      std::size_t segmentCount);
+
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
   const size_t numPartitions_;
@@ -163,6 +175,9 @@ class UcxPartitionedOutput : public exec::Operator,
   int64_t pendingRows_{0};
   /// Configured row threshold for flushing (from QueryConfig).
   const int64_t targetRowsPerChunk_;
+
+  /// Applies fused byte-aligned FOR during exchange packing when true.
+  const bool fusedForEnabled_;
 };
 
 } // namespace facebook::velox::ucx_exchange

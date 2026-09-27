@@ -19,10 +19,12 @@
 #include <thread>
 
 #include <cudf/contiguous_split.hpp>
+#include <cudf/detail/fused_for.hpp>
 #include <folly/String.h>
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 
@@ -62,6 +64,25 @@ cuda::stream_ref handOffToConsumerStream(
   // scope exit does not cancel the wait already queued on consumerStream.
   buffer.set_stream(consumerStream);
   return consumerStream;
+}
+
+cudf::packed_columns restoreReceivedPackedColumns(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    cuda::stream_ref stream) {
+  auto envelope = unwrapFusedForMetadata(std::move(metadata));
+  if (!envelope.encoded) {
+    return cudf::packed_columns(
+        std::move(envelope.cudfMetadata), std::move(data));
+  }
+
+  auto mr = data->memory_resource();
+  auto fused = cudf::detail::fused_for_packed_columns{
+      std::move(envelope.cudfMetadata),
+      std::move(data),
+      envelope.segmentCount,
+      envelope.logicalDataSize};
+  return cudf::detail::decode_fused_for(std::move(fused), stream, mr);
 }
 } // namespace
 
@@ -683,9 +704,10 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
     auto consumerStream = handOffToConsumerStream(ptr->stream, *ptr->dataBuf);
-    // Create packed_columns from the received metadata and data buffer
-    cudf::packed_columns packedCols(
-        std::move(ptr->metadata.cudfMetadata), std::move(ptr->dataBuf));
+    auto packedCols = restoreReceivedPackedColumns(
+        std::move(ptr->metadata.cudfMetadata),
+        std::move(ptr->dataBuf),
+        consumerStream);
 
     // Unpack to get the table_view and create a packed_table
     cudf::table_view tableView = cudf::unpack(packedCols);
@@ -862,8 +884,8 @@ void UcxExchangeSource::onIntraNodeData(
   // Create packed_columns from the shared data.
   auto consumerStream = handOffToConsumerStream(
       cuda::stream_ref{data->gpu_data->stream().value()}, *data->gpu_data);
-  cudf::packed_columns packedCols(
-      std::move(data->metadata), std::move(data->gpu_data));
+  auto packedCols = restoreReceivedPackedColumns(
+      std::move(data->metadata), std::move(data->gpu_data), consumerStream);
 
   // Unpack to get the table_view and create a packed_table
   cudf::table_view tableView = cudf::unpack(packedCols);
