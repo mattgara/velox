@@ -83,7 +83,6 @@ cudf_velox::compression::CompressionOptions compressionCodecOptions(
   using cudf_velox::compression::CompressionOptions;
   using cudf_velox::compression::EntropyEncoding;
   using cudf_velox::compression::NumericTransform;
-  using cudf_velox::compression::TypedRegionCodec;
 
   if (mode == "for") {
     return {NumericTransform::kFrameOfReference, EntropyEncoding::kNone};
@@ -96,24 +95,6 @@ cudf_velox::compression::CompressionOptions compressionCodecOptions(
   }
   if (mode == "delta-for-ans") {
     return {NumericTransform::kDeltaFrameOfReference, EntropyEncoding::kAns};
-  }
-  if (mode == "nvcomp-cascaded") {
-    return {
-        NumericTransform::kAutomatic,
-        EntropyEncoding::kAns,
-        TypedRegionCodec::kNvcompCascaded};
-  }
-  if (mode == "nvcomp-cascaded-ans") {
-    return {
-        NumericTransform::kAutomatic,
-        EntropyEncoding::kAns,
-        TypedRegionCodec::kNvcompCascadedAns};
-  }
-  if (mode == "simpatico-bitpack") {
-    return {
-        NumericTransform::kAutomatic,
-        EntropyEncoding::kAns,
-        TypedRegionCodec::kSimpaticoBitpack};
   }
   VELOX_CHECK_EQ(mode, "automatic-ans");
   return {NumericTransform::kAutomatic, EntropyEncoding::kAns};

@@ -15,8 +15,6 @@
  */
 #include "velox/experimental/cudf/compression/PackedColumnsCodec.h"
 #include "velox/experimental/cudf/compression/detail/AnsCodec.h"
-#include "velox/experimental/cudf/compression/detail/CascadedCodec.h"
-#include "velox/experimental/cudf/compression/detail/SimpaticoBitpackCodec.h"
 #include "velox/experimental/cudf/compression/detail/SizeUtils.h"
 
 #include <cudf/column/column_view.hpp>
@@ -55,7 +53,7 @@ constexpr int kThreadsPerBlock = 256;
 
 // ASCII "VLXPCOMP". Format identity and version are separate wire fields.
 constexpr int64_t kDescriptorMagic = 0x564c5850434f4d50LL;
-constexpr int64_t kDescriptorVersion = 5;
+constexpr int64_t kDescriptorVersion = 3;
 constexpr std::size_t kDescriptorHeaderWordCount = 4;
 constexpr std::size_t kRegionFixedWordCount = 8;
 constexpr std::size_t kMaximumBytePlaneCount = sizeof(uint64_t);
@@ -73,8 +71,6 @@ enum class RegionTransform : int64_t {
   kNone = 0,
   kFrameOfReference = 1,
   kDeltaFrameOfReference = 2,
-  kNvcompCascaded = 3,
-  kSimpaticoBitpack = 4,
 };
 
 enum class RegionEncoding : int64_t {
@@ -160,43 +156,6 @@ class DescriptorReader {
   }
   return cudf::data_type{id};
 }
-[[nodiscard]] std::optional<std::size_t> simpaticoMinimumEncodedSize(
-    std::size_t rawSize,
-    cudf::data_type logicalType) noexcept {
-  if (!cudf::is_fixed_width(logicalType)) {
-    return std::nullopt;
-  }
-  const auto elementWidth =
-      static_cast<std::size_t>(cudf::size_of(logicalType));
-  if ((elementWidth != 4 && elementWidth != 8) || rawSize == 0 ||
-      rawSize % elementWidth != 0) {
-    return std::nullopt;
-  }
-
-  const auto elementCount = rawSize / elementWidth;
-  const auto tileCount = elementCount / detail::kSimpaticoTileRows +
-      (elementCount % detail::kSimpaticoTileRows != 0);
-  if (tileCount > std::numeric_limits<std::size_t>::max() / elementWidth) {
-    return std::nullopt;
-  }
-
-  const auto tileValueBytes = tileCount * elementWidth;
-  std::size_t referenceOffset = 0;
-  std::size_t bitsOffset = 0;
-  std::size_t metadataEnd = 0;
-  std::size_t packedOffset = 0;
-  std::size_t minimumSize = 0;
-  if (!detail::tryNvcompAlignedSize(tileValueBytes, referenceOffset) ||
-      !detail::tryAddSizes(referenceOffset, tileValueBytes, bitsOffset) ||
-      !detail::tryNvcompAlignedSize(bitsOffset, bitsOffset) ||
-      !detail::tryAddSizes(bitsOffset, tileCount, metadataEnd) ||
-      !detail::tryNvcompAlignedSize(metadataEnd, packedOffset) ||
-      !detail::tryAddSizes(
-          packedOffset, detail::kSimpaticoDecodeGuardBytes, minimumSize)) {
-    return std::nullopt;
-  }
-  return minimumSize;
-}
 
 [[nodiscard]] std::optional<ParsedDescriptor> parseDescriptor(
     std::span<const int64_t> words) {
@@ -244,7 +203,7 @@ class DescriptorReader {
 
     if (*transformValue < static_cast<int64_t>(RegionTransform::kNone) ||
         *transformValue >
-            static_cast<int64_t>(RegionTransform::kSimpaticoBitpack) ||
+            static_cast<int64_t>(RegionTransform::kDeltaFrameOfReference) ||
         *encodingValue < static_cast<int64_t>(RegionEncoding::kNone) ||
         *encodingValue > static_cast<int64_t>(RegionEncoding::kAns)) {
       return std::nullopt;
@@ -285,89 +244,28 @@ class DescriptorReader {
       const auto elementWidth = cudf::size_of(region.logicalType);
       if ((elementWidth != 4 && elementWidth != 8) ||
           region.rawSize % elementWidth != 0 ||
-          rawCoverage % elementWidth != 0) {
+          rawCoverage % elementWidth != 0 || region.planeCount == 0 ||
+          region.planeCount > elementWidth) {
         return std::nullopt;
       }
       elementCount = region.rawSize / elementWidth;
-
-      const auto isBytePlane =
-          transform == RegionTransform::kFrameOfReference ||
-          transform == RegionTransform::kDeltaFrameOfReference;
-      if (isBytePlane &&
-          (region.planeCount == 0 || region.planeCount > elementWidth)) {
-        return std::nullopt;
-      }
-      if (transform == RegionTransform::kNvcompCascaded &&
-          (region.referenceBits != 0 ||
-           region.planeCount != detail::cascadedChunkCount(region.rawSize))) {
-        return std::nullopt;
-      }
-      if (transform == RegionTransform::kSimpaticoBitpack &&
-          (region.referenceBits != 0 || region.planeCount != 0)) {
-        return std::nullopt;
-      }
     }
 
-    auto addAlignedSegments = [&](std::size_t first) {
-      std::size_t size = 0;
-      for (std::size_t segment = first; segment < region.segmentSizes.size();
-           ++segment) {
-        std::size_t alignedSize = 0;
-        if (!detail::tryNvcompAlignedSize(
-                region.segmentSizes[segment], alignedSize) ||
-            !detail::tryAddSizes(size, alignedSize, size)) {
-          return std::optional<std::size_t>{};
-        }
-      }
-      return std::optional<std::size_t>{size};
-    };
-
     std::size_t regionEncodedSize = 0;
-    if (transform == RegionTransform::kNvcompCascaded) {
-      if (region.segmentSizes.size() < region.planeCount) {
-        return std::nullopt;
-      }
-      if (encoding == RegionEncoding::kNone) {
-        if (region.segmentSizes.size() != region.planeCount) {
-          return std::nullopt;
-        }
-        const auto size = addAlignedSegments(0);
-        if (!size) {
-          return std::nullopt;
-        }
-        regionEncodedSize = *size;
-      } else {
-        if (region.segmentSizes.size() == region.planeCount) {
-          return std::nullopt;
-        }
-        const auto size = addAlignedSegments(region.planeCount);
-        if (!size) {
-          return std::nullopt;
-        }
-        regionEncodedSize = *size;
-      }
-    } else if (transform == RegionTransform::kSimpaticoBitpack) {
-      if (encoding != RegionEncoding::kNone ||
-          region.segmentSizes.size() != 1) {
-        return std::nullopt;
-      }
-      regionEncodedSize = region.segmentSizes.front();
-      const auto minimumSize =
-          simpaticoMinimumEncodedSize(region.rawSize, region.logicalType);
-      if (!minimumSize || regionEncodedSize < *minimumSize) {
-        return std::nullopt;
-      }
-    } else if (encoding == RegionEncoding::kAns) {
+    if (encoding == RegionEncoding::kAns) {
       if (region.segmentSizes.empty() ||
           (transform != RegionTransform::kNone &&
            region.segmentSizes.size() != region.planeCount)) {
         return std::nullopt;
       }
-      const auto size = addAlignedSegments(0);
-      if (!size) {
-        return std::nullopt;
+      for (const auto size : region.segmentSizes) {
+        std::size_t alignedSize = 0;
+        if (!detail::tryNvcompAlignedSize(size, alignedSize) ||
+            !detail::tryAddSizes(
+                regionEncodedSize, alignedSize, regionEncodedSize)) {
+          return std::nullopt;
+        }
       }
-      regionEncodedSize = *size;
     } else {
       if (!region.segmentSizes.empty()) {
         return std::nullopt;
@@ -763,76 +661,6 @@ struct EncodedTypedRegion {
   EncodedRegion descriptor;
   rmm::device_buffer data;
 };
-[[nodiscard]] EncodedTypedRegion encodeCandidateTypedRegion(
-    const uint8_t* blobBase,
-    const TypedRegion& region,
-    std::size_t regionSize,
-    CompressionOptions options,
-    detail::PackedColumnsCodecState& state) {
-  EncodedRegion descriptor;
-  descriptor.rawSize = regionSize;
-  descriptor.logicalType = region.logicalType;
-  const cudf::device_span<const uint8_t> input{
-      blobBase + region.offset, regionSize};
-
-  if (options.typedRegionCodec == TypedRegionCodec::kSimpaticoBitpack) {
-    const auto transform = [&] {
-      switch (options.numericTransform) {
-        case NumericTransform::kAutomatic:
-          return detail::SimpaticoTransform::kAutomatic;
-        case NumericTransform::kFrameOfReference:
-          return detail::SimpaticoTransform::kFrameOfReference;
-        case NumericTransform::kDeltaFrameOfReference:
-          return detail::SimpaticoTransform::kDeltaFrameOfReference;
-      }
-      CUDF_FAIL("Invalid numeric transform", std::invalid_argument);
-    }();
-    auto encoded = detail::compressSimpaticoBitpack(
-        input,
-        region.logicalType,
-        transform,
-        state.stream,
-        state.temporaryMemoryResource);
-    CUDF_EXPECTS(
-        encoded.size() <= std::numeric_limits<uint32_t>::max(),
-        "Simpatico bitpack payload exceeds descriptor capacity",
-        std::overflow_error);
-    descriptor.transform = RegionTransform::kSimpaticoBitpack;
-    descriptor.segmentSizes.push_back(static_cast<uint32_t>(encoded.size()));
-    return {std::move(descriptor), std::move(encoded)};
-  }
-
-  CUDF_EXPECTS(
-      options.typedRegionCodec == TypedRegionCodec::kNvcompCascaded ||
-          options.typedRegionCodec == TypedRegionCodec::kNvcompCascadedAns,
-      "Invalid candidate typed-region codec",
-      std::invalid_argument);
-  auto cascaded = detail::compressCascaded(
-      input, region.logicalType, state.stream, state.temporaryMemoryResource);
-  CUDF_EXPECTS(
-      cascaded.chunkSizes.size() <= std::numeric_limits<uint32_t>::max(),
-      "Cascaded chunk count exceeds descriptor capacity",
-      std::overflow_error);
-  descriptor.transform = RegionTransform::kNvcompCascaded;
-  descriptor.planeCount = static_cast<uint32_t>(cascaded.chunkSizes.size());
-  descriptor.segmentSizes = cascaded.chunkSizes;
-
-  if (options.typedRegionCodec == TypedRegionCodec::kNvcompCascadedAns) {
-    auto ans = detail::compressAns(
-        {static_cast<const uint8_t*>(cascaded.data.data()),
-         cascaded.data.size()},
-        state.ans);
-    if (ans) {
-      descriptor.encoding = RegionEncoding::kAns;
-      descriptor.segmentSizes.insert(
-          descriptor.segmentSizes.end(),
-          ans->segmentSizes.begin(),
-          ans->segmentSizes.end());
-      return {std::move(descriptor), std::move(ans->data)};
-    }
-  }
-  return {std::move(descriptor), std::move(cascaded.data)};
-}
 
 template <typename T>
 EncodedTypedRegion encodeTypedRegion(
@@ -1162,25 +990,6 @@ void decodeTypedRegion(
 }
 
 [[nodiscard]] std::size_t encodedRegionSize(const EncodedRegion& region) {
-  if (region.transform == RegionTransform::kSimpaticoBitpack) {
-    return region.segmentSizes.front();
-  }
-
-  if (region.transform == RegionTransform::kNvcompCascaded) {
-    const auto first = region.encoding == RegionEncoding::kAns
-        ? static_cast<std::size_t>(region.planeCount)
-        : 0;
-    std::size_t result = 0;
-    for (std::size_t segment = first; segment < region.segmentSizes.size();
-         ++segment) {
-      result = detail::checkedAddSizes(
-          result,
-          detail::nvcompAlignedSize(region.segmentSizes[segment]),
-          "Encoded region size overflow");
-    }
-    return result;
-  }
-
   if (region.encoding == RegionEncoding::kNone) {
     if (region.transform == RegionTransform::kNone) {
       return region.rawSize;
@@ -1251,14 +1060,6 @@ std::optional<CompressedPackedColumns> PackedColumnsCodec::compress(
       "Invalid entropy encoding",
       std::invalid_argument);
   CUDF_EXPECTS(
-      options.typedRegionCodec == TypedRegionCodec::kBytePlanes ||
-          options.typedRegionCodec == TypedRegionCodec::kNvcompCascaded ||
-          options.typedRegionCodec == TypedRegionCodec::kNvcompCascadedAns ||
-          options.typedRegionCodec == TypedRegionCodec::kSimpaticoBitpack,
-      "Invalid typed-region codec",
-      std::invalid_argument);
-
-  CUDF_EXPECTS(
       input.metadata != nullptr && input.gpu_data != nullptr,
       "Cannot compress moved-from packed columns",
       std::invalid_argument);
@@ -1324,17 +1125,6 @@ std::optional<CompressedPackedColumns> PackedColumnsCodec::compress(
 
     addResidual(cursor, typed.offset - cursor);
     EncodedTypedRegion encoded = [&] {
-      if (options.typedRegionCodec != TypedRegionCodec::kBytePlanes) {
-        auto candidate = encodeCandidateTypedRegion(
-            blobBase, typed, regionSize, options, *state_);
-        if (detail::nvcompAlignedSize(candidate.data.size()) < regionSize) {
-          return candidate;
-        }
-        EncodedRegion raw;
-        raw.rawSize = regionSize;
-        return EncodedTypedRegion{std::move(raw), rmm::device_buffer{}};
-      }
-
       if (elementWidth == 8) {
         if (usesUnsignedStorage(typed.logicalType)) {
           return encodeTypedRegion<uint64_t>(blobBase, typed, options, *state_);
@@ -1458,41 +1248,6 @@ rmm::device_buffer PackedColumnsCodec::decompress(
             cudaMemcpyDeviceToDevice,
             state_->stream.value()));
       }
-    } else if (region.transform == RegionTransform::kNvcompCascaded) {
-      const std::span<const uint32_t> cascadedSizes{
-          region.segmentSizes.data(), region.planeCount};
-      cudf::device_span<uint8_t> regionOutput{
-          outputBase + outputOffset, region.rawSize};
-      if (region.encoding == RegionEncoding::kAns) {
-        const std::span<const uint32_t> ansSizes{
-            region.segmentSizes.data() + region.planeCount,
-            region.segmentSizes.size() - region.planeCount};
-        const auto cascadedSize = detail::cascadedEncodedSize(cascadedSizes);
-        auto cascaded = detail::decompressAns(
-            regionInput, ansSizes, cascadedSize, state_->ans);
-        detail::decompressCascaded(
-            {static_cast<const uint8_t*>(cascaded.data()), cascaded.size()},
-            cascadedSizes,
-            region.logicalType,
-            regionOutput,
-            state_->stream,
-            state_->temporaryMemoryResource);
-      } else {
-        detail::decompressCascaded(
-            regionInput,
-            cascadedSizes,
-            region.logicalType,
-            regionOutput,
-            state_->stream,
-            state_->temporaryMemoryResource);
-      }
-    } else if (region.transform == RegionTransform::kSimpaticoBitpack) {
-      detail::decompressSimpaticoBitpack(
-          regionInput,
-          region.logicalType,
-          {outputBase + outputOffset, region.rawSize},
-          state_->stream,
-          state_->temporaryMemoryResource);
     } else if (cudf::size_of(region.logicalType) == 8) {
       if (usesUnsignedStorage(region.logicalType)) {
         decodeTypedRegion<uint64_t>(

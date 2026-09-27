@@ -485,23 +485,6 @@ void CudfConfig::initialize(
         kUcxExchangeCompression,
         exchangeCompression);
   }
-  if (config.find(kUcxExchangeCompressionCodec) != config.end()) {
-    exchangeCompressionCodec = config[kUcxExchangeCompressionCodec];
-    VELOX_USER_CHECK(
-        exchangeCompressionCodec == "automatic-ans" ||
-            exchangeCompressionCodec == "for-ans" ||
-            exchangeCompressionCodec == "for" ||
-            exchangeCompressionCodec == "delta-for-ans" ||
-            exchangeCompressionCodec == "delta-for" ||
-            exchangeCompressionCodec == "nvcomp-cascaded" ||
-            exchangeCompressionCodec == "nvcomp-cascaded-ans" ||
-            exchangeCompressionCodec == "simpatico-bitpack",
-        "{} must be one of: automatic-ans, for-ans, for, delta-for-ans, "
-        "delta-for, nvcomp-cascaded, nvcomp-cascaded-ans, "
-        "simpatico-bitpack. Found: {}",
-        kUcxExchangeCompressionCodec,
-        exchangeCompressionCodec);
-  }
   if (config.find(kUcxExchangeCompressionPipelineThreads) != config.end()) {
     exchangeCompressionPipelineThreads =
         folly::to<int32_t>(config[kUcxExchangeCompressionPipelineThreads]);
