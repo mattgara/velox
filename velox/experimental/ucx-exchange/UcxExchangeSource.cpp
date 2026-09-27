@@ -860,9 +860,9 @@ void UcxExchangeSource::onIntraNodeData(
 
   // Convert packed_columns to PackedTableWithStream for the queue.
   // Create packed_columns from the shared data.
-  cudf::packed_columns packedCols(
   auto consumerStream = handOffToConsumerStream(
       cuda::stream_ref{data->gpu_data->stream().value()}, *data->gpu_data);
+  cudf::packed_columns packedCols(
       std::move(data->metadata), std::move(data->gpu_data));
 
   // Unpack to get the table_view and create a packed_table
