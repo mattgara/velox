@@ -83,6 +83,10 @@ struct DataSendContext {
   // Releases the communicator-wide byte reservation after UCX completes.
   std::shared_ptr<void> payloadSendPermit;
   std::optional<UcxTransferShaper::TimePoint> shapedCompletion;
+  // When shaping is enabled, payload-rate telemetry covers only the modeled
+  // cross-GPU CUDA-IPC class. Same-worker cuda_copy traffic does not consume
+  // that modeled link and must not inflate its measured rate.
+  bool recordPayloadTelemetry{false};
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -482,8 +486,13 @@ void UcxExchangeServer::sendData() {
       auto dataCtx = std::make_shared<DataSendContext>();
       dataCtx->data = dataPtr_;
       dataCtx->payloadSendPermit = std::move(payloadSendPermit_);
-      communicator_->recordPayloadSendStart(dataCtx->data->gpu_data->size());
-      if (shouldShapeCudaIpc()) {
+      const bool shapeCudaIpc = shouldShapeCudaIpc();
+      dataCtx->recordPayloadTelemetry =
+          !communicator_->cudaIpcShapingEnabled() || shapeCudaIpc;
+      if (dataCtx->recordPayloadTelemetry) {
+        communicator_->recordPayloadSendStart(dataCtx->data->gpu_data->size());
+      }
+      if (shapeCudaIpc) {
         dataCtx->shapedCompletion =
             communicator_->reserveShapedSend(dataCtx->data->gpu_data->size());
         VLOG(1) << "[UCX-SHAPER-SEND] worker=" << communicator_->getWorkerId()
@@ -567,7 +576,10 @@ void UcxExchangeServer::onPayloadSendPermitGranted(std::size_t bytes) {
 void UcxExchangeServer::sendComplete(
     ucs_status_t status,
     std::shared_ptr<void> arg) {
-  communicator_->recordPayloadSendComplete();
+  auto dataCtx = std::static_pointer_cast<DataSendContext>(arg);
+  if (dataCtx->recordPayloadTelemetry) {
+    communicator_->recordPayloadSendComplete();
+  }
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
     VLOG(3) << "@" << partitionKey_.taskId
