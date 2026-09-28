@@ -89,6 +89,10 @@ class UcxExchangeServer
   /// @brief Sends metadata and data to the connected receiver.
   void sendData();
 
+  /// Returns true for a cross-worker CUDA-IPC endpoint when the
+  /// disabled-by-default benchmark link model is configured.
+  bool shouldShapeCudaIpc();
+
   /// Resumes a send after the communicator reserves payload-window bytes.
   void onPayloadSendPermitGranted(std::size_t bytes);
 

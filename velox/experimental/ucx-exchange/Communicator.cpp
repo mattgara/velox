@@ -19,6 +19,7 @@
 #include <ucxx/utils/ucx.h>
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -88,6 +89,40 @@ std::shared_ptr<Communicator> Communicator::initAndGet(
               << instancePtr_->payloadSendWindowBytes_
               << " bytes (0 means unlimited)";
 
+    if (const char* encodedBandwidth =
+            std::getenv("VELOX_UCX_SIMULATED_CUDA_IPC_GBYTES_PER_SECOND")) {
+      const std::string_view value{encodedBandwidth};
+      double parsedBandwidth = 0.0;
+      const auto [end, error] = std::from_chars(
+          value.data(),
+          value.data() + value.size(),
+          parsedBandwidth,
+          std::chars_format::general);
+      VELOX_USER_CHECK(
+          error == std::errc{} && end == value.data() + value.size() &&
+              std::isfinite(parsedBandwidth) && parsedBandwidth >= 0.0,
+          "VELOX_UCX_SIMULATED_CUDA_IPC_GBYTES_PER_SECOND must be a "
+          "non-negative finite number, got '{}'",
+          value);
+      instancePtr_->simulatedCudaIpcGBytesPerSecond_ = parsedBandwidth;
+    }
+    if (const char* encodedLatency =
+            std::getenv("VELOX_UCX_SIMULATED_CUDA_IPC_LATENCY_US")) {
+      const std::string_view value{encodedLatency};
+      uint64_t parsedLatency = 0;
+      const auto [end, error] = std::from_chars(
+          value.data(), value.data() + value.size(), parsedLatency);
+      VELOX_USER_CHECK(
+          error == std::errc{} && end == value.data() + value.size() &&
+              parsedLatency <=
+                  static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+          "VELOX_UCX_SIMULATED_CUDA_IPC_LATENCY_US must be a non-negative "
+          "integer, got '{}'",
+          value);
+      instancePtr_->simulatedCudaIpcLatencyUs_ =
+          static_cast<int64_t>(parsedLatency);
+    }
+
     auto logLevel = CudfConfig::getInstance().exchangeLogLevel;
     LOG(INFO) << "ucx-exchange VLOG level set to " << logLevel;
     if (logLevel > 0) {
@@ -124,6 +159,9 @@ std::shared_ptr<Communicator> Communicator::getInstance() {
 }
 
 Communicator::~Communicator() {
+  // Stop timer callbacks while all UCX and communicator state is still alive.
+  outboundTransferShaper_.reset();
+  inboundTransferShaper_.reset();
   listener_.reset();
   // Note: worker_->flush() was removed - it only applies to RMA (Remote Memory
   // Access) operations like ucp_put/ucp_get, which this code doesn't use.
@@ -144,6 +182,17 @@ void Communicator::run() {
           << CudfConfig::getInstance().ucxxBlockingProgress << std::endl;
 
   running_.store(true);
+  if (cudaIpcShapingEnabled()) {
+    outboundTransferShaper_ = std::make_unique<UcxTransferShaper>(
+        simulatedCudaIpcGBytesPerSecond_,
+        std::chrono::microseconds(simulatedCudaIpcLatencyUs_));
+    inboundTransferShaper_ = std::make_unique<UcxTransferShaper>(
+        simulatedCudaIpcGBytesPerSecond_,
+        std::chrono::microseconds(simulatedCudaIpcLatencyUs_));
+    LOG(INFO) << "[UCX-SHAPER] CUDA-IPC bandwidth="
+              << simulatedCudaIpcGBytesPerSecond_
+              << " GB/s latency=" << simulatedCudaIpcLatencyUs_ << " us";
+  }
   // Force CUDA context creation.
   auto cudaStatus = cudaFree(0);
   VELOX_CHECK(
@@ -436,6 +485,32 @@ void Communicator::deferRequestCleanup(std::shared_ptr<ucxx::Request> request) {
   if (request) {
     deferredRequests_.push_back(std::move(request));
   }
+}
+
+UcxTransferShaper::TimePoint Communicator::reserveShapedSend(
+    std::size_t bytes) {
+  VELOX_CHECK_NOT_NULL(outboundTransferShaper_);
+  return outboundTransferShaper_->reserve(bytes);
+}
+
+void Communicator::scheduleShapedSendCompletion(
+    UcxTransferShaper::TimePoint deadline,
+    UcxTransferShaper::Callback callback) {
+  VELOX_CHECK_NOT_NULL(outboundTransferShaper_);
+  outboundTransferShaper_->scheduleAt(deadline, std::move(callback));
+}
+
+UcxTransferShaper::TimePoint Communicator::reserveShapedReceive(
+    std::size_t bytes) {
+  VELOX_CHECK_NOT_NULL(inboundTransferShaper_);
+  return inboundTransferShaper_->reserve(bytes);
+}
+
+void Communicator::scheduleShapedReceiveCompletion(
+    UcxTransferShaper::TimePoint deadline,
+    UcxTransferShaper::Callback callback) {
+  VELOX_CHECK_NOT_NULL(inboundTransferShaper_);
+  inboundTransferShaper_->scheduleAt(deadline, std::move(callback));
 }
 
 void Communicator::recordPayloadSendStart(std::size_t bytes) {

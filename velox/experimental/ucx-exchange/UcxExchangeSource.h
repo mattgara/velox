@@ -36,6 +36,8 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <optional>
+
 namespace facebook::velox::ucx_exchange {
 
 struct UcxExchangeMetrics {
@@ -72,6 +74,7 @@ class UcxExchangeSource
     WaitingForMetadata,
     WaitingForReceiveBuffer,
     WaitingForData,
+    WaitingForShapedData,
     WaitingForIntraNodeData,
     Done,
   };
@@ -148,6 +151,7 @@ class UcxExchangeSource
     std::unique_ptr<rmm::device_buffer> dataBuf;
     cuda::stream_ref stream{
         cudaStream_t{cudaStreamDefault}}; // The stream used to allocate dataBuf
+    std::optional<UcxTransferShaper::TimePoint> shapedCompletion;
   };
 
   /// @brief The constructor is private in order to ensure that exchange sources
@@ -207,6 +211,16 @@ class UcxExchangeSource
   /// @param status indication by transport layer of transfer status
   /// @param arg
   void onData(ucs_status_t status, std::shared_ptr<void> arg);
+
+  /// Processes a data completion after either native or shaped delivery.
+  void onDataReady(
+      ucs_status_t status,
+      std::shared_ptr<void> arg,
+      ReceiverState expectedState);
+
+  /// Returns true for a CUDA-IPC endpoint when the benchmark link model is
+  /// enabled.
+  bool shouldShapeCudaIpc();
 
   /// @brief Initiates receiving the HandshakeResponse from server.
   void receiveHandshakeResponse();

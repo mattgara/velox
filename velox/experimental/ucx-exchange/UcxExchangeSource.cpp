@@ -47,6 +47,8 @@ receiverStateNames() {
           {UcxExchangeSource::ReceiverState::WaitingForMetadata,
            "WaitingForMetadata"},
           {UcxExchangeSource::ReceiverState::WaitingForData, "WaitingForData"},
+          {UcxExchangeSource::ReceiverState::WaitingForShapedData,
+           "WaitingForShapedData"},
           {UcxExchangeSource::ReceiverState::WaitingForIntraNodeData,
            "WaitingForIntraNodeData"},
           {UcxExchangeSource::ReceiverState::Done, "Done"},
@@ -215,6 +217,9 @@ void UcxExchangeSource::process() {
       break;
     case ReceiverState::WaitingForData:
       // Waiting for data is handled by an upcall from UCXX. Nothing to do.
+      break;
+    case ReceiverState::WaitingForShapedData:
+      // The benchmark shaper publishes completion from its timer callback.
       break;
     case ReceiverState::WaitingForIntraNodeData:
       // Poll for intra-node transfer data
@@ -641,6 +646,16 @@ void UcxExchangeSource::startDataReceive(
     return;
   }
 
+  if (shouldShapeCudaIpc()) {
+    data->shapedCompletion = communicator_->reserveShapedReceive(
+        static_cast<std::size_t>(data->metadata.dataSizeBytes));
+    VLOG(1) << "[UCX-SHAPER-RECEIVE] worker=" << communicator_->getWorkerId()
+            << " task=" << partitionKey_.taskId
+            << " destination=" << partitionKey_.destination
+            << " seq=" << sequenceNumber_
+            << " wireBytes=" << data->metadata.dataSizeBytes;
+  }
+
   // Use weak_ptr to prevent use-after-free if close() is called during the
   // callback.
   std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
@@ -664,21 +679,57 @@ void UcxExchangeSource::startDataReceive(
                  .build();
 }
 
+bool UcxExchangeSource::shouldShapeCudaIpc() {
+  if (isIntraNodeTransfer_ || !communicator_->cudaIpcShapingEnabled()) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(endpointRef_);
+  return endpointRef_->usesCudaIpc().value_or(false);
+}
+
 void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
+  auto data = std::static_pointer_cast<DataAndMetadata>(arg);
+  if (closed_.load(std::memory_order_acquire) || status != UCS_OK ||
+      getState() != ReceiverState::WaitingForData ||
+      !data->shapedCompletion.has_value()) {
+    onDataReady(status, std::move(arg), ReceiverState::WaitingForData);
+    return;
+  }
+
+  if (!setStateIf(
+          ReceiverState::WaitingForData, ReceiverState::WaitingForShapedData)) {
+    communicator_->recordPayloadReceiveComplete();
+    return;
+  }
+
+  std::weak_ptr<UcxExchangeSource> weak = weak_from_this();
+  communicator_->scheduleShapedReceiveCompletion(
+      *data->shapedCompletion, [weak, status, arg = std::move(arg)]() mutable {
+        if (auto self = weak.lock()) {
+          self->onDataReady(
+              status, std::move(arg), ReceiverState::WaitingForShapedData);
+        }
+      });
+}
+
+void UcxExchangeSource::onDataReady(
+    ucs_status_t status,
+    std::shared_ptr<void> arg,
+    ReceiverState expectedState) {
   communicator_->recordPayloadReceiveComplete();
   // Check if close() was called - avoid processing if we're shutting down
   if (closed_.load(std::memory_order_acquire)) {
-    VLOG(3) << toString() << " onData called after close, ignoring";
+    VLOG(3) << toString() << " onDataReady called after close, ignoring";
     deliverEndMarker();
     return;
   }
   // Guard against replayed callbacks from UCP wireup replay.
-  if (getState() != ReceiverState::WaitingForData) {
-    VLOG(2) << toString() << " onData called in state " << toName(getState())
-            << ", ignoring (possible UCXX replay)";
+  if (getState() != expectedState) {
+    VLOG(2) << toString() << " onDataReady called in state "
+            << toName(getState()) << ", ignoring (possible UCXX replay)";
     return;
   }
-  VLOG(3) << toString() << " + onData " << ucs_status_string(status);
+  VLOG(3) << toString() << " + onDataReady " << ucs_status_string(status);
 
   if (status != UCS_OK) {
     std::string errorMsg = fmt::format(
@@ -692,7 +743,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
     deliverEndMarker();
     setState(ReceiverState::Done);
   } else {
-    VLOG(3) << toString() << "+ onData " << ucs_status_string(status)
+    VLOG(3) << toString() << "+ onDataReady " << ucs_status_string(status)
             << " got chunk: " << sequenceNumber_;
 
     this->sequenceNumber_++;
@@ -721,7 +772,7 @@ void UcxExchangeSource::onData(ucs_status_t status, std::shared_ptr<void> arg) {
         std::move(packedTable), consumerStream, ptr->metadata.numRows);
 
     enqueue(std::move(data));
-    setStateIf(ReceiverState::WaitingForData, ReceiverState::ReadyToReceive);
+    setStateIf(expectedState, ReceiverState::ReadyToReceive);
   }
   communicator_->addToWorkQueue(getSelfPtr());
 }

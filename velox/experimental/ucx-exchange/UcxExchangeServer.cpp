@@ -16,6 +16,7 @@
 #include "velox/experimental/ucx-exchange/UcxExchangeServer.h"
 #include <glog/logging.h>
 #include <rmm/cuda_stream_view.hpp>
+#include <optional>
 #include "cuda_runtime.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -81,6 +82,7 @@ struct DataSendContext {
   std::shared_ptr<cudf::packed_columns> data;
   // Releases the communicator-wide byte reservation after UCX completes.
   std::shared_ptr<void> payloadSendPermit;
+  std::optional<UcxTransferShaper::TimePoint> shapedCompletion;
 };
 
 void UcxExchangeServer::setState(ServerState newState) {
@@ -261,6 +263,14 @@ std::string UcxExchangeServer::toString() {
 
 std::shared_ptr<UcxExchangeServer> UcxExchangeServer::getSelfPtr() {
   return shared_from_this();
+}
+
+bool UcxExchangeServer::shouldShapeCudaIpc() {
+  if (!communicator_->cudaIpcShapingEnabled()) {
+    return false;
+  }
+  VELOX_CHECK_NOT_NULL(endpointRef_);
+  return endpointRef_->usesCudaIpc().value_or(false);
 }
 
 void UcxExchangeServer::sendData() {
@@ -473,6 +483,15 @@ void UcxExchangeServer::sendData() {
       dataCtx->data = dataPtr_;
       dataCtx->payloadSendPermit = std::move(payloadSendPermit_);
       communicator_->recordPayloadSendStart(dataCtx->data->gpu_data->size());
+      if (shouldShapeCudaIpc()) {
+        dataCtx->shapedCompletion =
+            communicator_->reserveShapedSend(dataCtx->data->gpu_data->size());
+        VLOG(1) << "[UCX-SHAPER-SEND] worker=" << communicator_->getWorkerId()
+                << " task=" << partitionKey_.taskId
+                << " destination=" << partitionKey_.destination
+                << " seq=" << sequenceNumber_
+                << " wireBytes=" << dataCtx->data->gpu_data->size();
+      }
 
       dataRequest_ =
           endpointRef_->endpoint_
@@ -482,19 +501,27 @@ void UcxExchangeServer::sendData() {
                   ucxx::Tag{dataTag})
               .callbackFunction(
                   [weakData](ucs_status_t status, std::shared_ptr<void> arg) {
-                    // Release the GPU data buffer from the context. The DMA has
-                    // completed by the time this callback fires, so the buffer
-                    // is safe to free. The context shell stays alive with the
-                    // Request.
-                    auto ctx = std::static_pointer_cast<DataSendContext>(arg);
-                    auto dataHolder = std::move(ctx->data);
-                    auto payloadPermit = std::move(ctx->payloadSendPermit);
+                    auto finish = [weakData, status, arg]() mutable {
+                      // Retain both the GPU buffer and the send-window permit
+                      // until simulated completion, so upstream backpressure
+                      // observes the modeled link rate.
+                      auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+                      auto dataHolder = std::move(ctx->data);
+                      auto payloadPermit = std::move(ctx->payloadSendPermit);
+                      if (auto self = weakData.lock()) {
+                        self->sendComplete(status, arg);
+                      }
+                    };
 
-                    if (auto self = weakData.lock()) {
-                      self->sendComplete(status, arg);
+                    auto ctx = std::static_pointer_cast<DataSendContext>(arg);
+                    if (ctx->shapedCompletion) {
+                      if (auto self = weakData.lock()) {
+                        self->communicator_->scheduleShapedSendCompletion(
+                            *ctx->shapedCompletion, std::move(finish));
+                        return;
+                      }
                     }
-                    // dataHolder is destroyed here, releasing the GPU buffer if
-                    // sendComplete() already reset the server's dataPtr_.
+                    finish();
                   })
               .callbackData(dataCtx)
               .build();
