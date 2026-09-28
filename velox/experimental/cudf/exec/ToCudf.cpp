@@ -474,6 +474,12 @@ void CudfConfig::initialize(
     partitionedOutputBatchRows =
         folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
+#ifdef VELOX_ENABLE_UCX_EXCHANGE
+  if (config.find(kUcxFusedFor) != config.end()) {
+    ucx_exchange::setFusedForDefault(
+        folly::to<bool>(config[kUcxFusedFor]));
+  }
+#endif
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);
   }

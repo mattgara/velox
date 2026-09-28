@@ -26,9 +26,13 @@
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
+#include <atomic>
+
 namespace facebook::velox::ucx_exchange {
 
 namespace {
+
+std::atomic<bool> fusedForDefaultEnabled{false};
 
 // Both registries are process-global and seeded once from CudfConfig::exchange,
 // while operator conversion is decided per query from cudf.enabled. A query
@@ -48,6 +52,14 @@ void checkCudfEnabledForUcx(const core::QueryConfig& queryConfig) {
 }
 
 } // namespace
+
+void setFusedForDefault(bool enabled) {
+  fusedForDefaultEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool fusedForDefault() {
+  return fusedForDefaultEnabled.load(std::memory_order_relaxed);
+}
 
 void registerUcxTransports() {
   exec::OutputTransportRegistry::global().insert(

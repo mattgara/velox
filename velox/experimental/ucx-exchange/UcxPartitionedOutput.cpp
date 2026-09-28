@@ -27,6 +27,7 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/FusedForWire.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
@@ -89,8 +90,9 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
           CudfConfig::kUcxPartitionedOutputBatchRows,
           CudfConfig::getInstance().partitionedOutputBatchRows)),
-      fusedForEnabled_(
-          ctx->queryConfig().get<bool>(CudfConfig::kUcxFusedFor, false)) {
+      fusedForEnabled_(ctx->queryConfig().get<bool>(
+          CudfConfig::kUcxFusedFor,
+          fusedForDefault())) {
   VELOX_CHECK_NOT_NULL(
       queueManager, "UcxPartitionedOutput requires an output queue manager");
   VELOX_CHECK(

@@ -35,6 +35,11 @@ namespace facebook::velox::ucx_exchange {
 /// it.
 void registerUcxTransports();
 
+/// Sets and reads the process default for fused FOR exchange packing. A
+/// query-session property with the same key may override this default.
+void setFusedForDefault(bool enabled);
+bool fusedForDefault();
+
 /// Removes both kUcx registrations, undoing registerUcxTransports(). Leaves
 /// every other transport alone, including the built-in in-memory default.
 /// Idempotent, and a no-op when the transport was never registered.
