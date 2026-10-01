@@ -232,6 +232,18 @@ TEST_F(CascadedExchangeTest, singleDestinationUsesCompactOwningPath) {
 }
 
 TEST_F(CascadedExchangeTest, splitDestinationsUseCompactOwningPath) {
+  // Establish that the fixture actually produces both destinations without
+  // compression before checking the new codec path.
+  auto raw = produce(std::vector<int32_t>(65536, 7), {}, 2);
+  ASSERT_EQ(raw.size(), 2);
+  for (auto& packet : raw) {
+    EXPECT_EQ(packet.rows, 32768);
+    auto received = restore(packet, stream_.view());
+    ASSERT_TRUE(received->packedTable);
+    EXPECT_EQ(
+        readColumn(received->tableView().column(0), stream_.view()),
+        std::vector<int32_t>(32768, 7));
+  }
   auto packets = produce(
       std::vector<int32_t>(65536, 7), {{CudfConfig::kUcxCascaded, "true"}}, 2);
   ASSERT_EQ(packets.size(), 2);

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/tests/UcxTestHelpers.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -126,11 +127,21 @@ std::shared_ptr<Task> createPartitionedOutputTask(
       pool.get(), rowType, BufferPtr(nullptr), vectorSize, vecPtrs);
 
   // Build the plan: Values -> PartitionedOutput
-  auto planFragment =
-      exec::test::PlanBuilder()
-          .values({rowVector})
-          .partitionedOutput(partitionKeys, numPartitions, replicateNullsAndAny)
-          .planFragment();
+  exec::test::PlanBuilder planBuilder;
+  planBuilder.values({rowVector});
+  if (partitionKeys.empty() && numPartitions > 1) {
+    // Empty keys otherwise select gather, not the equal-split route promised
+    // by this helper. A multi-destination test must name its partitioning.
+    planBuilder.partitionedOutput(
+        partitionKeys,
+        numPartitions,
+        replicateNullsAndAny,
+        std::make_shared<exec::RoundRobinPartitionFunctionSpec>());
+  } else {
+    planBuilder.partitionedOutput(
+        partitionKeys, numPartitions, replicateNullsAndAny);
+  }
+  auto planFragment = planBuilder.planFragment();
 
   std::shared_ptr<folly::Executor> executor(
       std::make_shared<folly::CPUThreadPoolExecutor>(
