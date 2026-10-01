@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
-#include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 #include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
@@ -212,12 +211,12 @@ class CascadedExchangeTest : public testing::Test {
     size_t rowStart = 0;
     rmm::cuda_stream consumer;
     for (auto& packet : packets) {
-      auto metadata = unwrapFusedForMetadata(
+      auto metadata = unwrapExchangePayloadMetadata(
           std::make_unique<std::vector<uint8_t>>(*packet.data->metadata));
-      ASSERT_TRUE(metadata.encoded);
-      ASSERT_GT(metadata.segmentCount, 0);
+      ASSERT_EQ(metadata.codec, ExchangePayloadCodec::kFusedFor);
+      ASSERT_GT(metadata.auxiliaryCount, 0);
       std::vector<cudf::detail::fused_for_segment> segments(
-          metadata.segmentCount);
+          metadata.auxiliaryCount);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
           segments.data(),
           packet.data->gpu_data->data(),
@@ -374,16 +373,16 @@ TEST_F(CascadedExchangeTest, emptyLayoutKeepsProducerRowsAndRawStorage) {
   }
 }
 
-TEST_F(CascadedExchangeTest, oldForEnvelopeAndDirectDecoderAreRetained) {
+TEST_F(CascadedExchangeTest, commonForEnvelopeRetainsDirectDecoder) {
   const std::vector<int32_t> values(65536, 7);
   auto packets = produce(
       values,
       {{CudfConfig::kUcxExchangeCompression, "fused-for-byte-aligned"}});
   ASSERT_EQ(packets.size(), 1);
-  auto metadata = unwrapFusedForMetadata(
+  auto metadata = unwrapExchangePayloadMetadata(
       std::make_unique<std::vector<uint8_t>>(*packets[0].data->metadata));
-  ASSERT_TRUE(metadata.encoded);
-  EXPECT_GT(metadata.segmentCount, 0);
+  ASSERT_EQ(metadata.codec, ExchangePayloadCodec::kFusedFor);
+  EXPECT_GT(metadata.auxiliaryCount, 0);
   auto received = restore(packets[0], stream_.view());
   ASSERT_TRUE(received->packedTable);
   EXPECT_FALSE(received->table);
@@ -493,10 +492,11 @@ TEST_F(
     expectCascaded(cascaded, 65536);
     auto raw = produce(values, {{CudfConfig::kUcxExchangeCompression, "none"}});
     ASSERT_EQ(raw.size(), 1);
-    EXPECT_FALSE(
-        unwrapFusedForMetadata(
+    EXPECT_EQ(
+        unwrapExchangePayloadMetadata(
             std::make_unique<std::vector<uint8_t>>(*raw[0].data->metadata))
-            .encoded);
+            .codec,
+        ExchangePayloadCodec::kNone);
     auto received = restore(raw[0], stream_.view());
     ASSERT_TRUE(received->packedTable);
     EXPECT_FALSE(received->table);

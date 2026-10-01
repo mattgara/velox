@@ -27,7 +27,6 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
-#include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 
 #include <cudf/binaryop.hpp>
@@ -178,10 +177,11 @@ UcxPartitionedOutput::packForExchange(
       tableView, stream, get_output_mr(), fusedForOptions(compression_));
   recordFusedForOutput(
       packed.logical_data_size, packed.wire_data->size(), packed.segment_count);
-  auto metadata = wrapFusedForMetadata(
+  auto metadata = wrapExchangePayloadMetadata(
       std::move(packed.metadata),
-      packed.segment_count,
-      packed.logical_data_size);
+      ExchangePayloadCodec::kFusedFor,
+      packed.logical_data_size,
+      packed.segment_count);
   return std::make_unique<cudf::packed_columns>(
       std::move(metadata), std::move(packed.wire_data));
 }
@@ -755,10 +755,11 @@ void UcxPartitionedOutput::splitAndEnqueue(
           partition.logical_data_size,
           partition.wire_data->size(),
           partition.segment_count);
-      auto metadata = wrapFusedForMetadata(
+      auto metadata = wrapExchangePayloadMetadata(
           std::move(partition.metadata),
-          partition.segment_count,
-          partition.logical_data_size);
+          ExchangePayloadCodec::kFusedFor,
+          partition.logical_data_size,
+          partition.segment_count);
       auto packed = std::make_unique<cudf::packed_columns>(
           std::move(metadata), std::move(partition.wire_data));
       queueManager->enqueue(
