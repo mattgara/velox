@@ -30,11 +30,11 @@
 
 namespace facebook::velox::ucx_exchange {
 
-// The Cascaded bytes match the PR24261 consumer. Legacy FOR continues to use
-// FusedForWire.h. Codec 1 in this newer envelope is deliberately unsupported
-// here.
+// Common envelope for compressed payloads. Readers also retain the legacy
+// FusedForWire.h format until all producers have migrated.
 enum class ExchangePayloadCodec : uint8_t {
   kNone = 0,
+  kFusedFor = 1,
   kCascaded = 2,
 };
 
@@ -42,6 +42,7 @@ struct ExchangePayloadMetadata {
   std::unique_ptr<std::vector<uint8_t>> cudfMetadata;
   ExchangePayloadCodec codec{ExchangePayloadCodec::kNone};
   std::size_t logicalDataSize{0};
+  std::size_t auxiliaryCount{0}; // FOR segment count, zero for Cascaded.
 };
 
 namespace exchange_compression_wire_detail {
@@ -80,11 +81,16 @@ T readScalar(const uint8_t*& current, const uint8_t* end) {
 inline std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
     std::unique_ptr<std::vector<uint8_t>> cudfMetadata,
     ExchangePayloadCodec codec,
-    std::size_t logicalDataSize) {
+    std::size_t logicalDataSize,
+    std::size_t auxiliaryCount = 0) {
   VELOX_CHECK_NOT_NULL(cudfMetadata);
   VELOX_CHECK(
-      codec == ExchangePayloadCodec::kCascaded,
-      "Only Cascaded uses the new exchange compression envelope");
+      codec == ExchangePayloadCodec::kFusedFor ||
+          codec == ExchangePayloadCodec::kCascaded,
+      "Unsupported exchange payload codec");
+  VELOX_CHECK(
+      codec != ExchangePayloadCodec::kCascaded || auxiliaryCount == 0,
+      "Cascaded cannot carry an auxiliary segment count");
   using namespace exchange_compression_wire_detail;
   VELOX_CHECK_LE(
       cudfMetadata->size(),
@@ -98,8 +104,7 @@ inline std::unique_ptr<std::vector<uint8_t>> wrapExchangePayloadMetadata(
   appendScalar(*output, static_cast<uint16_t>(kHeaderSize));
   appendScalar(*output, static_cast<uint8_t>(codec));
   appendScalar(*output, static_cast<uint64_t>(logicalDataSize));
-  appendScalar(
-      *output, uint64_t{0}); // Reference auxiliary count, unused for Cascaded.
+  appendScalar(*output, static_cast<uint64_t>(auxiliaryCount));
   appendScalar(*output, static_cast<uint64_t>(cudfMetadata->size()));
   output->insert(output->end(), cudfMetadata->begin(), cudfMetadata->end());
   return output;
@@ -132,14 +137,21 @@ inline ExchangePayloadMetadata unwrapExchangePayloadMetadata(
   VELOX_CHECK_EQ(
       headerSize, kHeaderSize, "Invalid exchange compression header size");
   VELOX_CHECK(
-      codecValue == static_cast<uint8_t>(ExchangePayloadCodec::kCascaded),
+      codecValue == static_cast<uint8_t>(ExchangePayloadCodec::kFusedFor) ||
+          codecValue == static_cast<uint8_t>(ExchangePayloadCodec::kCascaded),
       "Unsupported exchange payload codec");
   VELOX_CHECK_LE(
       logicalDataSize,
       std::numeric_limits<std::size_t>::max(),
       "Exchange logical payload size exceeds size_t");
-  VELOX_CHECK_EQ(
-      auxiliaryCount, 0, "Cascaded cannot carry an auxiliary segment count");
+  VELOX_CHECK_LE(
+      auxiliaryCount,
+      std::numeric_limits<std::size_t>::max(),
+      "Exchange auxiliary count exceeds size_t");
+  VELOX_CHECK(
+      codecValue != static_cast<uint8_t>(ExchangePayloadCodec::kCascaded) ||
+          auxiliaryCount == 0,
+      "Cascaded cannot carry an auxiliary segment count");
   VELOX_CHECK_EQ(
       cudfMetadataSize,
       static_cast<uint64_t>(end - current),
@@ -151,7 +163,8 @@ inline ExchangePayloadMetadata unwrapExchangePayloadMetadata(
   return ExchangePayloadMetadata{
       std::move(cudfMetadata),
       codec,
-      static_cast<std::size_t>(logicalDataSize)};
+      static_cast<std::size_t>(logicalDataSize),
+      static_cast<std::size_t>(auxiliaryCount)};
 }
 
 } // namespace facebook::velox::ucx_exchange

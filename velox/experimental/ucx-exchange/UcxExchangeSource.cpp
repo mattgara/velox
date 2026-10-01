@@ -110,9 +110,20 @@ PackedTableWithStreamPtr detail::restoreReceivedTable(
         std::move(table), stream, envelope.logicalDataSize, numRows);
   }
 
-  // Ordinary metadata and the legacy FOR envelope take the original decoder.
-  auto packedColumns = restoreReceivedPackedColumns(
-      std::move(envelope.cudfMetadata), std::move(data), stream);
+  auto packedColumns = [&]() {
+    if (envelope.codec == ExchangePayloadCodec::kFusedFor) {
+      auto mr = data->memory_resource();
+      auto fused = cudf::detail::fused_for_packed_columns{
+          std::move(envelope.cudfMetadata),
+          std::move(data),
+          envelope.auxiliaryCount,
+          envelope.logicalDataSize};
+      return cudf::detail::decode_fused_for(std::move(fused), stream, mr);
+    }
+    // Ordinary metadata and the legacy FOR envelope keep their original path.
+    return restoreReceivedPackedColumns(
+        std::move(envelope.cudfMetadata), std::move(data), stream);
+  }();
   auto tableView = cudf::unpack(packedColumns);
   auto packedTable = std::make_unique<cudf::packed_table>(
       cudf::packed_table{tableView, std::move(packedColumns)});

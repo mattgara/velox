@@ -17,6 +17,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/contiguous_split.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/fused_for.hpp>
 #include <cudf/partitioning.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
@@ -30,6 +31,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest-param-test.h>
 #include <gtest/gtest.h>
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <algorithm>
 #include <chrono>
@@ -52,8 +54,11 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
+#include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/tests/SinkDriverMock.h"
 #include "velox/experimental/ucx-exchange/tests/SourceDriverMock.h"
@@ -119,6 +124,75 @@ TEST(ReceivedTableStorageTest, rejectsMissingStorage) {
   PackedTableWithStream received;
   EXPECT_EQ(received.gpuDataSize(), 0);
   EXPECT_THROW((void)received.tableView(), VeloxRuntimeError);
+}
+
+TEST(ReceivedTableStorageTest, restoresBothForEnvelopesOnConsumerStream) {
+  constexpr vector_size_t kRows = 65536;
+  rmm::cuda_stream producer;
+  rmm::cuda_stream consumer;
+  auto mr = cudf::get_current_device_resource_ref();
+  std::vector<int32_t> values(kRows);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    values[i] = static_cast<int32_t>(i % 32) - 10;
+  }
+  auto column = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT32},
+      kRows,
+      cudf::mask_state::UNALLOCATED,
+      producer.view(),
+      mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      column->mutable_view().data<int32_t>(),
+      values.data(),
+      values.size() * sizeof(int32_t),
+      cudaMemcpyHostToDevice,
+      producer.view().get()));
+  for (bool legacy : {true, false}) {
+    auto packed = cudf::detail::pack_fused_for(
+        cudf::table_view{{column->view()}}, producer.view(), mr);
+    producer.synchronize();
+    const auto logicalBytes = packed.logical_data_size;
+    auto metadata = legacy
+        ? wrapFusedForMetadata(
+              std::move(packed.metadata), packed.segment_count, logicalBytes)
+        : wrapExchangePayloadMetadata(
+              std::move(packed.metadata),
+              ExchangePayloadCodec::kFusedFor,
+              logicalBytes,
+              packed.segment_count);
+    auto received = detail::restoreReceivedTable(
+        std::move(metadata),
+        std::move(packed.wire_data),
+        consumer.view(),
+        kRows);
+    ASSERT_TRUE(received->packedTable);
+    EXPECT_FALSE(received->table);
+    EXPECT_EQ(received->gpuDataSize(), logicalBytes);
+    EXPECT_EQ(received->numRows, kRows);
+    EXPECT_EQ(received->packedTable->data.gpu_data->stream(), consumer.view());
+    std::vector<int32_t> decoded(values.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        decoded.data(),
+        received->tableView().column(0).data<int32_t>(),
+        decoded.size() * sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        consumer.view().get()));
+    consumer.synchronize();
+    EXPECT_EQ(decoded, values);
+  }
+}
+
+TEST(ReceivedTableStorageTest, rejectsForSegmentCountOverflowBeforeDecode) {
+  auto stream = cudf::get_default_stream();
+  auto packed = cudf::pack(cudf::table_view{}, stream);
+  auto metadata = wrapExchangePayloadMetadata(
+      std::move(packed.metadata),
+      ExchangePayloadCodec::kFusedFor,
+      0,
+      std::numeric_limits<std::size_t>::max());
+  EXPECT_ANY_THROW(
+      detail::restoreReceivedTable(
+          std::move(metadata), std::move(packed.gpu_data), stream, 0));
 }
 
 TEST(IntraNodeTransferRegistryTest, notifiesAcrossPublishOrderings) {
