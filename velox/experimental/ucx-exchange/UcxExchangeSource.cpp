@@ -933,8 +933,9 @@ void UcxExchangeSource::onIntraNodeData(
 
   // Convert packed_columns to PackedTableWithStream for the queue.
   // Create packed_columns from the shared data.
-  auto consumerStream = handOffToConsumerStream(
-      cuda::stream_ref{data->gpu_data->stream().value()}, *data->gpu_data);
+  // Same-worker producers synchronize before publishing. Do not retag this
+  // already-ready packed buffer onto a different stream merely to consume it.
+  auto consumerStream = cudf_velox::cudfGlobalStreamPool().get_stream();
   auto packedCols = restoreReceivedPackedColumns(
       std::move(data->metadata), std::move(data->gpu_data), consumerStream);
 
