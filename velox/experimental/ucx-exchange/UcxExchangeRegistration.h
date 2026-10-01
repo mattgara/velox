@@ -16,7 +16,19 @@
 
 #pragma once
 
+#include <string_view>
+
 namespace facebook::velox::ucx_exchange {
+
+enum class ExchangeCompression {
+  kNone,
+  kFusedForBitpacked,
+  kFusedForByteAligned,
+  kCascaded,
+};
+
+ExchangeCompression parseExchangeCompression(std::string_view value);
+std::string_view exchangeCompressionName(ExchangeCompression compression);
 
 /// Registers the UCX transport on both sides of an exchange edge under
 /// core::TransportKind::kUcx: the output queue manager paired with the
@@ -35,15 +47,10 @@ namespace facebook::velox::ucx_exchange {
 /// it.
 void registerUcxTransports();
 
-/// Sets and reads the process default for fused FOR exchange packing. A
-/// query-session property with the same key may override this default.
-void setFusedForDefault(bool enabled);
-bool fusedForDefault();
-
-/// Separate default-off Cascaded gate for the prepared-pack addback.
-/// A query may override it, but cannot enable it together with fused FOR.
-void setCascadedDefault(bool enabled);
-bool cascadedDefault();
+/// Sets and reads the process default exchange codec, initially kNone.
+/// The query-session cudf.exchange_compression property overrides this default.
+void setExchangeCompressionDefault(ExchangeCompression compression);
+ExchangeCompression exchangeCompressionDefault();
 
 /// Removes both kUcx registrations, undoing registerUcxTransports(). Leaves
 /// every other transport alone, including the built-in in-memory default.

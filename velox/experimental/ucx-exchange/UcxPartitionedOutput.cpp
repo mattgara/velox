@@ -49,6 +49,26 @@ using namespace facebook::velox::cudf_velox;
 using facebook::velox::exec::Task;
 namespace facebook::velox::ucx_exchange {
 
+namespace {
+
+bool isFusedFor(ExchangeCompression compression) {
+  return compression == ExchangeCompression::kFusedForBitpacked ||
+      compression == ExchangeCompression::kFusedForByteAligned;
+}
+
+cudf::detail::fused_for_options fusedForOptions(
+    ExchangeCompression compression) {
+  VELOX_CHECK(isFusedFor(compression));
+  // Consumer policy is fixed, independent of cuDF's legacy environment options.
+  return cudf::detail::fused_for_options{
+      32 * 1024,
+      compression == ExchangeCompression::kFusedForBitpacked
+          ? cudf::detail::fused_for_layout::bitpacked
+          : cudf::detail::fused_for_layout::byte_aligned};
+}
+
+} // namespace
+
 // Computes a mapping from names in n2 to names in n1
 // and returns that mapping in remap.
 // Names in n2 must occurs in n1.
@@ -91,17 +111,10 @@ UcxPartitionedOutput::UcxPartitionedOutput(
       targetRowsPerChunk_(ctx->queryConfig().get<int64_t>(
           CudfConfig::kUcxPartitionedOutputBatchRows,
           CudfConfig::getInstance().partitionedOutputBatchRows)),
-      fusedForEnabled_(ctx->queryConfig().get<bool>(
-          CudfConfig::kUcxFusedFor,
-          fusedForDefault())),
-      cascadedEnabled_(ctx->queryConfig().get<bool>(
-          CudfConfig::kUcxCascaded,
-          cascadedDefault())) {
-  VELOX_USER_CHECK(
-      !(fusedForEnabled_ && cascadedEnabled_),
-      "Cannot enable {} and {} together",
-      CudfConfig::kUcxFusedFor,
-      CudfConfig::kUcxCascaded);
+      compression_(parseExchangeCompression(ctx->queryConfig().get<std::string>(
+          CudfConfig::kUcxExchangeCompression,
+          std::string{
+              exchangeCompressionName(exchangeCompressionDefault())}))) {
   VELOX_CHECK_NOT_NULL(
       queueManager, "UcxPartitionedOutput requires an output queue manager");
   VELOX_CHECK(
@@ -153,16 +166,16 @@ std::unique_ptr<cudf::packed_columns>
 UcxPartitionedOutput::packForExchange(
     cudf::table_view tableView,
     cuda::stream_ref stream) {
-  if (!fusedForEnabled_ || tableView.num_columns() == 0) {
+  if (!isFusedFor(compression_) || tableView.num_columns() == 0) {
     auto packed = std::make_unique<cudf::packed_columns>(
         cudf::pack(tableView, stream, get_output_mr()));
-    return cascadedEnabled_
+    return compression_ == ExchangeCompression::kCascaded
         ? compressCascadedForExchange(std::move(packed), stream)
         : std::move(packed);
   }
 
-  auto packed =
-      cudf::detail::pack_fused_for(tableView, stream, get_output_mr());
+  auto packed = cudf::detail::pack_fused_for(
+      tableView, stream, get_output_mr(), fusedForOptions(compression_));
   recordFusedForOutput(
       packed.logical_data_size, packed.wire_data->size(), packed.segment_count);
   auto metadata = wrapFusedForMetadata(
@@ -715,9 +728,13 @@ void UcxPartitionedOutput::splitAndEnqueue(
   VELOX_CHECK_EQ(
       offsets.size() + 1, numPartitions_, "mismatch in numPartitions_");
 
-  if (fusedForEnabled_) {
+  if (isFusedFor(compression_)) {
     auto partitions = cudf::detail::contiguous_split_fused_for(
-        tableView, offsets, stream, get_output_mr());
+        tableView,
+        offsets,
+        stream,
+        get_output_mr(),
+        fusedForOptions(compression_));
     stream.sync();
     VELOX_CHECK_EQ(partitions.size(), numPartitions_);
 
@@ -756,7 +773,7 @@ void UcxPartitionedOutput::splitAndEnqueue(
   auto contiguousTables =
       cudf::contiguous_split(tableView, offsets, stream, get_output_mr());
 
-  if (cascadedEnabled_) {
+  if (compression_ == ExchangeCompression::kCascaded) {
     for (auto& contiguousTable : contiguousTables) {
       if (contiguousTable.table.num_rows() == 0) {
         continue;

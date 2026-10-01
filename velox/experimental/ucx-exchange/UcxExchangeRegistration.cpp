@@ -32,8 +32,7 @@ namespace facebook::velox::ucx_exchange {
 
 namespace {
 
-std::atomic<bool> fusedForDefaultEnabled{false};
-std::atomic<bool> cascadedDefaultEnabled{false};
+std::atomic<ExchangeCompression> compressionDefault{ExchangeCompression::kNone};
 
 // Both registries are process-global and seeded once from CudfConfig::exchange,
 // while operator conversion is decided per query from cudf.enabled. A query
@@ -54,20 +53,45 @@ void checkCudfEnabledForUcx(const core::QueryConfig& queryConfig) {
 
 } // namespace
 
-void setFusedForDefault(bool enabled) {
-  fusedForDefaultEnabled.store(enabled, std::memory_order_relaxed);
+ExchangeCompression parseExchangeCompression(std::string_view value) {
+  if (value == "none") {
+    return ExchangeCompression::kNone;
+  }
+  if (value == "fused-for-bitpacked") {
+    return ExchangeCompression::kFusedForBitpacked;
+  }
+  if (value == "fused-for-byte-aligned") {
+    return ExchangeCompression::kFusedForByteAligned;
+  }
+  if (value == "cascaded") {
+    return ExchangeCompression::kCascaded;
+  }
+  VELOX_USER_FAIL(
+      "Unsupported cuDF exchange compression '{}'. Expected none, "
+      "fused-for-bitpacked, fused-for-byte-aligned, or cascaded",
+      value);
 }
 
-bool fusedForDefault() {
-  return fusedForDefaultEnabled.load(std::memory_order_relaxed);
+std::string_view exchangeCompressionName(ExchangeCompression compression) {
+  switch (compression) {
+    case ExchangeCompression::kNone:
+      return "none";
+    case ExchangeCompression::kFusedForBitpacked:
+      return "fused-for-bitpacked";
+    case ExchangeCompression::kFusedForByteAligned:
+      return "fused-for-byte-aligned";
+    case ExchangeCompression::kCascaded:
+      return "cascaded";
+  }
+  VELOX_UNREACHABLE();
 }
 
-void setCascadedDefault(bool enabled) {
-  cascadedDefaultEnabled.store(enabled, std::memory_order_relaxed);
+void setExchangeCompressionDefault(ExchangeCompression compression) {
+  compressionDefault.store(compression, std::memory_order_relaxed);
 }
 
-bool cascadedDefault() {
-  return cascadedDefaultEnabled.load(std::memory_order_relaxed);
+ExchangeCompression exchangeCompressionDefault() {
+  return compressionDefault.load(std::memory_order_relaxed);
 }
 
 void registerUcxTransports() {

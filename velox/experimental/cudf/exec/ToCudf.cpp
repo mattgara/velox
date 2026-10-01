@@ -475,12 +475,10 @@ void CudfConfig::initialize(
         folly::to<int64_t>(config[kUcxPartitionedOutputBatchRows]);
   }
 #ifdef VELOX_ENABLE_UCX_EXCHANGE
-  if (config.find(kUcxFusedFor) != config.end()) {
-    ucx_exchange::setFusedForDefault(
-        folly::to<bool>(config[kUcxFusedFor]));
-  }
-  if (config.find(kUcxCascaded) != config.end()) {
-    ucx_exchange::setCascadedDefault(folly::to<bool>(config[kUcxCascaded]));
+  if (config.find(kUcxExchangeCompression) != config.end()) {
+    ucx_exchange::setExchangeCompressionDefault(
+        ucx_exchange::parseExchangeCompression(
+            config[kUcxExchangeCompression]));
   }
 #endif
   if (config.find(kCudfLogFallback) != config.end()) {
