@@ -23,6 +23,7 @@
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <folly/Executor.h>
 #include <folly/Synchronized.h>
@@ -182,6 +183,33 @@ TEST(ReceivedTableStorageTest, restoresBothForEnvelopesOnConsumerStream) {
   }
 }
 
+TEST(ReceivedTableStorageTest, restoresTypedEmptyCommonForPayload) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  const auto type = cudf::data_type{cudf::type_id::INT32};
+  auto column = cudf::make_fixed_width_column(
+      type, 0, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto packed = cudf::detail::pack_fused_for(
+      cudf::table_view{{column->view()}}, stream, mr);
+  ASSERT_EQ(packed.segment_count, 0);
+  ASSERT_EQ(packed.logical_data_size, 0);
+  ASSERT_EQ(packed.wire_data->size(), 0);
+  auto metadata = wrapExchangePayloadMetadata(
+      std::move(packed.metadata),
+      ExchangePayloadCodec::kFusedFor,
+      packed.logical_data_size,
+      packed.segment_count);
+  auto received = detail::restoreReceivedTable(
+      std::move(metadata), std::move(packed.wire_data), stream, 0);
+  ASSERT_TRUE(received->packedTable);
+  EXPECT_FALSE(received->table);
+  EXPECT_EQ(received->numRows, 0);
+  EXPECT_EQ(received->gpuDataSize(), 0);
+  ASSERT_EQ(received->tableView().num_columns(), 1);
+  EXPECT_EQ(received->tableView().num_rows(), 0);
+  EXPECT_EQ(received->tableView().column(0).type(), type);
+}
+
 TEST(ReceivedTableStorageTest, rejectsForSegmentCountOverflowBeforeDecode) {
   auto stream = cudf::get_default_stream();
   auto packed = cudf::pack(cudf::table_view{}, stream);
@@ -190,9 +218,14 @@ TEST(ReceivedTableStorageTest, rejectsForSegmentCountOverflowBeforeDecode) {
       ExchangePayloadCodec::kFusedFor,
       0,
       std::numeric_limits<std::size_t>::max());
-  EXPECT_ANY_THROW(
-      detail::restoreReceivedTable(
-          std::move(metadata), std::move(packed.gpu_data), stream, 0));
+  try {
+    (void)detail::restoreReceivedTable(
+        std::move(metadata), std::move(packed.gpu_data), stream, 0);
+    FAIL() << "Expected fused FOR descriptor size overflow";
+  } catch (const cudf::logic_error& error) {
+    EXPECT_THAT(
+        error.what(), testing::HasSubstr("fused FOR descriptor size overflow"));
+  }
 }
 
 TEST(IntraNodeTransferRegistryTest, notifiesAcrossPublishOrderings) {
