@@ -26,6 +26,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeRegistration.h"
 
@@ -92,7 +93,15 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           CudfConfig::getInstance().partitionedOutputBatchRows)),
       fusedForEnabled_(ctx->queryConfig().get<bool>(
           CudfConfig::kUcxFusedFor,
-          fusedForDefault())) {
+          fusedForDefault())),
+      cascadedEnabled_(ctx->queryConfig().get<bool>(
+          CudfConfig::kUcxCascaded,
+          cascadedDefault())) {
+  VELOX_USER_CHECK(
+      !(fusedForEnabled_ && cascadedEnabled_),
+      "Cannot enable {} and {} together",
+      CudfConfig::kUcxFusedFor,
+      CudfConfig::kUcxCascaded);
   VELOX_CHECK_NOT_NULL(
       queueManager, "UcxPartitionedOutput requires an output queue manager");
   VELOX_CHECK(
@@ -145,8 +154,11 @@ UcxPartitionedOutput::packForExchange(
     cudf::table_view tableView,
     cuda::stream_ref stream) {
   if (!fusedForEnabled_ || tableView.num_columns() == 0) {
-    return std::make_unique<cudf::packed_columns>(
+    auto packed = std::make_unique<cudf::packed_columns>(
         cudf::pack(tableView, stream, get_output_mr()));
+    return cascadedEnabled_
+        ? compressCascadedForExchange(std::move(packed), stream)
+        : std::move(packed);
   }
 
   auto packed =
@@ -159,6 +171,65 @@ UcxPartitionedOutput::packForExchange(
       packed.logical_data_size);
   return std::make_unique<cudf::packed_columns>(
       std::move(metadata), std::move(packed.wire_data));
+}
+
+std::unique_ptr<cudf::packed_columns>
+UcxPartitionedOutput::compressCascadedForExchange(
+    std::unique_ptr<cudf::packed_columns> packed,
+    cuda::stream_ref stream) {
+  VELOX_CHECK_NOT_NULL(packed);
+  VELOX_CHECK_NOT_NULL(packed->metadata);
+  VELOX_CHECK_NOT_NULL(packed->gpu_data);
+  const auto logicalBytes = packed->gpu_data->size();
+  if (logicalBytes == 0) {
+    return packed;
+  }
+
+  auto options = cudf::experimental::pack_options{};
+  options.compression = cudf::experimental::pack_compression::cascaded;
+  options.output_mode = cudf::experimental::compressed_output_mode::compact;
+  auto plan =
+      cudf::experimental::prepare_pack(*packed, options, stream, get_temp_mr());
+  const auto sizes = plan.sizes();
+  VELOX_CHECK_EQ(sizes.uncompressed_payload_bytes, logicalBytes);
+  auto output = std::make_unique<rmm::device_buffer>(
+      sizes.payload_bytes, stream, get_output_mr());
+  auto result = cudf::experimental::pack_into(
+      plan,
+      cudf::device_span<uint8_t>{
+          static_cast<uint8_t*>(output->data()), output->size()});
+  VELOX_CHECK(
+      result.compression == cudf::experimental::pack_compression::cascaded,
+      "Cascaded exchange produced an unexpected representation");
+  VELOX_CHECK(
+      result.output_mode == cudf::experimental::compressed_output_mode::compact,
+      "Cascaded exchange requires actual compact payload bytes");
+  VELOX_CHECK_LE(result.payload_bytes, output->size());
+  // Compact packing has completed its reads before the borrowed input and plan
+  // leave scope, including this no-reduction fallback.
+  if (result.payload_bytes >= logicalBytes) {
+    return packed;
+  }
+
+  output->resize(result.payload_bytes, stream);
+  auto metadata = wrapExchangePayloadMetadata(
+      std::make_unique<std::vector<uint8_t>>(std::move(result.metadata)),
+      ExchangePayloadCodec::kCascaded,
+      logicalBytes);
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "cascadedLogicalBytes",
+        RuntimeCounter(
+            static_cast<int64_t>(logicalBytes), RuntimeCounter::Unit::kBytes));
+    lockedStats->addRuntimeStat(
+        "cascadedWireBytes",
+        RuntimeCounter(
+            static_cast<int64_t>(output->size()),
+            RuntimeCounter::Unit::kBytes));
+  }
+  return std::make_unique<cudf::packed_columns>(
+      std::move(metadata), std::move(output));
 }
 
 void UcxPartitionedOutput::addInput(RowVectorPtr input) {
@@ -684,6 +755,20 @@ void UcxPartitionedOutput::splitAndEnqueue(
 
   auto contiguousTables =
       cudf::contiguous_split(tableView, offsets, stream, get_output_mr());
+
+  if (cascadedEnabled_) {
+    for (auto& contiguousTable : contiguousTables) {
+      if (contiguousTable.table.num_rows() == 0) {
+        continue;
+      }
+      auto packed = std::make_unique<cudf::packed_columns>(
+          std::move(contiguousTable.data.metadata),
+          std::move(contiguousTable.data.gpu_data));
+      packed = compressCascadedForExchange(std::move(packed), stream);
+      contiguousTable.data.metadata = std::move(packed->metadata);
+      contiguousTable.data.gpu_data = std::move(packed->gpu_data);
+    }
+  }
 
   // Synchronize the stream to ensure CUDA operations complete before enqueuing.
   // UCXX/UCX is not stream-aware, so without syncing, data could be sent before

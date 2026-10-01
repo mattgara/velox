@@ -479,6 +479,9 @@ void CudfConfig::initialize(
     ucx_exchange::setFusedForDefault(
         folly::to<bool>(config[kUcxFusedFor]));
   }
+  if (config.find(kUcxCascaded) != config.end()) {
+    ucx_exchange::setCascadedDefault(folly::to<bool>(config[kUcxCascaded]));
+  }
 #endif
   if (config.find(kCudfLogFallback) != config.end()) {
     logFallback = folly::to<bool>(config[kCudfLogFallback]);

@@ -33,6 +33,7 @@ namespace facebook::velox::ucx_exchange {
 namespace {
 
 std::atomic<bool> fusedForDefaultEnabled{false};
+std::atomic<bool> cascadedDefaultEnabled{false};
 
 // Both registries are process-global and seeded once from CudfConfig::exchange,
 // while operator conversion is decided per query from cudf.enabled. A query
@@ -59,6 +60,14 @@ void setFusedForDefault(bool enabled) {
 
 bool fusedForDefault() {
   return fusedForDefaultEnabled.load(std::memory_order_relaxed);
+}
+
+void setCascadedDefault(bool enabled) {
+  cascadedDefaultEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool cascadedDefault() {
+  return cascadedDefaultEnabled.load(std::memory_order_relaxed);
 }
 
 void registerUcxTransports() {

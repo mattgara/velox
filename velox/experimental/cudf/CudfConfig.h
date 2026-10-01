@@ -65,6 +65,7 @@ struct CudfConfig {
   static constexpr const char* kUcxPartitionedOutputBatchRows{
       "cudf.partitioned_output_batch_rows"};
   static constexpr const char* kUcxFusedFor{"cudf.exchange_fused_for"};
+  static constexpr const char* kUcxCascaded{"cudf.exchange_cascaded"};
   /// Query session configs for the cuDF Operators.
   static constexpr const char* kCudfTopNBatchSize{"cudf.topk_batch_size"};
 

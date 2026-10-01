@@ -40,6 +40,11 @@ void registerUcxTransports();
 void setFusedForDefault(bool enabled);
 bool fusedForDefault();
 
+/// Separate default-off Cascaded gate for the prepared-pack addback.
+/// A query may override it, but cannot enable it together with fused FOR.
+void setCascadedDefault(bool enabled);
+bool cascadedDefault();
+
 /// Removes both kUcx registrations, undoing registerUcxTransports(). Leaves
 /// every other transport alone, including the built-in in-memory default.
 /// Idempotent, and a no-op when the transport was never registered.

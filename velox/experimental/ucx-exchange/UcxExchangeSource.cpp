@@ -24,6 +24,7 @@
 #include <folly/Uri.h>
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/ucx-exchange/ExchangeCompressionWire.h"
 #include "velox/experimental/ucx-exchange/FusedForWire.h"
 #include "velox/experimental/ucx-exchange/IntraNodeTransferRegistry.h"
 #include "velox/experimental/ucx-exchange/UcxExchangeSource.h"
@@ -87,6 +88,37 @@ cudf::packed_columns restoreReceivedPackedColumns(
   return cudf::detail::decode_fused_for(std::move(fused), stream, mr);
 }
 } // namespace
+
+PackedTableWithStreamPtr detail::restoreReceivedTable(
+    std::unique_ptr<std::vector<uint8_t>> metadata,
+    std::unique_ptr<rmm::device_buffer> data,
+    cuda::stream_ref stream,
+    vector_size_t numRows) {
+  auto envelope = unwrapExchangePayloadMetadata(std::move(metadata));
+  if (envelope.codec == ExchangePayloadCodec::kCascaded) {
+    auto mr = data->memory_resource();
+    auto packed = cudf::experimental::packed_data_view{
+        *envelope.cudfMetadata,
+        cudf::device_span<uint8_t const>{
+            static_cast<uint8_t const*>(data->data()), data->size()},
+        cudf::experimental::pack_compression::cascaded};
+    // Compressed materialize synchronizes before returning. Both borrowed
+    // buffers stay alive until then, even on the already-ready same-worker
+    // path.
+    auto table = cudf::experimental::materialize(packed, stream, mr);
+    return std::make_unique<PackedTableWithStream>(
+        std::move(table), stream, envelope.logicalDataSize, numRows);
+  }
+
+  // Ordinary metadata and the legacy FOR envelope take the original decoder.
+  auto packedColumns = restoreReceivedPackedColumns(
+      std::move(envelope.cudfMetadata), std::move(data), stream);
+  auto tableView = cudf::unpack(packedColumns);
+  auto packedTable = std::make_unique<cudf::packed_table>(
+      cudf::packed_table{tableView, std::move(packedColumns)});
+  return std::make_unique<PackedTableWithStream>(
+      std::move(packedTable), stream, numRows);
+}
 
 VELOX_DEFINE_EMBEDDED_ENUM_NAME(
     UcxExchangeSource,
@@ -755,21 +787,11 @@ void UcxExchangeSource::onDataReady(
     metrics_.totalBytes_.addValue(ptr->metadata.dataSizeBytes);
 
     auto consumerStream = handOffToConsumerStream(ptr->stream, *ptr->dataBuf);
-    auto packedCols = restoreReceivedPackedColumns(
+    auto data = detail::restoreReceivedTable(
         std::move(ptr->metadata.cudfMetadata),
         std::move(ptr->dataBuf),
-        consumerStream);
-
-    // Unpack to get the table_view and create a packed_table
-    cudf::table_view tableView = cudf::unpack(packedCols);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedCols)});
-
-    // Bundle the packed_table with the stream that was used for allocation
-    // and the producer's row count, which the packed table cannot report for
-    // itself when it has no columns.
-    auto data = std::make_unique<PackedTableWithStream>(
-        std::move(packedTable), consumerStream, ptr->metadata.numRows);
+        consumerStream,
+        ptr->metadata.numRows);
 
     enqueue(std::move(data));
     setStateIf(expectedState, ReceiverState::ReadyToReceive);
@@ -936,16 +958,11 @@ void UcxExchangeSource::onIntraNodeData(
   // Same-worker producers synchronize before publishing. Do not retag this
   // already-ready packed buffer onto a different stream merely to consume it.
   auto consumerStream = cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto packedCols = restoreReceivedPackedColumns(
-      std::move(data->metadata), std::move(data->gpu_data), consumerStream);
-
-  // Unpack to get the table_view and create a packed_table
-  cudf::table_view tableView = cudf::unpack(packedCols);
-  auto packedTable = std::make_unique<cudf::packed_table>(
-      cudf::packed_table{tableView, std::move(packedCols)});
-
-  auto tableWithStream = std::make_unique<PackedTableWithStream>(
-      std::move(packedTable), consumerStream, numRows);
+  auto tableWithStream = detail::restoreReceivedTable(
+      std::move(data->metadata),
+      std::move(data->gpu_data),
+      consumerStream,
+      numRows);
 
   enqueue(std::move(tableWithStream));
 

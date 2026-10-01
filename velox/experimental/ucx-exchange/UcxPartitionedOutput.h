@@ -134,6 +134,13 @@ class UcxPartitionedOutput : public exec::Operator,
       cudf::table_view tableView,
       cuda::stream_ref stream);
 
+  // Fixed Cascaded over ordinary packed input. Keep raw input when its payload
+  // is not reduced. Compact execution finishes before this helper releases the
+  // plan.
+  std::unique_ptr<cudf::packed_columns> compressCascadedForExchange(
+      std::unique_ptr<cudf::packed_columns> packed,
+      cuda::stream_ref stream);
+
   void recordFusedForOutput(
       std::size_t logicalBytes,
       std::size_t wireBytes,
@@ -178,6 +185,10 @@ class UcxPartitionedOutput : public exec::Operator,
 
   /// Applies fused byte-aligned FOR during exchange packing when true.
   const bool fusedForEnabled_;
+
+  /// Separate default-off prepared-pack path, mutually exclusive with fused
+  /// FOR.
+  const bool cascadedEnabled_;
 };
 
 } // namespace facebook::velox::ucx_exchange
