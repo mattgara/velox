@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
 #include <atomic>
 #include <cinttypes>
 #include <cuda/stream>
@@ -26,12 +27,13 @@
 
 namespace facebook::velox::ucx_exchange {
 
-/// Struct that bundles a packed_table with the CUDA stream that was used
-/// to allocate its memory. This allows the receiver to reuse the same stream
-/// for subsequent operations on the data.
+/// Bundles received cuDF storage with its consumer stream. Raw and fused FOR
+/// remain packed. A materializer can instead return an owning table.
 struct PackedTableWithStream {
+  std::unique_ptr<cudf::table> table;
   std::unique_ptr<cudf::packed_table> packedTable;
   cuda::stream_ref stream{cudaStream_t{cudaStreamDefault}};
+  size_t gpuDataBytes{0};
 
   /// Logical rows in 'packedTable', as reported by the producer. Authoritative:
   /// cudf::table_view::num_rows() derives the count from the columns and so
@@ -45,11 +47,29 @@ struct PackedTableWithStream {
       std::unique_ptr<cudf::packed_table>&& table,
       cuda::stream_ref s,
       vector_size_t numRows)
-      : packedTable(std::move(table)), stream(s), numRows(numRows) {}
+      : packedTable(std::move(table)),
+        stream(s),
+        gpuDataBytes(packedTable ? packedTable->data.gpu_data->size() : 0),
+        numRows(numRows) {}
 
-  /// Returns the size of the GPU data buffer, or 0 if packedTable is null.
+  PackedTableWithStream(
+      std::unique_ptr<cudf::table>&& materializedTable,
+      cuda::stream_ref s,
+      size_t uncompressedBytes,
+      vector_size_t numRows)
+      : table(std::move(materializedTable)),
+        stream(s),
+        gpuDataBytes(uncompressedBytes),
+        numRows(numRows) {}
+
+  cudf::table_view tableView() const {
+    VELOX_CHECK(table || packedTable, "Received cuDF table has no storage");
+    return table ? table->view() : packedTable->table;
+  }
+
+  /// Returns logical uncompressed bytes, not live allocation capacity.
   size_t gpuDataSize() const {
-    return packedTable ? packedTable->data.gpu_data->size() : 0;
+    return gpuDataBytes;
   }
 };
 
