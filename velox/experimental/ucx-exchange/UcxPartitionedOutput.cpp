@@ -198,9 +198,7 @@ UcxPartitionedOutput::compressCascadedForExchange(
     return packed;
   }
 
-  auto options = cudf::experimental::pack_options{};
-  options.compression = cudf::experimental::pack_compression::cascaded;
-  options.output_mode = cudf::experimental::compressed_output_mode::compact;
+  auto options = cudf::experimental::cascaded_pack_options{};
   auto plan =
       cudf::experimental::prepare_pack(*packed, options, stream, get_temp_mr());
   const auto sizes = plan.sizes();
@@ -211,12 +209,6 @@ UcxPartitionedOutput::compressCascadedForExchange(
       plan,
       cudf::device_span<uint8_t>{
           static_cast<uint8_t*>(output->data()), output->size()});
-  VELOX_CHECK(
-      result.compression == cudf::experimental::pack_compression::cascaded,
-      "Cascaded exchange produced an unexpected representation");
-  VELOX_CHECK(
-      result.output_mode == cudf::experimental::compressed_output_mode::compact,
-      "Cascaded exchange requires actual compact payload bytes");
   VELOX_CHECK_LE(result.payload_bytes, output->size());
   // Compact packing has completed its reads before the borrowed input and plan
   // leave scope, including this no-reduction fallback.

@@ -100,8 +100,7 @@ PackedTableWithStreamPtr detail::restoreReceivedTable(
     auto packed = cudf::experimental::packed_data_view{
         *envelope.cudfMetadata,
         cudf::device_span<uint8_t const>{
-            static_cast<uint8_t const*>(data->data()), data->size()},
-        cudf::experimental::pack_compression::cascaded};
+            static_cast<uint8_t const*>(data->data()), data->size()}};
     // Compressed materialize synchronizes before returning. Both borrowed
     // buffers stay alive until then, even on the already-ready same-worker
     // path.
